@@ -1,0 +1,25 @@
+[workspace]
+resolver = "3"
+members = ["crates/pi-rpc", "crates/pido"]
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.98"
+publish = false
+
+[workspace.dependencies]
+pi-rpc = { path = "crates/pi-rpc" }
+# Ely GPUI Components, pinned to a reviewed rev (see README for upgrade notes).
+ely-gpui-component = { git = "https://github.com/ELY-Open-Source/Ely-GPUI-Components", rev = "e0f355ac1a669c24336244bcaa8131f7f0e4f1b5" }
+gpui = { package = "gpui-pre", version = "=0.3.11", default-features = false }
+gpui_platform = { package = "gpui-pre-platform", version = "=0.3.11" }
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+crossbeam-channel = "0.5"
+dirs = "6"
+log = "0.4"
+env_logger = "0.11"
+
+[profile.release]
+lto = "thin"

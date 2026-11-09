@@ -1,0 +1,19 @@
+[package]
+name = "pi-rpc"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+description = "Client library for the Pi coding agent RPC protocol (JSONL over stdio)."
+license = "MIT"
+publish.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+crossbeam-channel.workspace = true
+dirs.workspace = true
+log.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
