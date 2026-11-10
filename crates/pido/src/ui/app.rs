@@ -115,22 +115,20 @@ impl Render for PidoApp {
         // list would grow past its share and push the composer out of the
         // window, so each band gets a definite box that content cannot
         // change.
-        // The backend reports the window in device pixels but paints the
-        // layout scaled by the display factor, so the layout box is the
-        // window divided by that factor. Using the raw bounds here painted
-        // 1.5x too large and cropped the composer away.
+        // GPUI reports the viewport (and window bounds) in logical pixels and
+        // scales the scene to device pixels when painting, so the layout box
+        // is the viewport as-is. Dividing by the scale factor here shrank the
+        // whole tree to a fraction of the window and left the rest blank.
         let scale = window.scale_factor();
-        let (w, h) = (bounds.size.width / scale, bounds.size.height / scale);
+        let viewport = window.viewport_size();
+        let (w, h) = (viewport.width, viewport.height);
         static GEOM: std::sync::Once = std::sync::Once::new();
         GEOM.call_once(|| {
+            let (w, h) = (f32::from(w), f32::from(h));
             log::info!(
-                "geometry: window={:?} scale={} layout={:?}x{:?} painted={:?}x{:?}",
-                bounds.size,
-                scale,
-                w,
-                h,
-                w * scale,
-                h * scale
+                "geometry: logical={w}x{h} scale={scale} device={}x{}",
+                (w * scale).round(),
+                (h * scale).round()
             )
         });
         let sidebar_w = gpui::px(264.);
@@ -196,8 +194,8 @@ impl Render for PidoApp {
             .child(
                 div()
                     .id("pido-root")
-                    .w(window.viewport_size().width / window.scale_factor())
-                    .h(window.viewport_size().height / window.scale_factor())
+                    .w(w)
+                    .h(h)
                     .min_w_0()
                     .min_h_0()
                     .flex()
