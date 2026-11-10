@@ -166,11 +166,32 @@ impl AssistantView {
     }
 }
 
+/// Fold `cwd` if it is open, unfold it if it is folded.
+pub fn toggle_fold(collapsed: &mut std::collections::HashSet<String>, cwd: &str) {
+    if !collapsed.remove(cwd) {
+        collapsed.insert(cwd.to_string());
+    }
+}
+
+/// Raw pi flags from `PIDO_EXTRA_ARGS` (e.g. `-e ./my-ext.ts`), for trying
+/// extensions without a settings UI.
+pub fn extra_args() -> Vec<String> {
+    std::env::var("PIDO_EXTRA_ARGS")
+        .map(|args| args.split_whitespace().map(str::to_string).collect())
+        .unwrap_or_default()
+}
+
 /// One row of the sidebar: a project header or a session.
 #[derive(Debug, Clone)]
 pub enum SidebarRow {
-    /// A project directory, as the last two path segments.
-    Group { label: gpui::SharedString },
+    /// A project directory: its short label, its full path (for the fold and
+    /// for starting a session there) and whether it is folded.
+    Group {
+        label: gpui::SharedString,
+        cwd: gpui::SharedString,
+        folded: bool,
+        sessions: usize,
+    },
     /// A session file.
     Session {
         path: gpui::SharedString,
@@ -182,7 +203,10 @@ pub enum SidebarRow {
 }
 
 /// Flatten grouped sessions into the sidebar's row order.
-fn flatten_groups(groups: &[SessionGroup]) -> Vec<SidebarRow> {
+fn flatten_groups(
+    groups: &[SessionGroup],
+    collapsed: &std::collections::HashSet<String>,
+) -> Vec<SidebarRow> {
     let mut rows = Vec::with_capacity(
         groups
             .iter()
@@ -190,9 +214,16 @@ fn flatten_groups(groups: &[SessionGroup]) -> Vec<SidebarRow> {
             .sum::<usize>(),
     );
     for group in groups {
+        let folded = collapsed.contains(&group.cwd);
         rows.push(SidebarRow::Group {
             label: shorten_project(&group.cwd).into(),
+            cwd: group.cwd.clone().into(),
+            folded,
+            sessions: group.sessions.len(),
         });
+        if folded {
+            continue;
+        }
         for session in &group.sessions {
             let title = session
                 .name
@@ -284,6 +315,8 @@ pub struct AppState {
     /// Sessions per project, as last scanned. The sidebar draws
     /// `sidebar_rows`, which is this flattened once per scan.
     pub session_groups: Vec<SessionGroup>,
+    /// Projects the user folded shut, keyed by working directory.
+    pub collapsed_projects: std::collections::HashSet<String>,
     /// The sidebar's rows, flattened once per scan: a header per project and
     /// a row per session. Rendering reads these instead of rebuilding strings
     /// per frame, and the list virtualises over the same order.
@@ -338,6 +371,7 @@ impl AppState {
                 thinking_level: None,
                 session_groups: Vec::new(),
                 sidebar_rows: Vec::new(),
+                collapsed_projects: std::collections::HashSet::new(),
                 session_name: None,
                 session_file: None,
                 last_session_loaded: false,
@@ -587,6 +621,23 @@ impl AppState {
         crate::settings::save_setting(|s| {
             s.last_session = persisted.map(str::to_string);
         });
+    }
+
+    /// Fold or unfold a project in the sidebar.
+    pub fn toggle_project(&mut self, cwd: &str, cx: &mut Context<Self>) {
+        toggle_fold(&mut self.collapsed_projects, cwd);
+        self.sidebar_rows = flatten_groups(&self.session_groups, &self.collapsed_projects);
+        cx.notify();
+    }
+
+    /// Start a fresh session in `project`: a new chat when pi is already there,
+    /// a reconnect to that directory otherwise.
+    pub fn new_session_in(&mut self, project: PathBuf, cx: &mut Context<Self>) {
+        if self.conn == Conn::Live && self.cwd.as_deref() == Some(project.as_path()) {
+            self.new_chat(cx);
+        } else {
+            self.connect(project, None, extra_args(), cx);
+        }
     }
 
     /// Stage an image for the next prompt. Returns false when the bytes are
@@ -878,7 +929,7 @@ impl AppState {
                 })
                 .await;
             this.update(cx, |s, cx| {
-                s.sidebar_rows = flatten_groups(&groups);
+                s.sidebar_rows = flatten_groups(&groups, &s.collapsed_projects);
                 s.session_groups = groups;
                 cx.notify();
             })
@@ -2090,6 +2141,7 @@ mod tests {
             thinking_level: None,
             session_groups: Vec::new(),
             sidebar_rows: Vec::new(),
+            collapsed_projects: std::collections::HashSet::new(),
             session_name: None,
             session_file: None,
             last_session_loaded: false,
@@ -2314,5 +2366,70 @@ mod image_tests {
             .collect::<Vec<_>>();
         assert!(!state.stage_image(None, big));
         assert!(state.pending_images.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod sidebar_tests {
+    use super::*;
+
+    fn group(cwd: &str, sessions: usize) -> SessionGroup {
+        SessionGroup {
+            cwd: cwd.to_string(),
+            sessions: (0..sessions)
+                .map(|ix| pi_rpc::sessions::SessionSummary {
+                    path: std::path::PathBuf::from(format!("{cwd}/s{ix}.jsonl")),
+                    session_id: format!("s{ix}"),
+                    cwd: cwd.to_string(),
+                    timestamp: None,
+                    updated_secs: Some(100),
+                    name: Some(format!("session {ix}")),
+                    preview: None,
+                    message_count: 1,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn folding_a_project_hides_its_sessions() {
+        let groups = vec![group("D:/a", 3), group("D:/b", 2)];
+        let open = flatten_groups(&groups, &Default::default());
+        assert_eq!(open.len(), 2 + 3 + 2, "two headers and five sessions");
+
+        let mut folded = std::collections::HashSet::new();
+        folded.insert("D:/a".to_string());
+        let rows = flatten_groups(&groups, &folded);
+        assert_eq!(
+            rows.len(),
+            2 + 2,
+            "the folded project keeps only its header"
+        );
+        match &rows[0] {
+            SidebarRow::Group {
+                folded: is_folded,
+                sessions,
+                ..
+            } => {
+                assert!(is_folded);
+                assert_eq!(*sessions, 3);
+            }
+            other => panic!("expected a group row, got {other:?}"),
+        }
+        match &rows[1] {
+            SidebarRow::Group {
+                folded: is_folded, ..
+            } => assert!(!is_folded),
+            other => panic!("expected the second group, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn toggling_folds_and_unfolds() {
+        let mut collapsed = std::collections::HashSet::new();
+        toggle_fold(&mut collapsed, "D:/a");
+        assert!(collapsed.contains("D:/a"));
+        toggle_fold(&mut collapsed, "D:/a");
+        assert!(!collapsed.contains("D:/a"));
     }
 }

@@ -8,12 +8,12 @@
 
 use ely_gpui_component::buttons::Button;
 use ely_gpui_component::lists::VirtualList;
-use ely_gpui_component::primitives::{Icon, IconName};
+use ely_gpui_component::primitives::{Disclosure, Icon, IconName};
 use ely_gpui_component::theme::{ActiveTheme, ControlSize, IconSize, Radius, TextSize};
 use ely_gpui_component::typography::{Caption, Ellipsis, Label};
 use gpui::{
-    App, Entity, InteractiveElement, IntoElement, ParentElement, StatefulInteractiveElement,
-    Styled, div, prelude::FluentBuilder, px,
+    App, Entity, InteractiveElement, IntoElement, MouseButton, ParentElement, SharedString,
+    StatefulInteractiveElement, Styled, div, prelude::FluentBuilder, px,
 };
 
 use crate::i18n;
@@ -97,20 +97,77 @@ pub fn render(state: &Entity<AppState>, cx: &App) -> impl IntoElement + use<> {
                                 let row = &rows[ix];
                                 let colors = cx.theme().colors.clone();
                                 match row {
-                                    SidebarRow::Group { label } => div()
-                                        .flex()
-                                        .items_center()
-                                        .gap_1p5()
-                                        .px_2()
-                                        .pt_3()
-                                        .pb_1()
-                                        .child(
-                                            Icon::new(IconName::Folder)
-                                                .size(IconSize::Sm)
-                                                .color(colors.fg_subtle),
-                                        )
-                                        .child(Label::new(label.clone()))
-                                        .into_any_element(),
+                                    SidebarRow::Group {
+                                        label,
+                                        cwd,
+                                        folded,
+                                        sessions,
+                                    } => {
+                                        let group = SharedString::from(format!("project-{ix}"));
+                                        let fold_state = state.clone();
+                                        let fold_cwd = cwd.to_string();
+                                        let new_state = state.clone();
+                                        let new_cwd = cwd.to_string();
+                                        div()
+                                            .id(("project", ix as u64))
+                                            .group(group.clone())
+                                            .w_full()
+                                            .flex()
+                                            .items_center()
+                                            .gap_1p5()
+                                            .px_2()
+                                            .pt_3()
+                                            .pb_1()
+                                            .cursor_pointer()
+                                            .hover(|style| style.bg(colors.hover))
+                                            .on_click(move |_, _, cx| {
+                                                fold_state.update(cx, |s, cx| {
+                                                    s.toggle_project(&fold_cwd, cx)
+                                                });
+                                            })
+                                            .child(Disclosure::new(("fold", ix as u64), !*folded))
+                                            .child(
+                                                Icon::new(IconName::Folder)
+                                                    .size(IconSize::Sm)
+                                                    .color(colors.fg_subtle),
+                                            )
+                                            .child(
+                                                div()
+                                                    .flex_1()
+                                                    .min_w_0()
+                                                    .child(Label::new(label.clone())),
+                                            )
+                                            .when(*folded, |this| {
+                                                this.child(Caption::new(sessions.to_string()))
+                                            })
+                                            // The row's own action, shown while hovered:
+                                            // a new session in this project.
+                                            .child(
+                                                div()
+                                                    .id(("project-new", ix as u64))
+                                                    .flex_none()
+                                                    .invisible()
+                                                    .group_hover(group, |style| style.visible())
+                                                    .on_mouse_down(
+                                                        MouseButton::Left,
+                                                        |_, window, _| window.prevent_default(),
+                                                    )
+                                                    .on_click(move |_, _, cx| {
+                                                        cx.stop_propagation();
+                                                        let cwd =
+                                                            std::path::PathBuf::from(&new_cwd);
+                                                        new_state.update(cx, |s, cx| {
+                                                            s.new_session_in(cwd, cx)
+                                                        });
+                                                    })
+                                                    .child(
+                                                        Icon::new(IconName::SquarePen)
+                                                            .size(IconSize::Xs)
+                                                            .color(colors.fg_subtle),
+                                                    ),
+                                            )
+                                            .into_any_element()
+                                    }
                                     SidebarRow::Session {
                                         path,
                                         title,
