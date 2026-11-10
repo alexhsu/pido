@@ -126,6 +126,10 @@ pub struct AppState {
     pub thinking_level: Option<ThinkingLevel>,
     pub session_groups: Vec<SessionGroup>,
     pub session_name: Option<String>,
+    /// The active session's file path, as reported by `get_state`.
+    pub session_file: Option<String>,
+    /// Set while a startup resume is in flight: once live, load its history.
+    last_session_loaded: bool,
     pub stats: Option<SessionStats>,
     /// A dismissible banner over the transcript.
     pub notice: Option<(NoticeKind, String)>,
@@ -150,6 +154,8 @@ impl AppState {
                 thinking_level: None,
                 session_groups: Vec::new(),
                 session_name: None,
+                session_file: None,
+                last_session_loaded: false,
                 stats: None,
                 notice: None,
                 last_project,
@@ -200,8 +206,15 @@ impl AppState {
 
     // -- session lifecycle --------------------------------------------------
 
-    /// Spawn pi in `cwd` and initialize the session.
-    pub fn connect(&mut self, cwd: PathBuf, cx: &mut Context<Self>) {
+    /// Spawn pi in `cwd` and initialize the session. When `resume_session`
+    /// names an existing session file it is loaded into pi at startup and its
+    /// transcript is restored, so the app reopens where the user left off.
+    pub fn connect(
+        &mut self,
+        cwd: PathBuf,
+        resume_session: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
         if !cwd.is_dir() {
             self.notice = Some((NoticeKind::Error, i18n::t(cx, "dir_invalid").to_string()));
             cx.notify();
@@ -217,7 +230,18 @@ impl AppState {
         });
         cx.notify();
 
-        let config = PiProcessConfig::new(&cwd);
+        // A stale session file must not break the spawn; fall back to fresh.
+        let mut args: Vec<String> = Vec::new();
+        self.last_session_loaded = false;
+        if let Some(session) = resume_session
+            && std::path::Path::new(&session).is_file()
+        {
+            log::info!("state: resuming session {session}");
+            args.push("--session".into());
+            args.push(session);
+            self.last_session_loaded = true;
+        }
+        let config = PiProcessConfig::new(&cwd).with_args(args);
         log::info!("state: connecting in {}", config.cwd.display());
         cx.spawn(async move |this, cx| {
             let spawned = cx
@@ -258,6 +282,7 @@ impl AppState {
                                     s.current_model = payload.model;
                                     s.thinking_level = payload.thinking_level;
                                     s.session_name = payload.session_name;
+                                    s.remember_session_file(payload.session_file.as_deref());
                                 }
                                 if let Ok(Ok(Some(payload))) =
                                     models.map(|r| r.data_as::<pi_rpc::protocol::AvailableModels>())
@@ -270,6 +295,12 @@ impl AppState {
                                     s.thinking_levels = payload.levels;
                                 }
                                 s.start_pump(client.clone(), cx);
+                                // A resumed session opens with its history;
+                                // a fresh one starts empty.
+                                if s.last_session_loaded {
+                                    s.last_session_loaded = false;
+                                    s.load_history(cx);
+                                }
                             }
                         }
                         s.refresh_sessions(cx);
@@ -285,6 +316,52 @@ impl AppState {
                     .ok();
                 }
             }
+        })
+        .detach();
+    }
+
+    /// Persist the active session file so the next launch resumes it.
+    fn remember_session_file(&mut self, session_file: Option<&str>) {
+        if self.session_file.as_deref() == session_file {
+            return;
+        }
+        self.session_file = session_file.map(str::to_string);
+        crate::settings::save_setting(|s| {
+            s.last_session = session_file.map(str::to_string);
+        });
+    }
+
+    /// Fetch all entries and rebuild the transcript (used by session resume
+    /// and by the sidebar's session picker).
+    fn load_history(&self, cx: &Context<Self>) {
+        let Some(client) = self.client() else { return };
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    let entries = client.request(Command::GetEntries { since: None })?;
+                    if !entries.success {
+                        anyhow::bail!("get_entries failed: {:?}", entries.error);
+                    }
+                    entries.data_as::<pi_rpc::protocol::SessionEntries>()
+                })
+                .await;
+            this.update(cx, |s, cx| {
+                match result {
+                    Ok(Some(payload)) => {
+                        log::info!(
+                            "state: history loaded, {} entries (leaf {:?})",
+                            payload.entries.len(),
+                            payload.leaf_id
+                        );
+                        s.load_entries(&payload.entries);
+                    }
+                    Ok(None) => {}
+                    Err(error) => s.push_notice(NoticeKind::Error, error.to_string()),
+                }
+                cx.notify();
+            })
+            .ok();
         })
         .detach();
     }
@@ -445,20 +522,17 @@ impl AppState {
                     if !switched.success {
                         anyhow::bail!("switch_session failed: {:?}", switched.error);
                     }
-                    let entries = client.request(Command::GetEntries { since: None })?;
-                    if !entries.success {
-                        anyhow::bail!("get_entries failed: {:?}", entries.error);
-                    }
-                    entries.data_as::<pi_rpc::protocol::SessionEntries>()
+                    Ok(())
                 })
                 .await;
             this.update(cx, |s, cx| {
                 match result {
-                    Ok(Some(payload)) => {
-                        s.load_entries(&payload.entries);
+                    Ok(()) => {
+                        // Refresh name/model/session-file, then rebuild the
+                        // transcript from the switched session's entries.
                         s.query_state(cx);
+                        s.load_history(cx);
                     }
-                    Ok(None) => {}
                     Err(error) => s.push_notice(NoticeKind::Error, error.to_string()),
                 }
                 cx.notify();
@@ -543,6 +617,7 @@ impl AppState {
                     s.current_model = payload.model;
                     s.thinking_level = payload.thinking_level;
                     s.session_name = payload.session_name;
+                    s.remember_session_file(payload.session_file.as_deref());
                     cx.notify();
                 }
             })

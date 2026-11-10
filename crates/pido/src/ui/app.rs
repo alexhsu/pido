@@ -66,13 +66,27 @@ impl PidoApp {
         cx.notify();
     }
 
-    /// Start a session immediately when `PIDO_AUTOCONNECT` names a directory.
+    /// Reconnect at startup so the user lands straight in their session.
     ///
-    /// Used by automated checks, and handy as a future deep link.
+    /// `PIDO_AUTOCONNECT` (used by automated checks) overrides the directory;
+    /// otherwise the last project from settings is used, resuming its last
+    /// session. First run, or a project directory that has vanished, falls
+    /// through to the welcome screen.
     pub fn autoconnect(&mut self, cx: &mut Context<Self>) {
-        if let Ok(dir) = std::env::var("PIDO_AUTOCONNECT") {
-            let path = std::path::PathBuf::from(dir);
-            self.state.update(cx, |s, cx| s.connect(path, cx));
+        let (dir, resume): (Option<std::path::PathBuf>, Option<String>) =
+            match std::env::var("PIDO_AUTOCONNECT") {
+                Ok(dir) => (Some(std::path::PathBuf::from(dir)), None),
+                Err(_) => {
+                    let settings = crate::settings::Settings::load();
+                    let dir = settings.last_project.map(std::path::PathBuf::from);
+                    let resume = settings
+                        .last_session
+                        .filter(|session| std::path::Path::new(session).is_file());
+                    (dir, resume)
+                }
+            };
+        if let Some(path) = dir {
+            self.state.update(cx, |s, cx| s.connect(path, resume, cx));
         }
     }
 }

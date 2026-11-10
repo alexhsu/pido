@@ -1,13 +1,19 @@
-//! The welcome screen: environment checks, a project-directory picker, and
-//! the start button.
+//! The welcome screen on Ely's `WelcomeScreen`: a time-of-day greeting over
+//! environment checks, a project-directory picker, and the start button.
+//!
+//! This pane only appears on first run, when the last project directory has
+//! vanished, or after a failed connection — normally the app reconnects to
+//! the last project automatically at startup.
 
 use ely_gpui_component::buttons::Button;
+use ely_gpui_component::chat::WelcomeScreen;
 use ely_gpui_component::forms::{PathInput, TextInput};
 use ely_gpui_component::theme::ActiveTheme;
-use ely_gpui_component::typography::{Caption, Paragraph, Title};
+use ely_gpui_component::typography::format::{now, system_zone};
+use ely_gpui_component::typography::{Caption, Paragraph};
 use gpui::{
     AppContext, Context, Hsla, IntoElement, ParentElement, SharedString, Styled, Window, div,
-    prelude::FluentBuilder, px,
+    prelude::FluentBuilder,
 };
 
 use crate::i18n;
@@ -54,71 +60,59 @@ pub fn render(
     let start_state = state.clone();
     let dir_for_start = dir_field.clone();
 
-    div()
-        .flex_1()
-        .flex()
-        .items_start()
-        .justify_center()
-        .py_16()
-        .child(
-            div()
-                .w(px(520.))
-                .flex()
-                .flex_col()
-                .gap_5()
-                .child(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .gap_2()
-                        .child(Title::new(i18n::t(cx, "welcome_title")))
-                        .child(Caption::new(i18n::t(cx, "welcome_desc"))),
+    WelcomeScreen::new("welcome", local_hour()).child(
+        div()
+            .flex()
+            .flex_col()
+            .gap_5()
+            .w_full()
+            .child(Caption::new(i18n::t(cx, "welcome_desc")))
+            .child(render_environment(state, cx))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .child(Caption::new(i18n::t(cx, "project_dir")))
+                    .child(PathInput::new("project-dir", &dir_field).directories()),
+            )
+            .child(
+                Button::new(
+                    "start",
+                    if connecting {
+                        i18n::t(cx, "starting")
+                    } else {
+                        i18n::t(cx, "start")
+                    },
                 )
-                .child(render_environment(state, cx))
+                .disabled(connecting || typed.is_empty())
+                .on_click(move |_, _, cx| {
+                    let path =
+                        std::path::PathBuf::from(dir_for_start.read(cx).text().trim().to_string());
+                    start_state.update(cx, |s, cx| s.connect(path, None, cx));
+                }),
+            )
+            .when_some(dead_reason, |this, reason| {
+                let reset_state = state.clone();
+                this.child(banner(
+                    danger_fill,
+                    danger_ink,
+                    i18n::t(cx, "connection_failed"),
+                    reason.into(),
+                ))
                 .child(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .gap_2()
-                        .child(Caption::new(i18n::t(cx, "project_dir")))
-                        .child(PathInput::new("project-dir", &dir_field).directories()),
-                )
-                .child(
-                    Button::new(
-                        "start",
-                        if connecting {
-                            i18n::t(cx, "starting")
-                        } else {
-                            i18n::t(cx, "start")
-                        },
-                    )
-                    .disabled(connecting || typed.is_empty())
-                    .on_click(move |_, _, cx| {
-                        let path = std::path::PathBuf::from(
-                            dir_for_start.read(cx).text().trim().to_string(),
-                        );
-                        start_state.update(cx, |s, cx| s.connect(path, cx));
-                    }),
-                )
-                .when_some(dead_reason, |this, reason| {
-                    let reset_state = state.clone();
-                    this.child(banner(
-                        danger_fill,
-                        danger_ink,
-                        i18n::t(cx, "connection_failed"),
-                        reason.into(),
-                    ))
-                    .child(
-                        ely_gpui_component::buttons::Button::new(
-                            "reconnect",
-                            i18n::t(cx, "reconnect"),
-                        )
+                    ely_gpui_component::buttons::Button::new("reconnect", i18n::t(cx, "reconnect"))
                         .on_click(move |_, _, cx| {
                             reset_state.update(cx, |s, cx| s.disconnect(cx));
                         }),
-                    )
-                }),
-        )
+                )
+            }),
+    )
+}
+
+/// The reader's local hour, 0–23, for the welcome greeting.
+fn local_hour() -> u8 {
+    now().to_zoned(system_zone("pido")).hour().max(0) as u8
 }
 
 /// Environment status: pi install and provider auth.

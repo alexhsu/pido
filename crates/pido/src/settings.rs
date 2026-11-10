@@ -14,8 +14,12 @@ pub struct Settings {
     pub theme: Option<String>,
     /// `"zh-CN"` or `"en-US"`.
     pub locale: Option<String>,
-    /// The project directory of the last session, to prefill the picker.
+    /// The project directory of the last session, to prefill the picker and
+    /// reconnect at startup.
     pub last_project: Option<String>,
+    /// The session file of the last active session; the app resumes it on
+    /// startup instead of starting a fresh empty one.
+    pub last_session: Option<String>,
     pub window: Option<WindowState>,
 }
 
