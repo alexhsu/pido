@@ -176,7 +176,8 @@ pub fn render(
                                 let path = std::path::PathBuf::from(
                                     dir_for_start.read(cx).text().trim().to_string(),
                                 );
-                                start_state.update(cx, |s, cx| s.connect(path, None, cx));
+                                start_state
+                                    .update(cx, |s, cx| s.connect(path, None, Vec::new(), cx));
                             }),
                         )
                         .when_some(dead_reason, |this, reason| {

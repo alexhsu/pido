@@ -20,13 +20,33 @@ fn main() -> anyhow::Result<()> {
     println!("pi version: {:?}", pi_rpc::client::probe_pi_install(None));
     println!("spawning pi --mode rpc in {} ...", cwd.display());
 
-    let config =
-        pi_rpc::client::PiProcessConfig::new(&cwd).with_args(vec!["--no-session".to_string()]);
+    let mut args = vec!["--no-session".to_string()];
+    if let Ok(extra) = std::env::var("PI_SMOKE_ARGS") {
+        println!("-- PI_SMOKE_ARGS: {extra}");
+        args.extend(extra.split_whitespace().map(str::to_string));
+    }
+    let config = pi_rpc::client::PiProcessConfig::new(&cwd).with_args(args);
     let client = PiClient::spawn(&config)?;
     let subscriber = client.subscribe();
 
     println!("-- get_state --");
     let response = client.request(Command::GetState)?;
+    if let Some(Ok(Some(commands))) = client
+        .request(Command::GetCommands)
+        .ok()
+        .map(|r| r.data_as::<pi_rpc::protocol::AvailableCommands>())
+    {
+        println!(
+            "-- commands ({}) : {}",
+            commands.commands.len(),
+            commands
+                .commands
+                .iter()
+                .map(|c| c.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
     println!("success={} command={}", response.success, response.command);
     println!("data: {}", serde_json::to_string_pretty(&response.data)?);
     if !response.success {

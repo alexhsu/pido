@@ -176,6 +176,9 @@ pub struct AppState {
     pub workspace_files: Vec<String>,
     /// Images staged for the next prompt/steer (paste, picker or drop).
     pub pending_images: Vec<PendingImage>,
+    /// An extension dialog waiting for the user (select/confirm/input/
+    /// editor). None while nothing asks.
+    pub pending_dialog: Option<pi_rpc::protocol::ExtensionUiRequest>,
     /// Bumped whenever the conversation is replaced, so the message list gets
     /// a fresh scroll/away state instead of reusing the old session's.
     pub session_epoch: u64,
@@ -214,6 +217,7 @@ impl AppState {
                 commands: Vec::new(),
                 workspace_files: Vec::new(),
                 pending_images: Vec::new(),
+                pending_dialog: None,
                 session_epoch: 0,
                 pending_steers: Vec::new(),
                 pending_composer_text: None,
@@ -290,6 +294,7 @@ impl AppState {
         &mut self,
         cwd: PathBuf,
         resume_session: Option<String>,
+        extra_args: Vec<String>,
         cx: &mut Context<Self>,
     ) {
         if !cwd.is_dir() {
@@ -326,6 +331,7 @@ impl AppState {
             self.session_file = Some(session);
             self.last_session_loaded = true;
         }
+        args.extend(extra_args);
         let config = PiProcessConfig::new(&cwd).with_args(args);
         log::info!("state: connecting in {}", config.cwd.display());
         cx.spawn(async move |this, cx| {
@@ -511,6 +517,79 @@ impl AppState {
         }
     }
 
+    /// Send an extension-dialog response and close the dialog. A no-op when
+    /// a different dialog (or none) is pending, e.g. after pi's own timeout.
+    fn answer_dialog(&mut self, id: &str, response: Command, cx: &mut Context<Self>) {
+        let matches = self
+            .pending_dialog
+            .as_ref()
+            .is_some_and(|dialog| dialog.id == id);
+        if !matches {
+            return;
+        }
+        if let Some(client) = self.client()
+            && let Err(error) = client.send_uncorrelated(response)
+        {
+            log::warn!("state: failed to answer extension dialog: {error}");
+        }
+        self.pending_dialog = None;
+        cx.notify();
+    }
+
+    /// The user picked `value` in a select, or submitted input/editor text.
+    pub fn answer_dialog_value(&mut self, id: &str, value: String, cx: &mut Context<Self>) {
+        self.answer_dialog(
+            id,
+            Command::ExtensionUiResponse {
+                id: id.to_string(),
+                value: Some(value),
+                confirmed: None,
+                cancelled: None,
+            },
+            cx,
+        );
+    }
+
+    /// The user answered a confirm dialog.
+    pub fn answer_dialog_confirm(&mut self, id: &str, confirmed: bool, cx: &mut Context<Self>) {
+        self.answer_dialog(
+            id,
+            Command::ExtensionUiResponse {
+                id: id.to_string(),
+                value: None,
+                confirmed: Some(confirmed),
+                cancelled: None,
+            },
+            cx,
+        );
+    }
+
+    /// The user dismissed the dialog, or its timeout elapsed.
+    pub fn cancel_dialog(&mut self, id: &str, cx: &mut Context<Self>) {
+        self.answer_dialog(
+            id,
+            Command::ExtensionUiResponse {
+                id: id.to_string(),
+                value: None,
+                confirmed: None,
+                cancelled: Some(true),
+            },
+            cx,
+        );
+    }
+
+    /// Mirror pi's dialog timeout client-side.
+    pub fn expire_dialog(&mut self, id: &str, cx: &mut Context<Self>) {
+        let still_pending = self
+            .pending_dialog
+            .as_ref()
+            .is_some_and(|dialog| dialog.id == id);
+        if still_pending {
+            log::info!("state: extension dialog {id} timed out on our side");
+            self.cancel_dialog(id, cx);
+        }
+    }
+
     /// Fetch the `/` command list pi offers (extensions, templates, skills).
     fn load_commands(&self, cx: &Context<Self>) {
         let Some(client) = self.client() else { return };
@@ -611,7 +690,7 @@ impl AppState {
             .clone()
             .or_else(|| self.last_project.clone().map(PathBuf::from));
         if let Some(directory) = directory {
-            self.connect(directory, self.session_file.clone(), cx);
+            self.connect(directory, self.session_file.clone(), Vec::new(), cx);
         }
     }
 
@@ -1214,28 +1293,34 @@ impl AppState {
             RpcRecord::Response(response) => self.on_unmatched_response(response),
             RpcRecord::ExtensionUiRequest(request) => {
                 if request.method.is_dialog() {
-                    // Dialog methods block the extension until answered, and
-                    // pi only auto-resolves them when a timeout was supplied.
-                    // Until native dialogs exist, cancel explicitly so an
-                    // extension cannot wedge the whole agent.
-                    if let Some(client) = self.client()
-                        && let Err(error) = client.send_uncorrelated(Command::ExtensionUiResponse {
-                            id: request.id.clone(),
-                            value: None,
-                            confirmed: None,
-                            cancelled: Some(true),
-                        })
-                    {
-                        log::warn!("state: failed to cancel extension dialog: {error}");
-                    }
-                    let detail = request
-                        .title
-                        .or(request.message)
-                        .unwrap_or_else(|| i18n::t(cx, "extension_notify").to_string());
-                    self.push_notice(
-                        NoticeKind::Warn,
-                        format!("{}: {detail}", i18n::t(cx, "extension_dialog_cancelled")),
+                    // The extension blocks until we answer (or its own
+                    // timeout fires). Show the native dialog; a client-side
+                    // timer mirrors pi's timeout so a stale dialog cannot
+                    // sit forever after pi has already moved on.
+                    log::info!(
+                        "state: extension dialog {} ({:?})",
+                        request.id,
+                        request.method
                     );
+                    if let Some(timeout) = request.timeout {
+                        let id = request.id.clone();
+                        cx.spawn(async move |this, cx| {
+                            cx.background_executor()
+                                .timer(Duration::from_millis(timeout))
+                                .await;
+                            this.update(cx, |s, cx| s.expire_dialog(&id, cx)).ok();
+                        })
+                        .detach();
+                    }
+                    self.pending_dialog = Some(request.clone());
+                    cx.notify();
+                } else if request.method == pi_rpc::protocol::ExtensionUiMethod::SetEditorText {
+                    // The extension wants its text in the composer; the root
+                    // view drains this channel into the draft field.
+                    if let Some(text) = request.text {
+                        self.pending_composer_text = Some(text);
+                    }
+                    cx.notify();
                 } else {
                     let text = request
                         .message
@@ -1878,6 +1963,7 @@ mod tests {
             last_project: None,
             commands: Vec::new(),
             workspace_files: Vec::new(),
+            pending_dialog: None,
             pending_images: Vec::new(),
             next_image_key: 1,
             session_epoch: 0,
