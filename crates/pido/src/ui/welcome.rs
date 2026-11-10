@@ -6,14 +6,13 @@
 //! the last project automatically at startup.
 
 use ely_gpui_component::buttons::Button;
-use ely_gpui_component::chat::WelcomeScreen;
 use ely_gpui_component::forms::{PathInput, TextInput};
 use ely_gpui_component::theme::ActiveTheme;
 use ely_gpui_component::typography::format::{now, system_zone};
 use ely_gpui_component::typography::{Caption, Paragraph};
 use gpui::{
-    AppContext, Context, Hsla, IntoElement, ParentElement, SharedString, Styled, Window, div,
-    prelude::FluentBuilder,
+    App, AppContext, Context, Hsla, InteractiveElement, IntoElement, ParentElement, SharedString,
+    StatefulInteractiveElement, Styled, Window, div, prelude::FluentBuilder,
 };
 
 use crate::i18n;
@@ -60,59 +59,117 @@ pub fn render(
     let start_state = state.clone();
     let dir_for_start = dir_field.clone();
 
-    WelcomeScreen::new("welcome", local_hour()).child(
-        div()
-            .flex()
-            .flex_col()
-            .gap_5()
-            .w_full()
-            .child(Caption::new(i18n::t(cx, "welcome_desc")))
-            .child(render_environment(state, cx))
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_2()
-                    .child(Caption::new(i18n::t(cx, "project_dir")))
-                    .child(PathInput::new("project-dir", &dir_field).directories()),
-            )
-            .child(
-                Button::new(
-                    "start",
-                    if connecting {
-                        i18n::t(cx, "starting")
-                    } else {
-                        i18n::t(cx, "start")
-                    },
-                )
-                .disabled(connecting || typed.is_empty())
-                .on_click(move |_, _, cx| {
-                    let path =
-                        std::path::PathBuf::from(dir_for_start.read(cx).text().trim().to_string());
-                    start_state.update(cx, |s, cx| s.connect(path, None, cx));
-                }),
-            )
-            .when_some(dead_reason, |this, reason| {
-                let reset_state = state.clone();
-                this.child(banner(
-                    danger_fill,
-                    danger_ink,
-                    i18n::t(cx, "connection_failed"),
-                    reason.into(),
-                ))
+    // Ely's WelcomeScreen greets in hardcoded English with no locale hook,
+    // so the same layout (centered container column, sparkles mark, Xxl
+    // greeting) is composed here with the greeting from our i18n catalog.
+    let theme = cx.theme();
+    let column = theme.container_width(ely_gpui_component::theme::ContainerSize::Md);
+
+    div()
+        .id("welcome")
+        .size_full()
+        .overflow_y_scroll()
+        .flex()
+        .flex_col()
+        .items_center()
+        .p_6()
+        .child(div().flex_1())
+        .child(
+            div()
+                .flex_none()
+                .w_full()
+                .max_w(column)
+                .flex()
+                .flex_col()
+                .gap_6()
                 .child(
-                    ely_gpui_component::buttons::Button::new("reconnect", i18n::t(cx, "reconnect"))
-                        .on_click(move |_, _, cx| {
-                            reset_state.update(cx, |s, cx| s.disconnect(cx));
-                        }),
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .gap_3()
+                        .child(
+                            ely_gpui_component::primitives::Icon::new(
+                                ely_gpui_component::primitives::IconName::Sparkles,
+                            )
+                            .size(ely_gpui_component::theme::IconSize::Lg)
+                            .color(theme.colors.accent),
+                        )
+                        .child(
+                            div()
+                                .min_w_0()
+                                .text_size(
+                                    theme.text_size(ely_gpui_component::theme::TextSize::Xxl),
+                                )
+                                .text_color(theme.colors.fg)
+                                .child(greeting(cx)),
+                        ),
                 )
-            }),
-    )
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_5()
+                        .w_full()
+                        .child(Caption::new(i18n::t(cx, "welcome_desc")))
+                        .child(render_environment(state, cx))
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap_2()
+                                .child(Caption::new(i18n::t(cx, "project_dir")))
+                                .child(PathInput::new("project-dir", &dir_field).directories()),
+                        )
+                        .child(
+                            Button::new(
+                                "start",
+                                if connecting {
+                                    i18n::t(cx, "starting")
+                                } else {
+                                    i18n::t(cx, "start")
+                                },
+                            )
+                            .disabled(connecting || typed.is_empty())
+                            .on_click(move |_, _, cx| {
+                                let path = std::path::PathBuf::from(
+                                    dir_for_start.read(cx).text().trim().to_string(),
+                                );
+                                start_state.update(cx, |s, cx| s.connect(path, None, cx));
+                            }),
+                        )
+                        .when_some(dead_reason, |this, reason| {
+                            let reset_state = state.clone();
+                            this.child(banner(
+                                danger_fill,
+                                danger_ink,
+                                i18n::t(cx, "connection_failed"),
+                                reason.into(),
+                            ))
+                            .child(
+                                ely_gpui_component::buttons::Button::new(
+                                    "reconnect",
+                                    i18n::t(cx, "reconnect"),
+                                )
+                                .on_click(move |_, _, cx| {
+                                    reset_state.update(cx, |s, cx| s.disconnect(cx));
+                                }),
+                            )
+                        }),
+                ),
+        )
+        .child(div().flex_1())
 }
 
-/// The reader's local hour, 0–23, for the welcome greeting.
-fn local_hour() -> u8 {
-    now().to_zoned(system_zone("pido")).hour().max(0) as u8
+/// The time-of-day greeting in the active locale.
+fn greeting(cx: &App) -> SharedString {
+    let hour = now().to_zoned(system_zone("pido")).hour();
+    let key = match hour {
+        5..=11 => "greeting_morning",
+        12..=17 => "greeting_afternoon",
+        _ => "greeting_evening",
+    };
+    i18n::t(cx, key)
 }
 
 /// Environment status: pi install and provider auth.
