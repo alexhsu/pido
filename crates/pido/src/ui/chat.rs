@@ -139,12 +139,18 @@ pub fn render_header(state: &Entity<AppState>, cx: &App) -> impl IntoElement + u
 }
 
 /// The scrollable transcript area with the notice banner and empty state.
-/// Parent is Ely's `ChatContainer`, which supplies the column height.
+///
+/// Parent is Ely's `ChatContainer`, which supplies the column height but no
+/// horizontal padding for messages (it gives that treatment only to the
+/// composer). The message column here mirrors the composer's: centered,
+/// `px_4`, capped at the theme's medium container width.
 pub fn render_transcript(
     state: &Entity<AppState>,
     _window: &mut Window,
     cx: &App,
 ) -> impl IntoElement + use<> {
+    let theme = cx.theme();
+    let column = theme.container_width(ely_gpui_component::theme::ContainerSize::Md);
     let s = state.read(cx);
     let count = s.transcript.len();
     let empty = count == 0;
@@ -162,21 +168,44 @@ pub fn render_transcript(
         .when_some(notice, |this, banner| {
             this.child(div().px_4().pt_2().child(banner))
         })
-        .child(if empty {
+        .child(
             div()
                 .flex_1()
+                .min_h_0()
+                .w_full()
                 .flex()
-                .items_center()
                 .justify_center()
-                .child(Caption::new(i18n::t(cx, "empty_transcript")))
-                .into_any_element()
-        } else {
-            MessageList::new("transcript", count, move |ix, _window, cx| {
-                let s = app.read(cx);
-                render_item(&s.transcript[ix], ix, cx).into_any_element()
-            })
-            .into_any_element()
-        })
+                .px_4()
+                .child(
+                    div()
+                        .w_full()
+                        .max_w(column)
+                        .flex()
+                        .flex_col()
+                        .child(if empty {
+                            div()
+                                .flex_1()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .child(Caption::new(i18n::t(cx, "empty_transcript")))
+                                .into_any_element()
+                        } else {
+                            div()
+                                .flex_1()
+                                .min_h_0()
+                                .child(MessageList::new(
+                                    "transcript",
+                                    count,
+                                    move |ix, _window, cx| {
+                                        let s = app.read(cx);
+                                        render_item(&s.transcript[ix], ix, cx).into_any_element()
+                                    },
+                                ))
+                                .into_any_element()
+                        }),
+                ),
+        )
 }
 
 /// One transcript row. `ix` keys element ids so streaming text is stable.
