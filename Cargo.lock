@@ -5068,6 +5068,7 @@ dependencies = [
  "base64 0.22.1",
  "dirs 6.0.0",
  "ely-gpui-component",
+ "embed-resource",
  "env_logger",
  "gpui-pre",
  "gpui-pre-platform",

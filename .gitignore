@@ -2,3 +2,7 @@
 *.log
 .DS_Store
 shot*.png
+icon-preview*.png
+titlebar-*.png
+screen-*.png
+exe-icon.png

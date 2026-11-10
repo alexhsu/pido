@@ -1,0 +1,4 @@
+// The application icon. Resource id 1 is the lowest, so Explorer, the
+// taskbar and the window class all pick it up without any runtime call
+// (gpui only takes a window icon on X11).
+1 ICON "assets/pido.ico"

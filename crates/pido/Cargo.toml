@@ -11,6 +11,9 @@ publish.workspace = true
 name = "pido"
 path = "src/main.rs"
 
+[build-dependencies]
+embed-resource = "3"
+
 [dependencies]
 pi-rpc.workspace = true
 ely-gpui-component.workspace = true
