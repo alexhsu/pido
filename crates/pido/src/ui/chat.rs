@@ -155,13 +155,16 @@ pub fn render_transcript(state: &Entity<AppState>, cx: &App) -> impl IntoElement
                         let column = cx
                             .theme()
                             .container_width(ely_gpui_component::theme::ContainerSize::Md);
+                        let fork_point = crate::state::fork_point_for(&s.transcript, ix);
                         div()
                             .w_full()
                             .flex()
                             .justify_center()
                             .px_4()
                             .child(div().w_full().max_w(column).min_w_0().child(render_item(
+                                &app,
                                 &s.transcript[ix],
+                                fork_point,
                                 ix,
                                 cx,
                             )))
@@ -173,7 +176,13 @@ pub fn render_transcript(state: &Entity<AppState>, cx: &App) -> impl IntoElement
 }
 
 /// One transcript row. `ix` keys element ids so streaming text is stable.
-fn render_item(item: &TranscriptItem, ix: usize, cx: &App) -> AnyElement {
+fn render_item(
+    app: &Entity<AppState>,
+    item: &TranscriptItem,
+    fork_point: Option<(String, usize)>,
+    ix: usize,
+    cx: &App,
+) -> AnyElement {
     let theme = cx.theme();
     match item {
         TranscriptItem::User { text, time } => {
@@ -286,7 +295,7 @@ fn render_item(item: &TranscriptItem, ix: usize, cx: &App) -> AnyElement {
             // has nothing stable to copy yet.
             if view.finished {
                 wrapper
-                    .child(assistant_footer(ix, view, cx))
+                    .child(assistant_footer(app, fork_point, ix, view, cx))
                     .into_any_element()
             } else {
                 wrapper.into_any_element()
@@ -337,9 +346,15 @@ fn group(ix: usize) -> SharedString {
     SharedString::from(format!("msg-{ix}"))
 }
 
-/// The action row under a finished assistant message: copy, what the turn
-/// cost in tokens, and when it landed.
-fn assistant_footer(ix: usize, view: &AssistantView, cx: &App) -> AnyElement {
+/// The action row under a finished assistant message: copy, fork the turn,
+/// what it cost in tokens, and when it landed.
+fn assistant_footer(
+    app: &Entity<AppState>,
+    fork_point: Option<(String, usize)>,
+    ix: usize,
+    view: &AssistantView,
+    cx: &App,
+) -> AnyElement {
     let theme = cx.theme();
     let copy = view.text();
     let usage = view
@@ -363,6 +378,22 @@ fn assistant_footer(ix: usize, view: &AssistantView, cx: &App) -> AnyElement {
             .tooltip(i18n::t(cx, "copy_message"))
             .on_click(move |_, _, cx| {
                 cx.write_to_clipboard(gpui::ClipboardItem::new_string(copy.to_string()));
+            })
+        })
+        .when_some(fork_point, |this, (text, occurrence)| {
+            this.child({
+                let app = app.clone();
+                ely_gpui_component::buttons::IconButton::new(
+                    ("fork-turn", ix),
+                    ely_gpui_component::primitives::IconName::GitBranch,
+                )
+                .variant(ely_gpui_component::buttons::ButtonVariant::Ghost)
+                .size(ControlSize::Sm)
+                .tooltip(i18n::t(cx, "fork_turn"))
+                .on_click(move |_, _, cx| {
+                    let (text, occurrence) = (text.clone(), occurrence);
+                    app.update(cx, |s, cx| s.fork_turn(&text, occurrence, cx));
+                })
             })
         })
         .when_some(usage, |this, usage| {

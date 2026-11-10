@@ -1442,6 +1442,83 @@ impl AppState {
         .detach();
     }
 
+    /// Fork the open session from the user prompt that started the turn the
+    /// pointer is on: pi branches there and rebinds, so the transcript is
+    /// rebuilt from the new leaf afterwards.
+    pub fn fork_turn(&mut self, user_text: &str, occurrence: usize, cx: &mut Context<Self>) {
+        if self.conn != Conn::Live {
+            return;
+        }
+        if self.streaming {
+            self.push_notice(NoticeKind::Warn, i18n::t(cx, "agent_busy").to_string());
+            cx.notify();
+            return;
+        }
+        let Some(client) = self.client() else { return };
+        let user_text = user_text.to_string();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn({
+                    let user_text = user_text.clone();
+                    async move {
+                        let listing = client.request(Command::GetForkMessages)?;
+                        if !listing.success {
+                            anyhow::bail!("get_fork_messages failed: {:?}", listing.error);
+                        }
+                        let messages = listing
+                            .data_as::<pi_rpc::protocol::ForkMessages>()?
+                            .unwrap_or_default()
+                            .messages;
+                        let entry_id = messages
+                            .iter()
+                            .filter(|message| message.text == user_text)
+                            .nth(occurrence)
+                            .map(|message| message.entry_id.clone())
+                            .ok_or_else(|| anyhow::anyhow!("fork point not found"))?;
+                        let forked = client.request(Command::Fork { entry_id })?;
+                        if !forked.success {
+                            anyhow::bail!("fork failed: {:?}", forked.error);
+                        }
+                        Ok(session_action_cancelled(&forked))
+                    }
+                })
+                .await;
+            this.update(cx, |s, cx| {
+                match result {
+                    Ok(cancelled) => {
+                        if cancelled {
+                            s.push_notice(
+                                NoticeKind::Warn,
+                                i18n::t(cx, "session_cancelled").to_string(),
+                            );
+                        } else {
+                            // Pi rebound to the fork; rebuild around it.
+                            s.transcript.clear();
+                            s.clear_changes();
+                            s.session_name = None;
+                            s.stats = None;
+                            s.session_epoch += 1;
+                            s.pending_steers.clear();
+                            s.query_state(cx);
+                            s.load_history(cx);
+                            s.refresh_stats(cx);
+                            s.refresh_sessions(cx);
+                            s.push_notice(
+                                NoticeKind::Info,
+                                i18n::t(cx, "session_forked").to_string(),
+                            );
+                        }
+                    }
+                    Err(error) => s.push_notice(NoticeKind::Error, error.to_string()),
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     /// Duplicate a session's active branch into a new session. Forking a
     /// session that is not open switches to it for the clone and then back,
     /// so the user's place survives; forking the open one leaves the clone
@@ -2642,6 +2719,29 @@ impl AppState {
     }
 }
 
+/// The fork point of the assistant turn at `ix`: the text of the user
+/// prompt that started it, and which occurrence of that text it is, so
+/// duplicate prompts land on the right entry.
+pub(crate) fn fork_point_for(items: &[TranscriptItem], ix: usize) -> Option<(String, usize)> {
+    let row = items.get(ix)?;
+    if !matches!(row, TranscriptItem::Assistant(_)) {
+        return None;
+    }
+    let mut at = None;
+    for (j, item) in items[..ix].iter().enumerate().rev() {
+        if let TranscriptItem::User { text, .. } = item {
+            at = Some((j, text.to_string()));
+            break;
+        }
+    }
+    let (j, text) = at?;
+    let occurrence = items[..j]
+        .iter()
+        .filter(|item| matches!(item, TranscriptItem::User { text: t, .. } if *t == text))
+        .count();
+    Some((text, occurrence))
+}
+
 /// Only assistant message starts open a transcript view. Pi emits the same
 /// event for user prompts/steering, tool results and custom messages.
 fn opens_assistant_view(message: &Option<AgentMessage>) -> bool {
@@ -3010,6 +3110,19 @@ mod tests {
 +let c = 4;
  let d = 5;
 ";
+
+    #[test]
+    fn the_fork_point_is_the_user_prompt_that_started_the_turn() {
+        let user = |text: &str| TranscriptItem::User {
+            text: text.into(),
+            time: None,
+        };
+        let assistant = || TranscriptItem::Assistant(Box::new(AssistantView::streaming()));
+        let items = vec![user("hi"), assistant(), user("hi"), assistant()];
+        assert_eq!(fork_point_for(&items, 1), Some(("hi".to_string(), 0)));
+        assert_eq!(fork_point_for(&items, 3), Some(("hi".to_string(), 1)));
+        assert_eq!(fork_point_for(&items, 0), None, "not an assistant row");
+    }
 
     #[test]
     fn timestamps_understand_seconds_and_milliseconds() {

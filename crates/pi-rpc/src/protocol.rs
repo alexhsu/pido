@@ -995,6 +995,22 @@ pub struct AvailableThinkingLevels {
     pub levels: Vec<ThinkingLevel>,
 }
 
+/// One forkable user prompt: its session entry and its text.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ForkMessage {
+    pub entry_id: String,
+    pub text: String,
+}
+
+/// `get_fork_messages` payload: the user prompts a fork may start from.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ForkMessages {
+    #[serde(default)]
+    pub messages: Vec<ForkMessage>,
+}
+
 /// `get_entries` payload.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
