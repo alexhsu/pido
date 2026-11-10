@@ -9,8 +9,8 @@ use ely_gpui_component::chat::{
 use ely_gpui_component::theme::{ActiveTheme, ControlSize, IconSize, TextSize};
 use ely_gpui_component::typography::{Caption, Paragraph};
 use gpui::{
-    AnyElement, App, Entity, InteractiveElement, IntoElement, ParentElement, SharedString, Styled,
-    div, prelude::FluentBuilder,
+    AnyElement, App, Entity, InteractiveElement, IntoElement, ParentElement, SharedString,
+    StatefulInteractiveElement, Styled, div, prelude::FluentBuilder,
 };
 use pi_rpc::protocol::ThinkingLevel;
 
@@ -156,6 +156,10 @@ pub fn render_transcript(state: &Entity<AppState>, cx: &App) -> impl IntoElement
                             .theme()
                             .container_width(ely_gpui_component::theme::ContainerSize::Md);
                         let fork_point = crate::state::fork_point_for(&s.transcript, ix);
+                        // A finished turn folds its tool calls and thinking
+                        // away until its status line is clicked.
+                        let folded =
+                            crate::state::turn_folded_for(&s.transcript, ix, &s.expanded_turns);
                         div()
                             .w_full()
                             .flex()
@@ -165,6 +169,7 @@ pub fn render_transcript(state: &Entity<AppState>, cx: &App) -> impl IntoElement
                                 &app,
                                 &s.transcript[ix],
                                 fork_point,
+                                folded,
                                 ix,
                                 cx,
                             )))
@@ -180,11 +185,71 @@ fn render_item(
     app: &Entity<AppState>,
     item: &TranscriptItem,
     fork_point: Option<(String, usize)>,
+    folded: bool,
     ix: usize,
     cx: &App,
 ) -> AnyElement {
     let theme = cx.theme();
     match item {
+        // A turn's status line: the working clock while it runs, then what
+        // the turn cost, with a chevron that re-opens what was folded away.
+        TranscriptItem::Turn { started, took } => {
+            let (text, running) = match took {
+                Some(took) => (
+                    i18n::t_arg(cx, "turn_done", "t", &i18n::format_duration(cx, *took)),
+                    false,
+                ),
+                None => (
+                    i18n::t_arg(
+                        cx,
+                        "turn_working",
+                        "t",
+                        &i18n::format_duration(cx, started.elapsed()),
+                    ),
+                    true,
+                ),
+            };
+            let expanded = app.read(cx).expanded_turns.contains(&(ix as u64));
+            let app = app.clone();
+            div()
+                .id(("turn", ix))
+                .flex_none()
+                .flex()
+                .items_center()
+                .gap_1p5()
+                .py_1()
+                .mb_1()
+                .border_b_1()
+                .border_color(theme.colors.border)
+                .text_size(theme.text_size(TextSize::Sm))
+                .text_color(theme.colors.fg_subtle)
+                .when(!running, |this| {
+                    this.cursor_pointer()
+                        .hover(|style| style.text_color(theme.colors.fg))
+                        .on_click(move |_, _, cx| {
+                            app.update(cx, |s, cx| {
+                                if s.expanded_turns.contains(&(ix as u64)) {
+                                    s.expanded_turns.remove(&(ix as u64));
+                                } else {
+                                    s.expanded_turns.insert(ix as u64);
+                                }
+                                cx.notify();
+                            });
+                        })
+                })
+                .child(text)
+                .when(!running, |this| {
+                    this.child(
+                        // The reference shows the down chevron while folded.
+                        ely_gpui_component::primitives::Disclosure::new(
+                            ("turn-chevron", ix),
+                            !expanded,
+                        )
+                        .size(ely_gpui_component::theme::IconSize::Xs),
+                    )
+                })
+                .into_any_element()
+        }
         TranscriptItem::User { text, time } => {
             let group = SharedString::from(format!("user-{ix}"));
             let footer = div()
@@ -238,7 +303,7 @@ fn render_item(
             }
             let mut bubble = MessageBubble::new(Role::Assistant)
                 .header(MessageHeader::new(("header", ix), i18n::t(cx, "pi")));
-            if !thinking.is_empty() {
+            if !thinking.is_empty() && !folded {
                 // Only a still-thinking view ticks; a finished one shows the
                 // frozen duration. Restored history records no durations, so
                 // it falls back to "Thought for a moment" (Duration::ZERO)
@@ -301,6 +366,7 @@ fn render_item(
                 wrapper.into_any_element()
             }
         }
+        TranscriptItem::Tool(card) if folded => div().into_any_element(),
         TranscriptItem::Tool(card) => {
             let status = if card.running {
                 StepState::Working
@@ -323,6 +389,7 @@ fn render_item(
             }
             div().px_1().child(rendered).into_any_element()
         }
+        TranscriptItem::Notice { .. } if folded => div().into_any_element(),
         TranscriptItem::Notice { kind, text } => {
             let (fill, ink) = match kind {
                 NoticeKind::Info => (theme.colors.info_subtle, theme.colors.info),

@@ -57,6 +57,12 @@ pub enum TranscriptItem {
         /// Wall-clock stamp, unix seconds; drives the hover footer.
         time: Option<i64>,
     },
+    /// A turn's status line, sitting between its prompt and its content.
+    /// `took` None means the turn is still running (the clock ticks).
+    Turn {
+        started: Instant,
+        took: Option<Duration>,
+    },
     Assistant(Box<AssistantView>),
     Tool(ToolView),
     Notice {
@@ -679,6 +685,12 @@ pub struct AppState {
     /// Messages waiting in pi's queues, as `queue_update` reports them.
     pub queued_steers: Vec<gpui::SharedString>,
     pub queued_follow_ups: Vec<gpui::SharedString>,
+    /// Turn status lines the user re-opened after completion, keyed by the
+    /// turn item's transcript index.
+    pub expanded_turns: std::collections::HashSet<u64>,
+    /// True between a prompt and its `agent_settled`; drives the one-second
+    /// ticker that keeps the working clock moving during silent stretches.
+    turn_running: bool,
     /// Files the agent changed in this session, newest first.
     pub changes: Vec<ChangeFile>,
     /// Counter stamped on each recorded change.
@@ -741,6 +753,8 @@ impl AppState {
                 pending_steers: Vec::new(),
                 queued_steers: Vec::new(),
                 queued_follow_ups: Vec::new(),
+                expanded_turns: std::collections::HashSet::new(),
+                turn_running: false,
                 changes: Vec::new(),
                 changes_seq: 0,
                 pending_writes: HashMap::new(),
@@ -829,6 +843,8 @@ impl AppState {
         self.conn = Conn::Connecting;
         self.cwd = Some(cwd.clone());
         self.transcript.clear();
+        self.expanded_turns.clear();
+        self.turn_running = false;
         self.clear_changes();
         self.notice = None;
         self.streaming = false;
@@ -993,6 +1009,43 @@ impl AppState {
             &self.pinned_sessions,
             &self.archived_sessions,
         )
+    }
+
+    /// One clock per second while a turn runs, so the working time advances
+    /// even when the model is quietly thinking and no deltas arrive.
+    fn spawn_turn_ticker(&self, cx: &Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_secs(1))
+                    .await;
+                let awake = this.update(cx, |s, cx| {
+                    if s.turn_running {
+                        cx.notify();
+                        true
+                    } else {
+                        false
+                    }
+                });
+                if !awake.unwrap_or(false) {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// Freeze the running turn's clock; a no-op when nothing is running.
+    fn finish_running_turn(&mut self) {
+        self.turn_running = false;
+        for item in self.transcript.iter_mut().rev() {
+            if let TranscriptItem::Turn { started, took } = item {
+                if took.is_none() {
+                    *took = Some(started.elapsed());
+                }
+                break;
+            }
+        }
     }
 
     /// Fold or unfold a project in the sidebar. An empty `cwd` folds the
@@ -1495,6 +1548,8 @@ impl AppState {
                         } else {
                             // Pi rebound to the fork; rebuild around it.
                             s.transcript.clear();
+                            s.expanded_turns.clear();
+                            s.turn_running = false;
                             s.clear_changes();
                             s.session_name = None;
                             s.stats = None;
@@ -1585,6 +1640,8 @@ impl AppState {
                         } else {
                             // The clone is active now; rebuild around it.
                             s.transcript.clear();
+                            s.expanded_turns.clear();
+                            s.turn_running = false;
                             s.clear_changes();
                             s.session_name = None;
                             s.stats = None;
@@ -1618,6 +1675,8 @@ impl AppState {
         }
         self.conn = Conn::Idle;
         self.transcript.clear();
+        self.expanded_turns.clear();
+        self.turn_running = false;
         self.clear_changes();
         self.streaming = false;
         self.stats = None;
@@ -1750,6 +1809,15 @@ impl AppState {
         self.clear_images();
         if steering {
             self.pending_steers.push(text.clone());
+        } else {
+            // A fresh turn: its status line sits between this prompt and the
+            // content, clocking the work until the agent settles.
+            self.transcript.push(TranscriptItem::Turn {
+                started: Instant::now(),
+                took: None,
+            });
+            self.turn_running = true;
+            self.spawn_turn_ticker(cx);
         }
         self.transcript.push(TranscriptItem::User {
             text: text.clone().into(),
@@ -1884,6 +1952,8 @@ impl AppState {
                             );
                         } else {
                             s.transcript.clear();
+                            s.expanded_turns.clear();
+                            s.turn_running = false;
                             s.clear_changes();
                             s.session_name = None;
                             s.stats = None;
@@ -1955,6 +2025,8 @@ impl AppState {
                             );
                         } else {
                             s.transcript.clear();
+                            s.expanded_turns.clear();
+                            s.turn_running = false;
                             s.clear_changes();
                             s.session_name = None;
                             s.stats = None;
@@ -2306,6 +2378,7 @@ impl AppState {
             }
             Event::AgentSettled { aborted } => {
                 self.streaming = false;
+                self.finish_running_turn();
                 self.pending_steers.clear();
                 self.queued_steers.clear();
                 self.queued_follow_ups.clear();
@@ -2644,7 +2717,10 @@ impl AppState {
     /// Rebuild the transcript from `get_entries` payload.
     fn load_entries(&mut self, entries: &[SessionEntry], leaf_id: Option<&str>) {
         self.transcript.clear();
+        self.expanded_turns.clear();
+        self.turn_running = false;
         self.clear_changes();
+
         // `write` calls carry their content in the call itself; the result
         // that follows only confirms it.
         let mut calls: HashMap<String, pi_rpc::protocol::ToolCall> = HashMap::new();
@@ -2740,6 +2816,21 @@ pub(crate) fn fork_point_for(items: &[TranscriptItem], ix: usize) -> Option<(Str
         .filter(|item| matches!(item, TranscriptItem::User { text: t, .. } if *t == text))
         .count();
     Some((text, occurrence))
+}
+
+/// Whether the row at `ix` sits in a finished, still-folded turn: its tool
+/// calls, notices and thinking are hidden until the turn is re-opened.
+pub(crate) fn turn_folded_for(
+    items: &[TranscriptItem],
+    ix: usize,
+    expanded: &std::collections::HashSet<u64>,
+) -> bool {
+    for (j, item) in items[..ix.min(items.len())].iter().enumerate().rev() {
+        if let TranscriptItem::Turn { took, .. } = item {
+            return took.is_some() && !expanded.contains(&(j as u64));
+        }
+    }
+    false
 }
 
 /// Only assistant message starts open a transcript view. Pi emits the same
@@ -2992,6 +3083,8 @@ mod tests {
             pending_steers: Vec::new(),
             queued_steers: Vec::new(),
             queued_follow_ups: Vec::new(),
+            expanded_turns: std::collections::HashSet::new(),
+            turn_running: false,
             changes: Vec::new(),
             changes_seq: 0,
             pending_writes: HashMap::new(),
@@ -3068,6 +3161,7 @@ mod tests {
             .iter()
             .map(|item| match item {
                 TranscriptItem::User { text, .. } => format!("user:{text}"),
+                TranscriptItem::Turn { .. } => "turn".to_string(),
                 TranscriptItem::Assistant(view) => format!("assistant:{}", view.text()),
                 TranscriptItem::Tool(card) => {
                     format!("tool:{}:{:?}", card.name, card.result.as_deref())
@@ -3110,6 +3204,52 @@ mod tests {
 +let c = 4;
  let d = 5;
 ";
+
+    #[test]
+    fn a_finished_turn_folds_its_content_until_reopened() {
+        let user = || TranscriptItem::User {
+            text: "hi".into(),
+            time: None,
+        };
+        let assistant = || TranscriptItem::Assistant(Box::new(AssistantView::streaming()));
+        let turn = |took: Option<Duration>| TranscriptItem::Turn {
+            started: Instant::now(),
+            took,
+        };
+        let items = vec![
+            user(),
+            turn(Some(Duration::from_secs(4))),
+            assistant(),
+            TranscriptItem::Tool(ToolView {
+                call_id: "c".into(),
+                name: "bash".into(),
+                args: None,
+                running: false,
+                failed: false,
+                result: None,
+                started: Instant::now(),
+                took: None,
+            }),
+            user(),
+            turn(None),
+            assistant(),
+        ];
+        let none = std::collections::HashSet::new();
+        assert!(!turn_folded_for(&items, 1, &none), "the status row itself");
+        assert!(
+            turn_folded_for(&items, 2, &none),
+            "text stays visible though"
+        );
+        assert!(turn_folded_for(&items, 3, &none), "tool hides while folded");
+        assert!(
+            !turn_folded_for(&items, 6, &none),
+            "running turn stays open"
+        );
+
+        let mut open = std::collections::HashSet::new();
+        open.insert(1u64);
+        assert!(!turn_folded_for(&items, 3, &open), "re-opened shows tools");
+    }
 
     #[test]
     fn the_fork_point_is_the_user_prompt_that_started_the_turn() {

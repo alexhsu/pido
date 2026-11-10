@@ -110,6 +110,8 @@ pub fn init(cx: &mut App, default: &str) {
                     ("session_archived", "已归档该会话"),
                     ("session_unarchived", "已取消归档"),
                     ("usage", "用量"),
+                    ("turn_working", "已工作 {t}"),
+                    ("turn_done", "已完成，用时 {t}"),
                     ("text_copied", "已复制"),
                     ("copy_message", "复制内容"),
                     ("queued_steer", "转向"),
@@ -210,6 +212,8 @@ pub fn init(cx: &mut App, default: &str) {
                     ("session_archived", "Session archived"),
                     ("session_unarchived", "Session unarchived"),
                     ("usage", "Usage"),
+                    ("turn_working", "Working · {t}"),
+                    ("turn_done", "Done in {t}"),
                     ("text_copied", "Copied"),
                     ("copy_message", "Copy text"),
                     ("queued_steer", "Steer"),
@@ -227,6 +231,34 @@ pub fn t(cx: &App, key: &str) -> SharedString {
 /// Look up `key` with one `{name}` argument filled.
 pub fn t_arg(cx: &App, key: &str, name: &str, value: &str) -> SharedString {
     cx.global::<I18n>().text(key, &[(name, value)])
+}
+
+/// A wall-clock span ("2时7分4秒" / "2h 7m 4s"), skipping zero leading
+/// units so a 64-second turn reads "1分4秒" / "1m 4s".
+pub fn format_duration(cx: &App, span: std::time::Duration) -> String {
+    let total = span.as_secs();
+    let (h, m, s) = (total / 3_600, total % 3_600 / 60, total % 60);
+    if is_zh(cx) {
+        let mut out = String::new();
+        if h > 0 {
+            out.push_str(&format!("{h}小时"));
+        }
+        if h > 0 || m > 0 {
+            out.push_str(&format!("{m}分"));
+        }
+        out.push_str(&format!("{s}秒"));
+        out
+    } else {
+        let mut parts = Vec::new();
+        if h > 0 {
+            parts.push(format!("{h}h"));
+        }
+        if h > 0 || m > 0 {
+            parts.push(format!("{m}m"));
+        }
+        parts.push(format!("{s}s"));
+        parts.join(" ")
+    }
 }
 
 /// Whether the active locale is Chinese, for formats a catalog cannot
