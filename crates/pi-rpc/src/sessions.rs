@@ -17,8 +17,12 @@ use std::time::SystemTime;
 
 use serde::Deserialize;
 
-/// Default session root: `~/.pi/agent/sessions`.
+/// Default session root: `$PI_CODING_AGENT_SESSION_DIR`, else
+/// `~/.pi/agent/sessions`. Pi honours the same variable.
 pub fn default_session_dir() -> Option<PathBuf> {
+    if let Some(dir) = std::env::var_os("PI_CODING_AGENT_SESSION_DIR") {
+        return Some(PathBuf::from(dir));
+    }
     dirs::home_dir().map(|home| home.join(".pi").join("agent").join("sessions"))
 }
 

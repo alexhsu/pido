@@ -166,6 +166,60 @@ impl AssistantView {
     }
 }
 
+/// One row of the sidebar: a project header or a session.
+#[derive(Debug, Clone)]
+pub enum SidebarRow {
+    /// A project directory, as the last two path segments.
+    Group { label: gpui::SharedString },
+    /// A session file.
+    Session {
+        path: gpui::SharedString,
+        title: gpui::SharedString,
+        /// Last activity, unix seconds: the age label is built at draw time,
+        /// so it follows the locale without rebuilding the rows.
+        updated: Option<i64>,
+    },
+}
+
+/// Flatten grouped sessions into the sidebar's row order.
+fn flatten_groups(groups: &[SessionGroup]) -> Vec<SidebarRow> {
+    let mut rows = Vec::with_capacity(
+        groups
+            .iter()
+            .map(|group| group.sessions.len() + 1)
+            .sum::<usize>(),
+    );
+    for group in groups {
+        rows.push(SidebarRow::Group {
+            label: shorten_project(&group.cwd).into(),
+        });
+        for session in &group.sessions {
+            let title = session
+                .name
+                .clone()
+                .or_else(|| session.preview.clone())
+                .unwrap_or_else(|| session.session_id.clone());
+            rows.push(SidebarRow::Session {
+                path: session.path.to_string_lossy().into_owned().into(),
+                title: title.into(),
+                updated: session.updated_secs,
+            });
+        }
+    }
+    rows
+}
+
+/// `D:\develop\code\pido` → `code / pido`, so a project header stays short.
+pub fn shorten_project(path: &str) -> String {
+    let normalized = path.replace('\\', "/");
+    let parts: Vec<&str> = normalized.split('/').filter(|p| !p.is_empty()).collect();
+    match parts.len() {
+        0 => path.to_string(),
+        1 => parts[0].to_string(),
+        n => format!("{} / {}", parts[n - 2], parts[n - 1]),
+    }
+}
+
 /// A finished message's text and its parsed blocks.
 #[derive(Clone)]
 pub struct CachedMarkdown {
@@ -227,7 +281,13 @@ pub struct AppState {
     pub current_model: Option<Model>,
     pub thinking_levels: Vec<ThinkingLevel>,
     pub thinking_level: Option<ThinkingLevel>,
+    /// Sessions per project, as last scanned. The sidebar draws
+    /// `sidebar_rows`, which is this flattened once per scan.
     pub session_groups: Vec<SessionGroup>,
+    /// The sidebar's rows, flattened once per scan: a header per project and
+    /// a row per session. Rendering reads these instead of rebuilding strings
+    /// per frame, and the list virtualises over the same order.
+    pub sidebar_rows: Vec<SidebarRow>,
     pub session_name: Option<String>,
     /// The active session's file path, as reported by `get_state`.
     pub session_file: Option<String>,
@@ -277,6 +337,7 @@ impl AppState {
                 thinking_levels: Vec::new(),
                 thinking_level: None,
                 session_groups: Vec::new(),
+                sidebar_rows: Vec::new(),
                 session_name: None,
                 session_file: None,
                 last_session_loaded: false,
@@ -817,6 +878,7 @@ impl AppState {
                 })
                 .await;
             this.update(cx, |s, cx| {
+                s.sidebar_rows = flatten_groups(&groups);
                 s.session_groups = groups;
                 cx.notify();
             })
@@ -2027,6 +2089,7 @@ mod tests {
             thinking_levels: Vec::new(),
             thinking_level: None,
             session_groups: Vec::new(),
+            sidebar_rows: Vec::new(),
             session_name: None,
             session_file: None,
             last_session_loaded: false,

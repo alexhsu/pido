@@ -7,17 +7,17 @@
 //! component's built-in day buckets.
 
 use ely_gpui_component::buttons::Button;
-use ely_gpui_component::layout::ScrollArea;
+use ely_gpui_component::lists::VirtualList;
 use ely_gpui_component::primitives::{Icon, IconName};
 use ely_gpui_component::theme::{ActiveTheme, ControlSize, IconSize, Radius, TextSize};
 use ely_gpui_component::typography::{Caption, Ellipsis, Label};
 use gpui::{
-    App, Entity, InteractiveElement, IntoElement, ParentElement, SharedString,
-    StatefulInteractiveElement, Styled, div, prelude::FluentBuilder, px,
+    App, Entity, InteractiveElement, IntoElement, ParentElement, StatefulInteractiveElement,
+    Styled, div, prelude::FluentBuilder, px,
 };
 
 use crate::i18n;
-use crate::state::{AppState, Conn};
+use crate::state::{AppState, Conn, SidebarRow};
 
 /// Render the whole sidebar. Session clicks switch the running pi process to
 /// that session file.
@@ -33,34 +33,7 @@ pub fn render(state: &Entity<AppState>, cx: &App) -> impl IntoElement + use<> {
     let app = state.clone();
     let s = state.read(cx);
     let can_start = s.conn == Conn::Live && !s.streaming;
-    let active_file = s.session_file.clone();
-
-    let groups: Vec<(SharedString, Vec<SessionRow>)> = s
-        .session_groups
-        .iter()
-        .map(|group| {
-            (
-                shorten_path(&group.cwd).into(),
-                group
-                    .sessions
-                    .iter()
-                    .map(|session| SessionRow {
-                        path: session.path.to_string_lossy().into_owned(),
-                        title: session
-                            .name
-                            .clone()
-                            .or_else(|| session.preview.clone())
-                            .unwrap_or_else(|| session.session_id.clone()),
-                        age: i18n::relative_time(cx, session.updated_secs),
-                        active: active_file.as_deref().is_some_and(|active| {
-                            same_file(active, &session.path.to_string_lossy())
-                        }),
-                    })
-                    .collect(),
-            )
-        })
-        .collect();
-    let empty = groups.is_empty();
+    let empty = s.sidebar_rows.is_empty();
 
     div()
         .w(px(264.))
@@ -102,119 +75,108 @@ pub fn render(state: &Entity<AppState>, cx: &App) -> impl IntoElement + use<> {
             // The list must be the only growing part and stay inside the
             // window; without a bound its content stretches the whole row and
             // the session pane's composer lands below the window.
-            div().flex_1().min_h_0().min_w_0().child(
-                ScrollArea::new("sessions").vertical().child(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .gap_4()
-                        .when(empty, |this| {
-                            this.child(Caption::new(i18n::t(cx, "no_sessions")))
-                        })
-                        .children(groups.into_iter().enumerate().map(
-                            |(group_ix, (cwd, sessions))| {
-                                let app = app.clone();
-                                div()
-                                    .flex()
-                                    .flex_col()
-                                    .gap_0p5()
-                                    // Project header: a folder mark and the
-                                    // directory's last two segments.
-                                    .child(
+            div()
+                .flex_1()
+                .min_h_0()
+                .min_w_0()
+                .when(empty, |this| {
+                    this.child(Caption::new(i18n::t(cx, "no_sessions")))
+                })
+                .when(!empty, |this| {
+                    // Only the rows in view are built: a project's whole
+                    // history can be long, and this list redraws whenever the
+                    // transcript does.
+                    let rows = s.sidebar_rows.clone();
+                    let app = app.clone();
+                    let state = state.clone();
+                    this.child(
+                        VirtualList::new(
+                            ("sessions", rows.len() as u64),
+                            rows.len(),
+                            move |ix, _, cx| {
+                                let row = &rows[ix];
+                                let colors = cx.theme().colors.clone();
+                                match row {
+                                    SidebarRow::Group { label } => div()
+                                        .flex()
+                                        .items_center()
+                                        .gap_1p5()
+                                        .px_2()
+                                        .pt_3()
+                                        .pb_1()
+                                        .child(
+                                            Icon::new(IconName::Folder)
+                                                .size(IconSize::Sm)
+                                                .color(colors.fg_subtle),
+                                        )
+                                        .child(Label::new(label.clone()))
+                                        .into_any_element(),
+                                    SidebarRow::Session {
+                                        path,
+                                        title,
+                                        updated,
+                                    } => {
+                                        let active = state
+                                            .read(cx)
+                                            .session_file
+                                            .as_deref()
+                                            .is_some_and(|open| same_file(open, path));
+                                        let age = i18n::relative_time(cx, *updated);
+                                        let app = app.clone();
+                                        let path = path.clone();
                                         div()
+                                            .id(("session", ix as u64))
+                                            .role(gpui::Role::ListItem)
+                                            .aria_label(title.clone())
+                                            .aria_selected(active)
                                             .flex()
                                             .items_center()
-                                            .gap_1p5()
-                                            .px_2()
-                                            .pb_1()
+                                            .gap_1()
+                                            .h(control_h)
+                                            .pl_2()
+                                            .pr_0p5()
+                                            .rounded(radius_md)
+                                            .text_size(text_sm)
+                                            .text_color(if active {
+                                                colors.fg
+                                            } else {
+                                                colors.fg_muted
+                                            })
+                                            .when(active, |row| row.bg(colors.active))
+                                            .when(!active, |row| {
+                                                row.cursor_pointer()
+                                                    .hover(|style| style.bg(colors.hover))
+                                            })
+                                            .on_click(move |_, _, cx| {
+                                                app.update(cx, |s, cx| {
+                                                    s.switch_session(
+                                                        std::path::PathBuf::from(path.to_string()),
+                                                        cx,
+                                                    )
+                                                });
+                                            })
                                             .child(
-                                                Icon::new(IconName::Folder)
-                                                    .size(IconSize::Sm)
-                                                    .color(colors.fg_subtle),
+                                                div()
+                                                    .flex_1()
+                                                    .min_w_0()
+                                                    .child(Ellipsis::new(title.clone())),
                                             )
-                                            .child(Label::new(cwd)),
-                                    )
-                                    .children(sessions.into_iter().enumerate().map(
-                                        move |(row_ix, row)| {
-                                            let SessionRow {
-                                                path,
-                                                title,
-                                                age,
-                                                active,
-                                            } = row;
-                                            let app = app.clone();
-                                            div()
-                                                .id((
-                                                    "session",
-                                                    (group_ix as u64) * 1_000_000 + row_ix as u64,
-                                                ))
-                                                .role(gpui::Role::ListItem)
-                                                .aria_label(title.clone())
-                                                .aria_selected(active)
-                                                .flex()
-                                                .items_center()
-                                                .gap_1()
-                                                .h(control_h)
-                                                .pl_2()
-                                                .pr_0p5()
-                                                .rounded(radius_md)
-                                                .text_size(text_sm)
-                                                .text_color(if active {
-                                                    colors.fg
-                                                } else {
-                                                    colors.fg_muted
-                                                })
-                                                .when(active, |row| row.bg(colors.active))
-                                                .when(!active, |row| {
-                                                    row.cursor_pointer()
-                                                        .hover(|style| style.bg(colors.hover))
-                                                })
-                                                .on_click(move |_, _, cx| {
-                                                    app.update(cx, |s, cx| {
-                                                        s.switch_session(
-                                                            std::path::PathBuf::from(&path),
-                                                            cx,
-                                                        )
-                                                    });
-                                                })
-                                                .child(
-                                                    div()
-                                                        .flex_1()
-                                                        .min_w_0()
-                                                        .child(Ellipsis::new(title.clone())),
-                                                )
-                                                .child(
-                                                    div()
-                                                        .flex_none()
-                                                        .text_size(text_xs)
-                                                        .text_color(colors.fg_subtle)
-                                                        .child(age),
-                                                )
-                                        },
-                                    ))
+                                            .child(
+                                                div()
+                                                    .flex_none()
+                                                    .text_size(text_xs)
+                                                    .text_color(colors.fg_subtle)
+                                                    .child(age),
+                                            )
+                                            .into_any_element()
+                                    }
+                                }
                             },
-                        )),
-                ),
-            ),
+                        )
+                        .size_full(),
+                    )
+                }),
         )
-}
-
-struct SessionRow {
-    path: String,
-    title: String,
-    age: SharedString,
-    active: bool,
-}
-
-/// `D:\develop\code\pido` → `code / pido`, to keep group headers short.
-fn shorten_path(path: &str) -> String {
-    let normalized = path.replace('\\', "/");
-    let parts: Vec<&str> = normalized.split('/').filter(|p| !p.is_empty()).collect();
-    match parts.len() {
-        0 => path.to_string(),
-        1 => parts[0].to_string(),
-        n => format!("{} / {}", parts[n - 2], parts[n - 1]),
-    }
 }
 
 /// Compare two session paths without caring about separator style; Windows
