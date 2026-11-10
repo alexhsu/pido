@@ -30,6 +30,9 @@ pub struct SessionSummary {
     pub cwd: String,
     /// Header timestamp, ISO-8601 string as written by Pi.
     pub timestamp: Option<String>,
+    /// When the file was last written — the session's last activity, as
+    /// unix seconds (pi appends as the conversation progresses).
+    pub updated_secs: Option<i64>,
     /// Display name from the latest `session_info` entry, if any.
     pub name: Option<String>,
     /// Preview text: the first user message, truncated.
@@ -188,6 +191,7 @@ fn parse_session_file(path: &Path) -> Option<SessionSummary> {
     }
 
     Some(SessionSummary {
+        updated_secs: file_mtime(path),
         path: path.to_path_buf(),
         session_id,
         cwd,
@@ -196,6 +200,16 @@ fn parse_session_file(path: &Path) -> Option<SessionSummary> {
         preview: preview.map(|p| truncate(&p, 120)),
         message_count,
     })
+}
+
+/// The file's last modification time, as unix seconds; None when unknown.
+fn file_mtime(path: &Path) -> Option<i64> {
+    let metadata = std::fs::metadata(path).ok()?;
+    let modified = metadata.modified().ok()?;
+    modified
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|d| d.as_secs() as i64)
 }
 
 /// Extract a preview string from a user message payload (`content` may be a

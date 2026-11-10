@@ -78,6 +78,11 @@ impl PidoApp {
                 Ok(dir) => (Some(std::path::PathBuf::from(dir)), None),
                 Err(_) => {
                     let settings = crate::settings::Settings::load();
+                    log::info!(
+                        "autoconnect: last_project={:?} last_session={:?}",
+                        settings.last_project,
+                        settings.last_session
+                    );
                     let dir = settings.last_project.map(std::path::PathBuf::from);
                     let resume = settings
                         .last_session

@@ -61,6 +61,11 @@ pub fn init(cx: &mut App, default: &str) {
                     ("new_session_started", "已开启新会话"),
                     ("extension_notify", "扩展通知"),
                     ("dismiss", "知道了"),
+                    ("time_now", "刚刚"),
+                    ("time_hours", "{n}小时"),
+                    ("time_days", "{n}天"),
+                    ("time_months", "{n}个月"),
+                    ("time_years", "{n}年"),
                 ],
             )
             .catalog(
@@ -108,6 +113,11 @@ pub fn init(cx: &mut App, default: &str) {
                     ("new_session_started", "New session started"),
                     ("extension_notify", "Extension notice"),
                     ("dismiss", "Dismiss"),
+                    ("time_now", "now"),
+                    ("time_hours", "{n}h"),
+                    ("time_days", "{n}d"),
+                    ("time_months", "{n}mo"),
+                    ("time_years", "{n}y"),
                 ],
             ),
     );
@@ -116,6 +126,55 @@ pub fn init(cx: &mut App, default: &str) {
 /// Look up `key` in the active locale.
 pub fn t(cx: &App, key: &str) -> SharedString {
     cx.global::<I18n>().text(key, &[])
+}
+
+/// Look up `key` with one `{name}` argument filled.
+pub fn t_arg(cx: &App, key: &str, name: &str, value: &str) -> SharedString {
+    cx.global::<I18n>().text(key, &[(name, value)])
+}
+
+/// Relative age of `unix_secs`, in the active locale ("3天" / "3d").
+pub fn relative_time(cx: &App, unix_secs: Option<i64>) -> SharedString {
+    let Some(secs) = unix_secs else {
+        return SharedString::default();
+    };
+    let Some(age) = chrono_age(secs) else {
+        return SharedString::default();
+    };
+    let (key, n) = match age {
+        Age::Now => return t(cx, "time_now"),
+        Age::Hours(n) => ("time_hours", n),
+        Age::Days(n) => ("time_days", n),
+        Age::Months(n) => ("time_months", n),
+        Age::Years(n) => ("time_years", n),
+    };
+    t_arg(cx, key, "n", &n.to_string())
+}
+
+enum Age {
+    Now,
+    Hours(i64),
+    Days(i64),
+    Months(i64),
+    Years(i64),
+}
+
+fn chrono_age(unix_secs: i64) -> Option<Age> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_secs() as i64;
+    let age = (now - unix_secs).max(0);
+    let minutes = age / 60;
+    let hours = age / 3600;
+    let days = age / 86_400;
+    Some(match age {
+        _ if minutes < 60 => Age::Now,
+        _ if hours < 24 => Age::Hours(hours),
+        _ if days < 30 => Age::Days(days),
+        _ if days < 365 => Age::Months(days / 30),
+        _ => Age::Years(days / 365),
+    })
 }
 
 /// The locale used next, toggling between Chinese and English.
