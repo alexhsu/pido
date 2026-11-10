@@ -17,7 +17,7 @@
 //! pi stdin  ◀── send()/request()                     └─▶ pending one-shots
 //! ```
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
@@ -146,6 +146,9 @@ struct Inner {
     /// `Arc<Inner>` clones that do not count: only the last *handle* drop
     /// may close Pi's stdin.
     handle_count: AtomicU64,
+    /// The last few stderr lines, for diagnostics when a spawn or request
+    /// fails. Pi writes fatal startup errors here.
+    stderr_tail: Mutex<VecDeque<String>>,
 }
 
 /// Handle to a running Pi RPC process.
@@ -195,7 +198,7 @@ impl PiClient {
             .current_dir(&config.cwd)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null());
+            .stderr(Stdio::piped());
         #[cfg(windows)]
         command.creation_flags(CREATE_NO_WINDOW);
         let mut child = command
@@ -209,6 +212,10 @@ impl PiClient {
             .stdout
             .take()
             .ok_or_else(|| anyhow::anyhow!("pi stdout was not piped"))?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("pi stderr was not piped"))?;
 
         let inner = Arc::new(Inner {
             child: Mutex::new(Some(child)),
@@ -217,7 +224,33 @@ impl PiClient {
             subscribers: Mutex::new(Vec::new()),
             shutdown: Mutex::new(false),
             handle_count: AtomicU64::new(1),
+            stderr_tail: Mutex::new(VecDeque::new()),
         });
+
+        // stderr thread: Pi uses stderr for startup failures and provider
+        // errors. Keep a short tail so connection failures can explain
+        // themselves instead of surfacing only a timeout.
+        {
+            let inner = Arc::clone(&inner);
+            std::thread::Builder::new()
+                .name("pi-rpc-stderr".into())
+                .spawn(move || {
+                    let reader = BufReader::new(stderr);
+                    for line in reader.lines().map_while(Result::ok) {
+                        let line = line.trim_end().to_string();
+                        if line.is_empty() {
+                            continue;
+                        }
+                        log::warn!("pi stderr: {line}");
+                        let mut tail = inner.stderr_tail.lock().unwrap();
+                        if tail.len() >= 40 {
+                            tail.pop_front();
+                        }
+                        tail.push_back(line);
+                    }
+                })
+                .expect("failed to spawn pi stderr thread");
+        }
 
         // Reader thread: drains stdout continuously (backpressure would stall
         // Pi). Splits on `\n` only, per the spec, and tolerates a trailing
@@ -304,11 +337,23 @@ impl PiClient {
             std::thread::Builder::new()
                 .name("pi-rpc-reaper".into())
                 .spawn(move || {
-                    let code = {
-                        let mut guard = inner.child.lock().unwrap();
-                        match guard.as_mut() {
-                            Some(child) => child.wait().ok().and_then(|s| s.code()),
-                            None => None,
+                    // Poll instead of holding the child lock across `wait`:
+                    // the shutdown path needs that lock to kill a wedged Pi.
+                    let code = loop {
+                        let status = {
+                            let mut guard = inner.child.lock().unwrap();
+                            match guard.as_mut() {
+                                Some(child) => child.try_wait(),
+                                None => break None,
+                            }
+                        };
+                        match status {
+                            Ok(Some(status)) => break status.code(),
+                            Ok(None) => std::thread::sleep(Duration::from_millis(50)),
+                            Err(error) => {
+                                log::warn!("pi-rpc: waiting for pi failed: {error}");
+                                break None;
+                            }
                         }
                     };
                     let shutting_down = *inner.shutdown.lock().unwrap();
@@ -343,6 +388,14 @@ impl PiClient {
     /// Fails when Pi is already shut down.
     pub fn send(&self, command: Command) -> anyhow::Result<()> {
         let request = Request::new(command);
+        self.write_request(&request)
+    }
+
+    /// Write a command with no envelope id. Required for
+    /// `extension_ui_response`, whose own `id` field names the dialog being
+    /// answered: an envelope id would serialize a duplicate `"id"` key.
+    pub fn send_uncorrelated(&self, command: Command) -> anyhow::Result<()> {
+        let request = Request::anonymous(command);
         self.write_request(&request)
     }
 
@@ -412,11 +465,38 @@ impl PiClient {
         *shutdown = true;
         // Dropping the stdin handle closes the pipe.
         *self.inner.stdin.lock().unwrap() = None;
+
+        // Graceful shutdown is the documented path, but a wedged Pi must not
+        // outlive the app. Give it three seconds, then kill it.
+        let inner = Arc::clone(&self.inner);
+        std::thread::Builder::new()
+            .name("pi-rpc-kill".into())
+            .spawn(move || {
+                std::thread::sleep(Duration::from_secs(3));
+                let mut guard = inner.child.lock().unwrap();
+                if let Some(child) = guard.as_mut()
+                    && matches!(child.try_wait(), Ok(None))
+                {
+                    log::warn!("pi-rpc: pi did not exit after stdin closed; killing");
+                    let _ = child.kill();
+                }
+            })
+            .ok();
     }
 
     /// Whether shutdown has been initiated.
     pub fn is_shut_down(&self) -> bool {
         *self.inner.shutdown.lock().unwrap()
+    }
+
+    /// The last stderr lines Pi wrote, newest last. Useful when a request or
+    /// startup fails and the protocol response alone does not explain why.
+    pub fn last_stderr(&self) -> String {
+        self.inner
+            .stderr_tail
+            .lock()
+            .map(|tail| tail.iter().cloned().collect::<Vec<_>>().join("\n"))
+            .unwrap_or_default()
     }
 }
 

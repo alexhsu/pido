@@ -10,7 +10,10 @@
 //! name (last one wins). There is no `pi sessions` list command, so a desktop
 //! client lists sessions by scanning this directory.
 
+use std::collections::{HashMap, HashSet};
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 use serde::Deserialize;
 
@@ -73,26 +76,88 @@ struct EntryTail {
     entry_type: Option<String>,
 }
 
+/// A cached session summary keyed by the file's metadata.
+struct CachedSummary {
+    modified: SystemTime,
+    len: u64,
+    summary: SessionSummary,
+}
+
+/// Scans a session directory, reusing summaries for files whose size and
+/// modification time have not changed. Session files can be large (the whole
+/// transcript), so rescanning every file on every settle is wasteful.
+#[derive(Default)]
+pub struct SessionScanner {
+    cache: HashMap<PathBuf, CachedSummary>,
+}
+
+impl SessionScanner {
+    /// Scan `root`, parsing only new or changed files. Unreadable or malformed
+    /// files are skipped; a partial write must not hide the rest of the list.
+    pub fn scan(&mut self, root: &Path) -> anyhow::Result<Vec<SessionGroup>> {
+        let files = walk_dirs(root)?;
+        let present: HashSet<&Path> = files.iter().map(PathBuf::as_path).collect();
+        let mut summaries = Vec::with_capacity(files.len());
+
+        for path in &files {
+            let stamp = file_stamp(path);
+            if let Some(cached) = self.cache.get(path)
+                && stamp
+                    .is_some_and(|(modified, len)| cached.modified == modified && cached.len == len)
+            {
+                summaries.push(cached.summary.clone());
+                continue;
+            }
+            let Some(summary) = parse_session_file(path) else {
+                log::warn!("skipping unparseable session file: {}", path.display());
+                continue;
+            };
+            if let Some((modified, len)) = stamp {
+                self.cache.insert(
+                    path.clone(),
+                    CachedSummary {
+                        modified,
+                        len,
+                        summary: summary.clone(),
+                    },
+                );
+            }
+            summaries.push(summary);
+        }
+
+        self.cache
+            .retain(|path, _| present.contains(path.as_path()));
+        Ok(group_summaries(summaries))
+    }
+}
+
 /// Scan a session root directory and return all found sessions grouped by
 /// working directory, groups ordered by their newest session.
 ///
 /// Unreadable or malformed files are skipped (a partial write should not hide
 /// the rest of the list).
 pub fn scan_sessions(root: &Path) -> anyhow::Result<Vec<SessionGroup>> {
-    let mut summaries = Vec::new();
-    for dir_entry in walk_dirs(root)? {
-        let summary = match parse_session_file(&dir_entry) {
-            Some(summary) => summary,
-            None => {
-                log::warn!("skipping unparseable session file: {}", dir_entry.display());
-                continue;
-            }
-        };
-        summaries.push(summary);
-    }
+    SessionScanner::default().scan(root)
+}
 
-    // Newest first within a group.
-    summaries.sort_by_key(|summary| std::cmp::Reverse(sort_key(summary)));
+/// Read the working directory from a session header without loading the
+/// whole transcript. Used when switching to a session from another project.
+pub fn read_session_cwd(path: &Path) -> Option<String> {
+    let file = std::fs::File::open(path).ok()?;
+    let mut line = String::new();
+    BufReader::new(file).read_line(&mut line).ok()?;
+    let header: SessionHeader = serde_json::from_str(&line).ok()?;
+    header.cwd
+}
+
+/// Group summaries by cwd, newest activity first. Because `summaries` is
+/// already sorted, the first occurrence of a cwd fixes that group's position.
+fn group_summaries(mut summaries: Vec<SessionSummary>) -> Vec<SessionGroup> {
+    summaries.sort_by(|a, b| {
+        activity(b)
+            .cmp(&activity(a))
+            .then_with(|| sort_key(b).cmp(&sort_key(a)))
+    });
 
     let mut groups: Vec<SessionGroup> = Vec::new();
     for summary in summaries {
@@ -105,28 +170,29 @@ pub fn scan_sessions(root: &Path) -> anyhow::Result<Vec<SessionGroup>> {
             });
         }
     }
-
-    // Groups by newest session first.
-    groups.sort_by_key(|g| {
-        g.sessions
-            .first()
-            .and_then(|s| s.timestamp.clone())
-            .unwrap_or_default()
-    });
-    groups.reverse();
-    Ok(groups)
+    groups
 }
 
-/// Sessions sort by their header timestamp, falling back to the file name.
-fn sort_key(summary: &SessionSummary) -> (String, String) {
-    (
-        summary.timestamp.clone().unwrap_or_default(),
-        summary
-            .path
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default(),
-    )
+/// Last activity, from the file's modification time. Falls back to 0 when
+/// the filesystem cannot report one.
+fn activity(summary: &SessionSummary) -> i64 {
+    summary.updated_secs.unwrap_or(0)
+}
+
+/// Tie-breaker for sessions with the same activity second.
+fn sort_key(summary: &SessionSummary) -> String {
+    summary
+        .path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default()
+}
+
+/// Size and modification time, used to decide whether a cached summary is
+/// still valid.
+fn file_stamp(path: &Path) -> Option<(SystemTime, u64)> {
+    let metadata = std::fs::metadata(path).ok()?;
+    Some((metadata.modified().ok()?, metadata.len()))
 }
 
 /// Recursively collect `*.jsonl` files under `root` (one level of project
@@ -247,10 +313,15 @@ fn truncate(text: &str, max_chars: usize) -> String {
 mod tests {
     use super::*;
 
-    fn write_session(dir: &Path, file: &str, lines: &[String]) -> PathBuf {
+    /// Write a session and set its modification time, in seconds since the
+    /// epoch, so activity ordering is deterministic.
+    fn write_session(dir: &Path, file: &str, lines: &[String], mtime_secs: u64) -> PathBuf {
         std::fs::create_dir_all(dir).unwrap();
         let path = dir.join(file);
         std::fs::write(&path, lines.join("\n") + "\n").unwrap();
+        let file = std::fs::File::options().write(true).open(&path).unwrap();
+        file.set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(mtime_secs))
+            .unwrap();
         path
     }
 
@@ -267,6 +338,7 @@ mod tests {
                 r#"{"type":"session","version":3,"id":"id-old","timestamp":"2026-01-02T10:00:00.000Z","cwd":"C:\\proj-a"}"#.into(),
                 r#"{"type":"message","id":"m1","parentId":null,"timestamp":"2026-01-02T10:00:01.000Z","message":{"role":"user","content":"Older question about Rust","timestamp":1}}"#.into(),
             ],
+            10,
         );
         write_session(
             &project_a,
@@ -277,6 +349,7 @@ mod tests {
                 r#"{"type":"session_info","id":"s1","parentId":"m2","timestamp":"2026-01-03T10:05:00.000Z","name":"my session"}"#.into(),
                 r#"{"type":"session_info","id":"s2","parentId":"s1","timestamp":"2026-01-03T10:06:00.000Z","name":"renamed"}"#.into(),
             ],
+            30,
         );
         write_session(
             &project_b,
@@ -284,18 +357,21 @@ mod tests {
             &[
                 r#"{"type":"session","version":3,"id":"id-b","timestamp":"2026-01-01T10:00:00.000Z","cwd":"C:\\proj-b"}"#.into(),
             ],
+            20,
         );
         // A stray non-session jsonl file must be skipped.
         write_session(
             &root.path().join("--junk--"),
             "not-a-session.jsonl",
             &[r#"{"type":"model_change"}"#.into()],
+            40,
         );
 
         let groups = scan_sessions(root.path()).unwrap();
         assert_eq!(groups.len(), 2, "two project groups");
 
-        // Groups ordered newest first: proj-a (Jan 3) before proj-b (Jan 1).
+        // Groups ordered by newest activity: proj-a (30s) before proj-b
+        // (20s), regardless of the header timestamps' calendar order.
         assert_eq!(groups[0].cwd, "C:\\proj-a");
         assert_eq!(groups[1].cwd, "C:\\proj-b");
 
@@ -315,6 +391,50 @@ mod tests {
             Some("Older question about Rust")
         );
         assert_eq!(group_a.sessions[1].message_count, 1);
+    }
+
+    #[test]
+    fn scanner_reuses_unchanged_files_and_sees_updates() {
+        let root = tempdir();
+        let project = root.path().join("--C--one--");
+        let path = write_session(
+            &project,
+            "2026-01-01T10-00-00-000Z_id.jsonl",
+            &[
+                r#"{"type":"session","version":3,"id":"id","timestamp":"2026-01-01T10:00:00.000Z","cwd":"C:\\one"}"#.into(),
+            ],
+            10,
+        );
+
+        let mut scanner = SessionScanner::default();
+        let first = scanner.scan(root.path()).unwrap();
+        assert_eq!(first[0].sessions[0].message_count, 0);
+
+        // Appending a message changes the size, so the cached summary is
+        // invalidated and the message count updates.
+        let mut lines = std::fs::read_to_string(&path).unwrap();
+        lines.push_str(
+            r#"{"type":"message","id":"m1","parentId":null,"timestamp":"2026-01-01T10:00:01.000Z","message":{"role":"user","content":"hi","timestamp":1}}"#,
+        );
+        lines.push('\n');
+        std::fs::write(&path, lines).unwrap();
+        let second = scanner.scan(root.path()).unwrap();
+        assert_eq!(second[0].sessions[0].message_count, 1);
+    }
+
+    #[test]
+    fn read_session_cwd_reads_only_the_header() {
+        let root = tempdir();
+        let project = root.path().join("--C--one--");
+        let path = write_session(
+            &project,
+            "2026-01-01T10-00-00-000Z_id.jsonl",
+            &[
+                r#"{"type":"session","version":3,"id":"id","timestamp":"2026-01-01T10:00:00.000Z","cwd":"C:\\one"}"#.into(),
+            ],
+            10,
+        );
+        assert_eq!(read_session_cwd(&path).as_deref(), Some("C:\\one"));
     }
 
     #[test]

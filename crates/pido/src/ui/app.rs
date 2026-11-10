@@ -16,9 +16,6 @@ actions!(pido, [Stop]);
 /// Height of the session header above the chat pane.
 pub const HEADER_HEIGHT: f32 = 52.;
 
-/// Height reserved for the composer below the transcript.
-pub const COMPOSER_HEIGHT: f32 = 150.;
-
 pub struct PidoApp {
     pub focus: FocusHandle,
     pub state: gpui::Entity<AppState>,
@@ -28,20 +25,36 @@ pub struct PidoApp {
     pub welcome_dir: Option<gpui::Entity<TextInput>>,
     /// Last observed window size, persisted on quit.
     window_size: Option<(f32, f32)>,
+    /// Whether the composer has been focused since the session went live.
+    composer_focused: bool,
 }
 
 impl PidoApp {
     pub fn new(cx: &mut Context<Self>) -> Self {
         let focus = cx.focus_handle();
         let state = AppState::new(cx);
-        // Re-render whenever the state entity changes.
-        cx.observe(&state, |_, _, cx| cx.notify()).detach();
+        // Re-render whenever the state entity changes, and drain any text a
+        // cancelled/failed action wants restored into the composer.
+        cx.observe(&state, |this, state, cx| {
+            let restored = state.update(cx, |state, _| state.take_pending_composer_text());
+            if let (Some(text), Some(draft)) = (restored, this.draft.clone()) {
+                draft.update(cx, |input, cx| {
+                    if !input.text().trim().is_empty() {
+                        input.insert("\n", cx);
+                    }
+                    input.insert(&text, cx);
+                });
+            }
+            cx.notify();
+        })
+        .detach();
         let app = Self {
             focus,
             state,
             draft: None,
             welcome_dir: None,
             window_size: None,
+            composer_focused: false,
         };
         app.observe_window_for_quit(cx);
         app
@@ -67,7 +80,7 @@ impl PidoApp {
         self.draft = Some(cx.new(|cx| {
             TextInput::new(window, cx)
                 .multi_line(1, 8)
-                .placeholder(crate::i18n::t(cx, "idle_hint"))
+                .placeholder_key("idle_hint")
         }));
         cx.notify();
     }
@@ -110,76 +123,50 @@ impl Render for PidoApp {
         self.window_size = Some((f32::from(bounds.size.width), f32::from(bounds.size.height)));
         let state = self.state.clone();
         let live = state.read(cx).conn == Conn::Live;
-        // Every pane is placed with explicit pixel geometry. Flex and
-        // percentage heights proved unreliable here: the virtualized message
-        // list would grow past its share and push the composer out of the
-        // window, so each band gets a definite box that content cannot
-        // change.
-        // GPUI reports the viewport (and window bounds) in logical pixels and
-        // scales the scene to device pixels when painting, so the layout box
-        // is the viewport as-is. Dividing by the scale factor here shrank the
-        // whole tree to a fraction of the window and left the rest blank.
-        let scale = window.scale_factor();
-        let viewport = window.viewport_size();
-        let (w, h) = (viewport.width, viewport.height);
-        static GEOM: std::sync::Once = std::sync::Once::new();
-        GEOM.call_once(|| {
-            let (w, h) = (f32::from(w), f32::from(h));
-            log::info!(
-                "geometry: logical={w}x{h} scale={scale} device={}x{}",
-                (w * scale).round(),
-                (h * scale).round()
-            )
-        });
-        let sidebar_w = gpui::px(264.);
-        let header_h = gpui::px(HEADER_HEIGHT);
-        let composer_h = gpui::px(COMPOSER_HEIGHT);
+
+        if live && !self.composer_focused {
+            if let Some(draft) = &self.draft {
+                let focus = draft.read(cx).focus().clone();
+                window.focus(&focus, cx);
+            }
+            self.composer_focused = true;
+        } else if !live {
+            self.composer_focused = false;
+        }
 
         let main: gpui::AnyElement = if live {
             div()
-                .absolute()
-                .left(sidebar_w)
-                .top(gpui::px(0.))
-                .w(w - sidebar_w)
-                .h(h)
+                .flex_1()
+                .min_w_0()
+                .h_full()
+                .min_h_0()
+                .flex()
+                .flex_col()
+                .child(div().flex_none().child(chat::render_header(&state, cx)))
                 .child(
                     div()
-                        .absolute()
-                        .left(gpui::px(0.))
-                        .top(gpui::px(0.))
-                        .w(w - sidebar_w)
-                        .h(header_h)
-                        .child(chat::render_header(&state, cx)),
-                )
-                .child(
-                    div()
-                        .absolute()
-                        .left(gpui::px(0.))
-                        .top(header_h)
-                        .w(w - sidebar_w)
-                        .h(h - header_h - composer_h)
+                        .flex_1()
+                        .min_h_0()
                         .overflow_hidden()
-                        .child(chat::render_transcript(
-                            &state,
-                            window,
-                            h - header_h - composer_h,
-                            cx,
-                        )),
+                        .child(chat::render_transcript(&state, cx)),
                 )
                 .child(
                     div()
-                        .absolute()
-                        .left(gpui::px(0.))
-                        .top(h - composer_h)
-                        .w(w - sidebar_w)
-                        .h(composer_h)
+                        .flex_none()
                         .px_4()
                         .pt_2()
+                        .pb_2()
                         .child(composer::render(&state, self, cx)),
                 )
                 .into_any_element()
         } else {
-            welcome::render(&state, self, window, cx).into_any_element()
+            div()
+                .flex_1()
+                .min_w_0()
+                .h_full()
+                .min_h_0()
+                .child(welcome::render(&state, self, window, cx))
+                .into_any_element()
         };
 
         // The FocusScope must carry the window size itself: a percentage
@@ -194,8 +181,7 @@ impl Render for PidoApp {
             .child(
                 div()
                     .id("pido-root")
-                    .w(w)
-                    .h(h)
+                    .size_full()
                     .min_w_0()
                     .min_h_0()
                     .flex()

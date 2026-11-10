@@ -18,4 +18,4 @@ pub use client::{
 pub use protocol::{
     AgentMessage, Command, Event, Request, Response, RpcRecord, StreamingBehavior, parse_record,
 };
-pub use sessions::{SessionGroup, SessionSummary};
+pub use sessions::{SessionGroup, SessionScanner, SessionSummary, read_session_cwd};

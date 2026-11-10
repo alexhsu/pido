@@ -4,9 +4,11 @@
 //!
 //! Spacing and the centered column width come from Ely's `ChatContainer`.
 
+use ely_gpui_component::buttons::{ButtonVariant, IconButton};
 use ely_gpui_component::chat::PromptInput;
 use ely_gpui_component::forms::Choice;
 use ely_gpui_component::menus::{DropdownMenu, Menu, MenuItem};
+use ely_gpui_component::primitives::IconName;
 use ely_gpui_component::theme::ActiveTheme;
 use gpui::{
     App, Entity, IntoElement, ParentElement, SharedString, Styled, div, prelude::FluentBuilder, px,
@@ -17,8 +19,8 @@ use crate::state::AppState;
 use crate::ui::app::PidoApp;
 use crate::ui::chat::level_slug;
 
-/// Render the composer block. While the agent runs, the send button becomes a
-/// stop button and Enter sends a steering message instead of a new prompt.
+/// Render the composer block. While the agent runs, Enter sends a steering
+/// message and a separate stop button aborts the run.
 pub fn render(state: &Entity<AppState>, app: &mut PidoApp, cx: &App) -> impl IntoElement {
     let theme = cx.theme();
     let colors = theme.colors.clone();
@@ -38,12 +40,10 @@ pub fn render(state: &Entity<AppState>, app: &mut PidoApp, cx: &App) -> impl Int
         }
     });
 
-    let input = if streaming {
-        let stop_state = state.clone();
-        input.busy(move |_, cx| stop_state.update(cx, |s, cx| s.stop(cx)))
-    } else {
-        input
-    };
+    // Do not use PromptInput::busy here: it also swallows Enter, which is
+    // exactly how a running agent should be steered. The send button stays a
+    // send button while streaming (it sends `steer`), and a separate Stop
+    // tool aborts the run.
 
     // `/` offers pi's extension commands, prompt templates and skills. The
     // component strips the typed `/query` and hands us the value; commands
@@ -83,8 +83,20 @@ pub fn render(state: &Entity<AppState>, app: &mut PidoApp, cx: &App) -> impl Int
         mention_draft.update(cx, |field, cx| field.insert(&path, cx));
     });
 
-    // The model pill sits at the right of the tool row, beside send.
+    // The model pill sits at the right of the tool row, beside send; a
+    // separate stop button appears while the agent runs.
     let pill = model_pill(s, state.clone(), cx);
+    let stop = if streaming {
+        let stop_state = state.clone();
+        Some(
+            IconButton::new("composer-stop", IconName::Square)
+                .variant(ButtonVariant::Secondary)
+                .tooltip(i18n::t(cx, "stop"))
+                .on_click(move |_, _, cx| stop_state.update(cx, |s, cx| s.stop(cx))),
+        )
+    } else {
+        None
+    };
 
     let stats_line = stats_caption(s, cx);
 
@@ -92,11 +104,20 @@ pub fn render(state: &Entity<AppState>, app: &mut PidoApp, cx: &App) -> impl Int
         .flex()
         .flex_col()
         .gap_2()
-        .child(input.tool(
-            // A growable spacer with the pill pinned to its right edge:
-            // the component's own spacer then gets no space to expand.
-            div().w_full().flex().justify_end().child(pill),
-        ))
+        .child(
+            input.tool(
+                // A growable spacer with the controls pinned to its right edge:
+                // the component's own spacer then gets no space to expand.
+                div()
+                    .w_full()
+                    .flex()
+                    .items_center()
+                    .justify_end()
+                    .gap_1()
+                    .children(stop)
+                    .child(pill),
+            ),
+        )
         .when_some(stats_line, |this, line| {
             this.child(
                 div()
@@ -128,17 +149,27 @@ fn model_pill(s: &AppState, picker: Entity<AppState>, cx: &App) -> DropdownMenu 
         format!("{model_name} {level}")
     };
 
-    // 模型 ▸ every configured model, the active one checked.
-    let current_id = s.current_model.as_ref().map(|m| m.id.clone());
+    // 模型 ▸ every configured model, the active one checked. Identity is
+    // (provider, id): two providers may expose the same model id.
+    let current = s
+        .current_model
+        .as_ref()
+        .map(|m| (m.provider.clone().unwrap_or_default(), m.id.clone()));
     let mut models = Menu::new();
     for model in &s.models {
         let picker = picker.clone();
         let id = model.id.clone();
-        let checked = current_id.as_deref() == Some(model.id.as_str());
+        let provider = model.provider.clone().unwrap_or_default();
+        let checked = current
+            .as_ref()
+            .is_some_and(|(current_provider, current_id)| {
+                current_provider == &provider && current_id == &id
+            });
         models = models.item(MenuItem::radio(model.name.clone(), checked).on_click(
             move |_, cx| {
                 let id = id.clone();
-                picker.update(cx, |s, cx| s.set_model(&id, cx));
+                let provider = provider.clone();
+                picker.update(cx, |s, cx| s.set_model(&provider, &id, cx));
             },
         ));
     }
@@ -173,13 +204,21 @@ fn level_default(s: &AppState, fallback: SharedString) -> SharedString {
     }
 }
 
-/// `12 轮 · 3.4M tok · 缓存命中 99% · 上下文 61%`, or nothing before a run.
+/// `12 条消息 · 3.4M tok · 缓存命中 99% · 上下文 61% · 成本 $0.0123`,
+/// or nothing before a run.
 fn stats_caption(s: &AppState, cx: &App) -> Option<SharedString> {
     let stats = s.stats.as_ref()?;
-    let turns = stats.user_messages + stats.assistant_messages;
     let mut parts: Vec<String> = Vec::new();
-    if turns > 0 {
-        parts.push(i18n::t_arg(cx, "status_turns", "n", &turns.to_string()).to_string());
+    if stats.total_messages > 0 {
+        parts.push(
+            i18n::t_arg(
+                cx,
+                "status_messages",
+                "n",
+                &stats.total_messages.to_string(),
+            )
+            .to_string(),
+        );
     }
     if let Some(tokens) = stats.tokens.as_ref() {
         let total = tokens.total_tokens.unwrap_or(tokens.input + tokens.output);
@@ -195,10 +234,31 @@ fn stats_caption(s: &AppState, cx: &App) -> Option<SharedString> {
     {
         parts.push(i18n::t_arg(cx, "status_ctx", "p", &format!("{percent:.0}")).to_string());
     }
+    let cost = stats.cost.or_else(|| {
+        stats
+            .tokens
+            .as_ref()
+            .and_then(|tokens| tokens.cost.as_ref().and_then(|cost| cost.total))
+    });
+    if let Some(cost) = cost
+        && cost > 0.0
+    {
+        parts.push(i18n::t_arg(cx, "status_cost", "c", &format_cost(cost)).to_string());
+    }
     if parts.is_empty() {
         None
     } else {
         Some(parts.join(" · ").into())
+    }
+}
+
+fn format_cost(cost: f64) -> String {
+    if cost >= 1.0 {
+        format!("${cost:.2}")
+    } else if cost >= 0.01 {
+        format!("${cost:.3}")
+    } else {
+        format!("${cost:.4}")
     }
 }
 

@@ -227,6 +227,10 @@ pub enum ThinkingLevel {
     High,
     Xhigh,
     Max,
+    /// A level added by a newer Pi. Kept so an unknown value does not fail
+    /// the whole payload; the UI filters it out of pickers.
+    #[serde(other)]
+    Unknown,
 }
 
 /// Delivery mode for steering and follow-up queues.
@@ -235,6 +239,8 @@ pub enum ThinkingLevel {
 pub enum QueueMode {
     All,
     OneAtATime,
+    #[serde(other)]
+    Unknown,
 }
 
 // ---------------------------------------------------------------------------
@@ -494,6 +500,8 @@ pub enum CompactionReason {
     Threshold,
     #[serde(rename = "overflow")]
     Overflow,
+    #[serde(other)]
+    Unknown,
 }
 
 // ---------------------------------------------------------------------------
@@ -608,10 +616,11 @@ impl UserMessage {
                 .iter()
                 .filter_map(|block| match block {
                     UserContentBlock::Text { text } => Some(text.as_str()),
-                    UserContentBlock::Image { .. } => None,
+                    _ => None,
                 })
                 .collect::<Vec<_>>()
                 .join(""),
+            UserContent::Other(_) => String::new(),
         }
     }
 }
@@ -621,6 +630,8 @@ impl UserMessage {
 pub enum UserContent {
     Text(String),
     Blocks(Vec<UserContentBlock>),
+    /// A shape this crate does not know. Kept opaque so history still parses.
+    Other(Value),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -634,6 +645,8 @@ pub enum UserContentBlock {
         data: String,
         mime_type: String,
     },
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -650,6 +663,9 @@ pub struct AssistantMessage {
     pub usage: Option<Usage>,
     #[serde(default)]
     pub stop_reason: Option<StopReason>,
+    /// Human-readable failure reported by the provider, when any.
+    #[serde(default)]
+    pub error_message: Option<String>,
     #[serde(default)]
     pub timestamp: f64,
 }
@@ -666,6 +682,9 @@ pub enum AssistantContent {
     },
     #[serde(rename = "toolCall")]
     ToolCall(ToolCall),
+    /// A block type added by a newer Pi; ignored by this build.
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -731,6 +750,8 @@ pub enum ToolResultBlock {
         data: String,
         mime_type: String,
     },
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -763,6 +784,8 @@ pub enum StopReason {
     Error,
     #[serde(rename = "aborted")]
     Aborted,
+    #[serde(other)]
+    Unknown,
 }
 
 // ---------------------------------------------------------------------------
@@ -888,6 +911,8 @@ pub enum ExtensionUiMethod {
     SetTitle,
     #[serde(rename = "set_editor_text")]
     SetEditorText,
+    #[serde(other)]
+    Unknown,
 }
 
 impl ExtensionUiMethod {
@@ -1111,6 +1136,20 @@ mod tests {
     }
 
     #[test]
+    fn extension_ui_response_keeps_the_dialog_id() {
+        let request = Request::anonymous(Command::ExtensionUiResponse {
+            id: "dialog-1".into(),
+            value: None,
+            confirmed: None,
+            cancelled: Some(true),
+        });
+        let json = serde_json::to_value(&request).unwrap();
+        assert_eq!(json["type"], "extension_ui_response");
+        assert_eq!(json["id"], "dialog-1");
+        assert_eq!(json["cancelled"], true);
+    }
+
+    #[test]
     fn parse_response_record() {
         let record = parse_record(
             r#"{"id":"req-1","type":"response","command":"get_state","success":true,"data":{"isStreaming":false}}"#,
@@ -1183,6 +1222,43 @@ mod tests {
                     ));
                 }
                 other => panic!("expected assistant message, got {other:?}"),
+            },
+            other => panic!("expected message_end, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unknown_content_blocks_do_not_fail_messages() {
+        let record = parse_record(
+            r#"{"type":"message_end","message":{"role":"assistant","content":[{"type":"future_block","payload":1},{"type":"text","text":"still here"}],"stopReason":"future_reason","timestamp":1}}"#,
+        )
+        .unwrap();
+        match record {
+            RpcRecord::Event(Event::MessageEnd { message }) => match message {
+                AgentMessage::Assistant(assistant) => {
+                    assert!(matches!(&assistant.content[0], AssistantContent::Unknown));
+                    assert!(matches!(
+                        &assistant.content[1],
+                        AssistantContent::Text { text } if text == "still here"
+                    ));
+                    assert_eq!(assistant.stop_reason, Some(StopReason::Unknown));
+                }
+                other => panic!("expected assistant message, got {other:?}"),
+            },
+            other => panic!("expected message_end, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unknown_user_content_does_not_fail_history() {
+        let record = parse_record(
+            r#"{"type":"message_end","message":{"role":"user","content":[{"type":"future_block"}],"timestamp":1}}"#,
+        )
+        .unwrap();
+        match record {
+            RpcRecord::Event(Event::MessageEnd { message }) => match message {
+                AgentMessage::User(user) => assert!(user.text().is_empty()),
+                other => panic!("expected user message, got {other:?}"),
             },
             other => panic!("expected message_end, got {other:?}"),
         }

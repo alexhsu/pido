@@ -52,13 +52,31 @@ impl Settings {
             log::warn!("settings: cannot create {}: {error}", parent.display());
             return;
         }
-        match serde_json::to_string_pretty(self) {
-            Ok(text) => {
-                if let Err(error) = std::fs::write(&path, text) {
-                    log::warn!("settings: cannot write {}: {error}", path.display());
+        let text = match serde_json::to_string_pretty(self) {
+            Ok(text) => text,
+            Err(error) => {
+                log::warn!("settings: cannot serialize: {error}");
+                return;
+            }
+        };
+        // Write a sibling temp file and rename it into place. On Windows a
+        // rename cannot replace an existing file, so remove the old one only
+        // after the temp write has succeeded.
+        let temp = path.with_extension("json.tmp");
+        if let Err(error) = std::fs::write(&temp, text) {
+            log::warn!("settings: cannot write {}: {error}", temp.display());
+            return;
+        }
+        if let Err(error) = std::fs::rename(&temp, &path) {
+            #[cfg(windows)]
+            {
+                let _ = std::fs::remove_file(&path);
+                if std::fs::rename(&temp, &path).is_ok() {
+                    return;
                 }
             }
-            Err(error) => log::warn!("settings: cannot serialize: {error}"),
+            log::warn!("settings: cannot replace {}: {error}", path.display());
+            let _ = std::fs::remove_file(&temp);
         }
     }
 }

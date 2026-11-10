@@ -32,6 +32,7 @@ pub fn render(state: &Entity<AppState>, cx: &App) -> impl IntoElement + use<> {
     );
     let app = state.clone();
     let s = state.read(cx);
+    let can_start = s.conn == Conn::Live && !s.streaming;
     let active_file = s.session_file.clone();
 
     let groups: Vec<(SharedString, Vec<SessionRow>)> = s
@@ -85,10 +86,14 @@ pub fn render(state: &Entity<AppState>, cx: &App) -> impl IntoElement + use<> {
                         .child(Label::new(i18n::t(cx, "app_name")))
                         .child(Caption::new(pi_status_line(state, cx))),
                 )
-                .child(Button::new("new-chat", i18n::t(cx, "new_chat")).on_click({
-                    let app = app.clone();
-                    move |_, _, cx| app.update(cx, |s, cx| s.new_chat(cx))
-                })),
+                .child(
+                    Button::new("new-chat", i18n::t(cx, "new_chat"))
+                        .disabled(!can_start)
+                        .on_click({
+                            let app = app.clone();
+                            move |_, _, cx| app.update(cx, |s, cx| s.new_chat(cx))
+                        }),
+                ),
         )
         .child(
             // The list must be the only growing part and stay inside the
@@ -202,7 +207,8 @@ struct SessionRow {
 fn pi_status_line(state: &Entity<AppState>, cx: &App) -> SharedString {
     let s = state.read(cx);
     match &s.conn {
-        Conn::Idle | Conn::Connecting => i18n::t(cx, "disconnected"),
+        Conn::Idle => i18n::t(cx, "disconnected"),
+        Conn::Connecting => i18n::t(cx, "connecting"),
         Conn::Live => match (&s.current_model, &s.session_name) {
             (Some(model), Some(name)) => format!("{name} · {}", model.name).into(),
             (Some(model), None) => model.name.clone().into(),
@@ -224,8 +230,16 @@ fn shorten_path(path: &str) -> String {
     }
 }
 
-/// Compare two session paths without caring about separator style.
+/// Compare two session paths without caring about separator style; Windows
+/// paths are also case-insensitive.
 fn same_file(a: &str, b: &str) -> bool {
-    std::path::Path::new(a) == std::path::Path::new(b)
-        || a.replace('\\', "/") == b.replace('\\', "/")
+    let normalize = |path: &str| {
+        let path = path.replace('\\', "/");
+        if cfg!(windows) {
+            path.to_lowercase()
+        } else {
+            path
+        }
+    };
+    std::path::Path::new(a) == std::path::Path::new(b) || normalize(a) == normalize(b)
 }

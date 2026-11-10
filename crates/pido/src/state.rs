@@ -6,19 +6,24 @@
 //! `WeakEntity::update`, so the UI never blocks. The event pump subscribes to
 //! the client and folds every record into the transcript.
 
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use gpui::{App, AppContext, Context, Entity};
 use pi_rpc::client::{ClientEvent, PiClient, PiProcessConfig};
 use pi_rpc::protocol::{
-    AgentMessage, AssistantMessageEvent, Command, Event, Model, Response, RpcRecord, SessionEntry,
-    SessionState, SessionStats, ThinkingLevel,
+    AgentMessage, AssistantMessageEvent, ClearedQueue, Command, Event, Model, Response, RpcRecord,
+    SessionEntry, SessionState, SessionStats, StreamingBehavior, ThinkingLevel,
 };
 use pi_rpc::sessions::{self, SessionGroup};
 
 use crate::i18n;
+
+/// Bound for the three initialization requests. A hung Pi must not leave the
+/// window "connecting" for minutes.
+const INIT_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// How the connection to pi stands.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -53,44 +58,71 @@ pub enum TranscriptItem {
 
 #[derive(Debug, Clone)]
 pub struct AssistantView {
-    pub thinking: String,
-    pub thinking_live: bool,
-    pub text: String,
-    pub text_live: bool,
+    /// Text blocks keyed by their streaming `contentIndex`. A message can hold
+    /// several blocks around tool calls; a single buffer would let `text_end`
+    /// overwrite earlier text mid-stream.
+    pub text_blocks: BTreeMap<u32, String>,
+    pub thinking_blocks: BTreeMap<u32, String>,
+    pub live_text: Option<u32>,
+    pub live_thinking: Option<u32>,
     pub finished: bool,
     pub started: Instant,
     pub took: Option<Duration>,
+    /// Provider error text for a failed assistant message, when any.
+    pub error: Option<String>,
 }
 
 impl AssistantView {
     fn streaming() -> Self {
         Self {
-            thinking: String::new(),
-            thinking_live: false,
-            text: String::new(),
-            text_live: false,
+            text_blocks: BTreeMap::new(),
+            thinking_blocks: BTreeMap::new(),
+            live_text: None,
+            live_thinking: None,
             finished: false,
             started: Instant::now(),
             took: None,
+            error: None,
         }
     }
 
     fn from_message(message: &pi_rpc::protocol::AssistantMessage) -> Self {
         let mut view = Self::streaming();
-        for block in &message.content {
+        for (index, block) in message.content.iter().enumerate() {
+            let index = index as u32;
             match block {
                 pi_rpc::protocol::AssistantContent::Text { text } => {
-                    view.text.push_str(text);
+                    view.text_blocks.insert(index, text.clone());
                 }
                 pi_rpc::protocol::AssistantContent::Thinking { thinking } => {
-                    view.thinking.push_str(thinking);
+                    view.thinking_blocks.insert(index, thinking.clone());
                 }
-                pi_rpc::protocol::AssistantContent::ToolCall(_) => {}
+                pi_rpc::protocol::AssistantContent::ToolCall(_)
+                | pi_rpc::protocol::AssistantContent::Unknown => {}
             }
         }
         view.finished = true;
+        view.error = message.error_message.clone();
         view
     }
+
+    /// Rendered text, keeping blocks separated so two blocks never merge.
+    pub fn text(&self) -> String {
+        join_blocks(&self.text_blocks)
+    }
+
+    pub fn thinking(&self) -> String {
+        join_blocks(&self.thinking_blocks)
+    }
+}
+
+fn join_blocks(blocks: &BTreeMap<u32, String>) -> String {
+    blocks
+        .values()
+        .filter(|text| !text.is_empty())
+        .cloned()
+        .collect::<Vec<_>>()
+        .join("\n\n")
 }
 
 #[derive(Debug, Clone)]
@@ -139,6 +171,16 @@ pub struct AppState {
     pub commands: Vec<pi_rpc::protocol::CommandInfo>,
     /// Workspace files offered at `@`, as project-relative paths.
     pub workspace_files: Vec<String>,
+    /// Bumped whenever the conversation is replaced, so the message list gets
+    /// a fresh scroll/away state instead of reusing the old session's.
+    pub session_epoch: u64,
+    /// Steer messages queued by the UI that pi has not delivered yet.
+    pending_steers: Vec<String>,
+    /// Text Esc or a failed send wants put back into the composer. The root
+    /// view drains this into the draft field.
+    pub pending_composer_text: Option<String>,
+    /// Cached session scan keyed by file metadata.
+    session_scan: Arc<Mutex<sessions::SessionScanner>>,
     client: Option<PiClient>,
 }
 
@@ -165,6 +207,10 @@ impl AppState {
                 last_project,
                 commands: Vec::new(),
                 workspace_files: Vec::new(),
+                session_epoch: 0,
+                pending_steers: Vec::new(),
+                pending_composer_text: None,
+                session_scan: Arc::new(Mutex::new(sessions::SessionScanner::default())),
                 client: None,
             };
             state.probe_environment(cx);
@@ -176,27 +222,45 @@ impl AppState {
         self.client.clone()
     }
 
+    /// Take text a cancelled/failed action wants restored to the composer.
+    pub fn take_pending_composer_text(&mut self) -> Option<String> {
+        self.pending_composer_text.take()
+    }
+
     // -- environment --------------------------------------------------------
 
     /// Probe the pi CLI and provider auth in the background for the welcome
-    /// screen. Probes the common providers; only ready ones are reported.
+    /// screen. Only providers present in `auth.json` (plus the common ones
+    /// for env-var auth) are checked, in parallel so startup is not serialized
+    /// behind several Node processes.
     fn probe_environment(&self, cx: &Context<Self>) {
         cx.spawn(async move |this, cx| {
             let found = cx
                 .background_executor()
                 .spawn(async move {
-                    let pi_version = pi_rpc::client::probe_pi_install(None);
-                    let mut ready_providers = Vec::new();
-                    if pi_version.is_some() {
-                        for provider in ["deepseek", "anthropic", "openai", "openrouter", "google"]
-                        {
-                            if pi_rpc::client::probe_auth(provider, None).unwrap_or(false) {
-                                ready_providers.push(provider.to_string());
-                            }
-                        }
-                    }
+                    let Some(pi_version) = pi_rpc::client::probe_pi_install(None) else {
+                        return Environment::default();
+                    };
+                    let providers = probe_providers();
+                    let ready_providers = std::thread::scope(|scope| {
+                        let handles = providers
+                            .into_iter()
+                            .map(|provider| {
+                                scope.spawn(move || {
+                                    let ready = pi_rpc::client::probe_auth(&provider, None)
+                                        .unwrap_or(false);
+                                    (provider, ready)
+                                })
+                            })
+                            .collect::<Vec<_>>();
+                        handles
+                            .into_iter()
+                            .filter_map(|handle| handle.join().ok())
+                            .filter_map(|(provider, ready)| ready.then_some(provider))
+                            .collect()
+                    });
                     Environment {
-                        pi_version,
+                        pi_version: Some(pi_version),
                         ready_providers,
                     }
                 })
@@ -230,6 +294,12 @@ impl AppState {
         self.cwd = Some(cwd.clone());
         self.transcript.clear();
         self.notice = None;
+        self.streaming = false;
+        self.stats = None;
+        self.session_name = None;
+        self.session_epoch += 1;
+        self.pending_steers.clear();
+        self.pending_composer_text = None;
         self.last_project = Some(cwd.to_string_lossy().into_owned());
         crate::settings::save_setting(|s| {
             s.last_project = self.last_project.clone();
@@ -239,12 +309,14 @@ impl AppState {
         // A stale session file must not break the spawn; fall back to fresh.
         let mut args: Vec<String> = Vec::new();
         self.last_session_loaded = false;
+        self.session_file = None;
         if let Some(session) = resume_session
             && std::path::Path::new(&session).is_file()
         {
             log::info!("state: resuming session {session}");
             args.push("--session".into());
-            args.push(session);
+            args.push(session.clone());
+            self.session_file = Some(session);
             self.last_session_loaded = true;
         }
         let config = PiProcessConfig::new(&cwd).with_args(args);
@@ -257,48 +329,78 @@ impl AppState {
             match spawned {
                 Ok(client) => {
                     log::info!("state: pi spawned, running init requests");
-                    let init_client = client.clone();
-                    let init = cx
-                        .background_executor()
-                        .spawn(async move {
-                            let state = init_client.request(Command::GetState);
-                            let models = init_client.request(Command::GetAvailableModels);
-                            let levels = init_client.request(Command::GetAvailableThinkingLevels);
-                            (state, models, levels)
-                        })
-                        .await;
-                    let (state, models, levels) = init;
+                    // Run the three independent round trips in parallel, each
+                    // with a short timeout. Sequentially they could stall the
+                    // UI behind 3 x 120s if Pi is wedged.
+                    let (state_result, models_result, levels_result) =
+                        std::thread::scope(|scope| {
+                            let state_client = client.clone();
+                            let models_client = client.clone();
+                            let levels_client = client.clone();
+                            let state = scope.spawn(move || {
+                                state_client.request_with_timeout(Command::GetState, INIT_TIMEOUT)
+                            });
+                            let models = scope.spawn(move || {
+                                models_client
+                                    .request_with_timeout(Command::GetAvailableModels, INIT_TIMEOUT)
+                            });
+                            let levels = scope.spawn(move || {
+                                levels_client.request_with_timeout(
+                                    Command::GetAvailableThinkingLevels,
+                                    INIT_TIMEOUT,
+                                )
+                            });
+                            (
+                                state
+                                    .join()
+                                    .unwrap_or_else(|_| Err(anyhow::anyhow!("get_state panicked"))),
+                                models.join().unwrap_or_else(|_| {
+                                    Err(anyhow::anyhow!("get_available_models panicked"))
+                                }),
+                                levels.join().unwrap_or_else(|_| {
+                                    Err(anyhow::anyhow!("get_available_thinking_levels panicked"))
+                                }),
+                            )
+                        });
                     log::info!(
                         "state: init done, get_state ok={}",
-                        state.as_ref().map(|r| r.success).unwrap_or(false)
+                        state_result.as_ref().map(|r| r.success).unwrap_or(false)
                     );
                     this.update(cx, |s, cx| {
-                        let failed = state.as_ref().err().map(|e| e.to_string());
+                        let failed = state_result.as_ref().err().map(|e| e.to_string());
                         log::info!("state: applying connect result, failed={failed:?}");
                         s.client = Some(client.clone());
                         match failed {
                             Some(error) => {
-                                s.conn = Conn::Dead(error);
+                                let stderr = client.last_stderr();
+                                s.conn = Conn::Dead(if stderr.is_empty() {
+                                    error
+                                } else {
+                                    format!("{error}\n{stderr}")
+                                });
                             }
                             None => {
                                 s.conn = Conn::Live;
                                 if let Ok(Ok(Some(payload))) =
-                                    state.map(|r| r.data_as::<SessionState>())
+                                    state_result.map(|r| r.data_as::<SessionState>())
                                 {
                                     s.current_model = payload.model;
                                     s.thinking_level = payload.thinking_level;
                                     s.session_name = payload.session_name;
+                                    s.streaming = payload.is_streaming;
                                     s.remember_session_file(payload.session_file.as_deref());
                                 }
-                                if let Ok(Ok(Some(payload))) =
-                                    models.map(|r| r.data_as::<pi_rpc::protocol::AvailableModels>())
+                                if let Ok(Ok(Some(payload))) = models_result
+                                    .map(|r| r.data_as::<pi_rpc::protocol::AvailableModels>())
                                 {
                                     s.models = payload.models;
                                 }
-                                if let Ok(Ok(Some(payload))) = levels.map(|r| {
+                                if let Ok(Ok(Some(payload))) = levels_result.map(|r| {
                                     r.data_as::<pi_rpc::protocol::AvailableThinkingLevels>()
                                 }) {
                                     s.thinking_levels = payload.levels;
+                                    s.thinking_levels
+                                        .retain(|level| *level != ThinkingLevel::Unknown);
                                 }
                                 s.start_pump(client.clone(), cx);
                                 // A resumed session opens with its history;
@@ -309,6 +411,7 @@ impl AppState {
                                 }
                                 s.load_commands(cx);
                                 s.scan_workspace_files(cx);
+                                s.refresh_stats(cx);
                             }
                         }
                         s.refresh_sessions(cx);
@@ -329,18 +432,19 @@ impl AppState {
     }
 
     /// Persist the active session file so the next launch resumes it.
+    ///
+    /// Pi reports a session path as soon as a session exists, but only creates
+    /// the file on the first message. Persist just paths that are on disk; an
+    /// empty session must not become a resume target that fails the file
+    /// existence check at startup.
     fn remember_session_file(&mut self, session_file: Option<&str>) {
-        if self.session_file.as_deref() == session_file {
-            return;
-        }
         self.session_file = session_file.map(str::to_string);
+        let persisted = session_file.filter(|path| std::path::Path::new(path).is_file());
         crate::settings::save_setting(|s| {
-            s.last_session = session_file.map(str::to_string);
+            s.last_session = persisted.map(str::to_string);
         });
     }
 
-    /// Fetch all entries and rebuild the transcript (used by session resume
-    /// and by the sidebar's session picker).
     /// Fetch the `/` command list pi offers (extensions, templates, skills).
     fn load_commands(&self, cx: &Context<Self>) {
         let Some(client) = self.client() else { return };
@@ -407,7 +511,7 @@ impl AppState {
                             payload.entries.len(),
                             payload.leaf_id
                         );
-                        s.load_entries(&payload.entries);
+                        s.load_entries(&payload.entries, payload.leaf_id.as_deref());
                     }
                     Ok(None) => {}
                     Err(error) => s.push_notice(NoticeKind::Error, error.to_string()),
@@ -429,7 +533,20 @@ impl AppState {
         self.streaming = false;
         self.stats = None;
         self.session_name = None;
+        self.pending_steers.clear();
+        self.pending_composer_text = None;
         cx.notify();
+    }
+
+    /// Reconnect to the last project/session after a crash or failed start.
+    pub fn retry(&mut self, cx: &mut Context<Self>) {
+        let directory = self
+            .cwd
+            .clone()
+            .or_else(|| self.last_project.clone().map(PathBuf::from));
+        if let Some(directory) = directory {
+            self.connect(directory, self.session_file.clone(), cx);
+        }
     }
 
     /// Consume the client's broadcast into the transcript until it ends.
@@ -461,15 +578,27 @@ impl AppState {
 
     // -- sidebar ------------------------------------------------------------
 
-    /// Rescan `~/.pi/agent/sessions` in the background.
+    /// Rescan `~/.pi/agent/sessions` in the background, reusing cached
+    /// summaries for files that have not changed.
     pub fn refresh_sessions(&self, cx: &Context<Self>) {
+        let scanner = Arc::clone(&self.session_scan);
         cx.spawn(async move |this, cx| {
             let groups = cx
                 .background_executor()
                 .spawn(async move {
-                    sessions::default_session_dir()
-                        .and_then(|dir| sessions::scan_sessions(&dir).ok())
-                        .unwrap_or_default()
+                    let Some(dir) = sessions::default_session_dir() else {
+                        return Vec::new();
+                    };
+                    match scanner.lock() {
+                        Ok(mut scanner) => scanner.scan(&dir).unwrap_or_else(|error| {
+                            log::warn!("session scan failed: {error}");
+                            Vec::new()
+                        }),
+                        Err(error) => {
+                            log::warn!("session scan cache poisoned: {error}");
+                            Vec::new()
+                        }
+                    }
                 })
                 .await;
             this.update(cx, |s, cx| {
@@ -484,15 +613,28 @@ impl AppState {
     // -- actions ------------------------------------------------------------
 
     /// Send a prompt, or steer the running agent. The optimistic user bubble
-    /// appears immediately; the wire call happens in the background.
+    /// appears immediately; on rejection it is removed and its text restored
+    /// to the composer.
     pub fn send_text(&mut self, text: String, cx: &mut Context<Self>) {
         if text.trim().is_empty() || self.conn != Conn::Live {
             return;
         }
-        let command = if self.streaming {
-            Command::Steer {
-                message: text.clone(),
-                images: None,
+        let Some(client) = self.client() else { return };
+        let steering = self.streaming;
+        let command = if steering {
+            // Extension/prompt-template commands are not allowed through
+            // `steer`; pi expands them on a prompt with streamingBehavior.
+            if text.trim_start().starts_with('/') {
+                Command::Prompt {
+                    message: text.clone(),
+                    images: None,
+                    streaming_behavior: Some(StreamingBehavior::Steer),
+                }
+            } else {
+                Command::Steer {
+                    message: text.clone(),
+                    images: None,
+                }
             }
         } else {
             Command::Prompt {
@@ -501,25 +643,100 @@ impl AppState {
                 streaming_behavior: None,
             }
         };
-        self.transcript.push(TranscriptItem::User { text });
-        self.check_command(command, "prompt", cx);
+        if steering {
+            self.pending_steers.push(text.clone());
+        }
+        self.transcript
+            .push(TranscriptItem::User { text: text.clone() });
         cx.notify();
-    }
 
-    /// Interactive Esc semantics: drop queued steering, then abort the run.
-    pub fn stop(&mut self, cx: &Context<Self>) {
-        let Some(client) = self.client() else { return };
+        let label = if steering { "steer" } else { "prompt" };
+        let restore = text.clone();
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
+                .spawn(async move { client.request(command) })
+                .await;
+            this.update(cx, |s, cx| {
+                let failure = match &result {
+                    Ok(response) if response.success => None,
+                    Ok(response) => Some(response.error.clone().unwrap_or_default()),
+                    Err(error) => Some(error.to_string()),
+                };
+                if let Some(error) = failure {
+                    s.remove_last_user_text(&text);
+                    if steering {
+                        s.pending_steers.retain(|pending| pending != &text);
+                    }
+                    s.restore_to_composer(&restore);
+                    s.push_notice(NoticeKind::Error, format!("{label}: {error}"));
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn remove_last_user_text(&mut self, text: &str) {
+        if let Some(index) = self
+            .transcript
+            .iter()
+            .rposition(|item| matches!(item, TranscriptItem::User { text: t } if t == text))
+        {
+            self.transcript.remove(index);
+        }
+    }
+
+    fn restore_to_composer(&mut self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        self.pending_composer_text = Some(match self.pending_composer_text.take() {
+            Some(existing) if !existing.is_empty() => format!("{existing}\n{text}"),
+            _ => text.to_string(),
+        });
+    }
+
+    /// Interactive Esc semantics: drop queued steering, then abort the run.
+    ///
+    /// pi returns the cleared messages' text, and the documented Esc behavior
+    /// is to put it back in the editor, so the user does not lose what they
+    /// typed while the agent was running.
+    pub fn stop(&mut self, cx: &Context<Self>) {
+        let Some(client) = self.client() else { return };
+        cx.spawn(async move |this, cx| {
+            let cleared = cx
+                .background_executor()
                 .spawn(async move {
-                    let _ = client.request(Command::ClearQueue);
-                    client.request(Command::Abort)
+                    let cleared = client.request(Command::ClearQueue);
+                    let _ = client.request(Command::Abort);
+                    cleared
                 })
                 .await;
             this.update(cx, |s, cx| {
-                if let Err(error) = result {
-                    s.notice = Some((NoticeKind::Error, error.to_string()));
+                match cleared {
+                    Ok(response) if response.success => {
+                        if let Ok(Some(queue)) = response.data_as::<ClearedQueue>() {
+                            for text in queue.steering.iter().chain(queue.follow_up.iter()) {
+                                s.remove_last_user_text(text);
+                            }
+                            let restored = queue
+                                .steering
+                                .iter()
+                                .chain(queue.follow_up.iter())
+                                .cloned()
+                                .collect::<Vec<_>>()
+                                .join("\n");
+                            s.restore_to_composer(&restored);
+                        }
+                        s.pending_steers.clear();
+                    }
+                    Ok(response) => s.push_notice(
+                        NoticeKind::Error,
+                        format!("clear_queue: {}", response.error.unwrap_or_default()),
+                    ),
+                    Err(error) => s.push_notice(NoticeKind::Error, error.to_string()),
                 }
                 cx.notify();
             })
@@ -528,63 +745,124 @@ impl AppState {
         .detach();
     }
 
-    /// Start a fresh session in the same project.
+    /// Start a fresh session in the same project. The transcript is only
+    /// cleared after pi accepts the switch, so a cancelled or failed command
+    /// leaves the current conversation intact.
     pub fn new_chat(&mut self, cx: &mut Context<Self>) {
         if self.conn != Conn::Live {
             return;
         }
-        self.check_command(
-            Command::NewSession {
-                parent_session: None,
-            },
-            "new_session",
-            cx,
-        );
-        self.transcript.clear();
-        self.session_name = None;
-        self.stats = None;
-        self.push_notice(
-            NoticeKind::Info,
-            i18n::t(cx, "new_session_started").to_string(),
-        );
-        self.query_state(cx);
-        cx.notify();
-    }
-
-    /// Load a past session into the running pi process and rebuild the
-    /// transcript from its entries.
-    pub fn switch_session(&mut self, path: PathBuf, cx: &mut Context<Self>) {
-        if self.conn != Conn::Live {
+        if self.streaming {
+            self.push_notice(NoticeKind::Warn, i18n::t(cx, "agent_busy").to_string());
+            cx.notify();
             return;
         }
         let Some(client) = self.client() else { return };
-        self.transcript.clear();
-        self.session_name = None;
-        self.push_notice(
-            NoticeKind::Info,
-            i18n::t(cx, "session_restored").to_string(),
-        );
-        cx.notify();
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
                 .spawn(async move {
-                    let switched = client.request(Command::SwitchSession {
-                        session_path: path.to_string_lossy().into_owned(),
-                    })?;
-                    if !switched.success {
-                        anyhow::bail!("switch_session failed: {:?}", switched.error);
-                    }
-                    Ok(())
+                    client.request(Command::NewSession {
+                        parent_session: None,
+                    })
                 })
                 .await;
             this.update(cx, |s, cx| {
                 match result {
-                    Ok(()) => {
-                        // Refresh name/model/session-file, then rebuild the
-                        // transcript from the switched session's entries.
-                        s.query_state(cx);
-                        s.load_history(cx);
+                    Ok(response) if response.success => {
+                        if session_action_cancelled(&response) {
+                            s.push_notice(
+                                NoticeKind::Warn,
+                                i18n::t(cx, "session_cancelled").to_string(),
+                            );
+                        } else {
+                            s.transcript.clear();
+                            s.session_name = None;
+                            s.stats = None;
+                            s.session_epoch += 1;
+                            s.pending_steers.clear();
+                            s.push_notice(
+                                NoticeKind::Info,
+                                i18n::t(cx, "new_session_started").to_string(),
+                            );
+                            s.query_state(cx);
+                            s.refresh_stats(cx);
+                            s.refresh_sessions(cx);
+                        }
+                    }
+                    Ok(response) => s.push_notice(
+                        NoticeKind::Error,
+                        format!("new_session: {}", response.error.unwrap_or_default()),
+                    ),
+                    Err(error) => s.push_notice(NoticeKind::Error, error.to_string()),
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Load a past session into the running pi process and rebuild the
+    /// transcript from its entries. The transcript is cleared only once pi
+    /// accepts the switch.
+    pub fn switch_session(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        if self.conn != Conn::Live {
+            return;
+        }
+        if self.streaming {
+            self.push_notice(NoticeKind::Warn, i18n::t(cx, "agent_busy").to_string());
+            cx.notify();
+            return;
+        }
+        let Some(client) = self.client() else { return };
+        let session_file = path.to_string_lossy().into_owned();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn({
+                    let path = path.clone();
+                    async move {
+                        let switched = client.request(Command::SwitchSession {
+                            session_path: path.to_string_lossy().into_owned(),
+                        })?;
+                        if !switched.success {
+                            anyhow::bail!("switch_session failed: {:?}", switched.error);
+                        }
+                        let cancelled = session_action_cancelled(&switched);
+                        // pi rebinds its own runtime to the session's cwd;
+                        // pido must follow so `@` and last_project agree.
+                        let cwd = sessions::read_session_cwd(&path);
+                        Ok((cancelled, cwd))
+                    }
+                })
+                .await;
+            this.update(cx, |s, cx| {
+                match result {
+                    Ok((cancelled, cwd)) => {
+                        if cancelled {
+                            s.push_notice(
+                                NoticeKind::Warn,
+                                i18n::t(cx, "session_cancelled").to_string(),
+                            );
+                        } else {
+                            s.transcript.clear();
+                            s.session_name = None;
+                            s.stats = None;
+                            s.session_epoch += 1;
+                            s.pending_steers.clear();
+                            s.remember_session_file(Some(&session_file));
+                            s.apply_session_cwd(cwd, cx);
+                            s.push_notice(
+                                NoticeKind::Info,
+                                i18n::t(cx, "session_restored").to_string(),
+                            );
+                            // Refresh name/model/session-file, then rebuild
+                            // the transcript from the switched session.
+                            s.query_state(cx);
+                            s.load_history(cx);
+                            s.refresh_stats(cx);
+                        }
                     }
                     Err(error) => s.push_notice(NoticeKind::Error, error.to_string()),
                 }
@@ -595,28 +873,101 @@ impl AppState {
         .detach();
     }
 
-    pub fn set_model(&mut self, model_id: &str, cx: &mut Context<Self>) {
-        let Some(model) = self.models.iter().find(|m| m.id == model_id).cloned() else {
+    /// Move pido's project context (cwd, `@` index, slash commands,
+    /// last_project) to follow a switched session.
+    fn apply_session_cwd(&mut self, cwd: Option<String>, cx: &Context<Self>) {
+        let Some(cwd) = cwd else { return };
+        let path = PathBuf::from(&cwd);
+        if self.cwd.as_deref() == Some(path.as_path()) {
+            return;
+        }
+        self.cwd = Some(path);
+        self.last_project = Some(cwd.clone());
+        crate::settings::save_setting(|s| s.last_project = Some(cwd));
+        self.scan_workspace_files(cx);
+        self.load_commands(cx);
+    }
+
+    pub fn set_model(&mut self, provider: &str, model_id: &str, cx: &mut Context<Self>) {
+        let Some(model) = self
+            .models
+            .iter()
+            .find(|m| m.id == model_id && m.provider.as_deref().unwrap_or_default() == provider)
+            .cloned()
+        else {
             return;
         };
-        let provider = model.provider.clone().unwrap_or_default();
+        let Some(client) = self.client() else { return };
+        let previous_model = self.current_model.clone();
+        let previous_levels = self.thinking_levels.clone();
         self.current_model = Some(model);
-        self.check_command(
-            Command::SetModel {
-                provider,
-                model_id: model_id.to_string(),
-            },
-            "set_model",
-            cx,
-        );
-        // Thinking levels change with the model.
-        self.refresh_thinking_levels(cx);
+        let provider = provider.to_string();
+        let model_id = model_id.to_string();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { client.request(Command::SetModel { provider, model_id }) })
+                .await;
+            this.update(cx, |s, cx| {
+                match result {
+                    Ok(response) if response.success => {
+                        // Thinking levels change with the model.
+                        s.refresh_thinking_levels(cx);
+                    }
+                    Ok(response) => {
+                        s.current_model = previous_model;
+                        s.thinking_levels = previous_levels;
+                        s.push_notice(
+                            NoticeKind::Error,
+                            format!("set_model: {}", response.error.unwrap_or_default()),
+                        );
+                    }
+                    Err(error) => {
+                        s.current_model = previous_model;
+                        s.thinking_levels = previous_levels;
+                        s.push_notice(NoticeKind::Error, error.to_string());
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
         cx.notify();
     }
 
     pub fn set_thinking(&mut self, level: ThinkingLevel, cx: &mut Context<Self>) {
+        if level == ThinkingLevel::Unknown {
+            return;
+        }
+        let Some(client) = self.client() else { return };
+        let previous = self.thinking_level;
         self.thinking_level = Some(level);
-        self.check_command(Command::SetThinkingLevel { level }, "set_thinking", cx);
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { client.request(Command::SetThinkingLevel { level }) })
+                .await;
+            this.update(cx, |s, cx| {
+                match result {
+                    Ok(response) if response.success => {}
+                    Ok(response) => {
+                        s.thinking_level = previous;
+                        s.push_notice(
+                            NoticeKind::Error,
+                            format!("set_thinking: {}", response.error.unwrap_or_default()),
+                        );
+                    }
+                    Err(error) => {
+                        s.thinking_level = previous;
+                        s.push_notice(NoticeKind::Error, error.to_string());
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
         cx.notify();
     }
 
@@ -692,6 +1043,8 @@ impl AppState {
                     result.map(|r| r.data_as::<pi_rpc::protocol::AvailableThinkingLevels>())
                 {
                     s.thinking_levels = payload.levels;
+                    s.thinking_levels
+                        .retain(|level| *level != ThinkingLevel::Unknown);
                     cx.notify();
                 }
             })
@@ -743,7 +1096,14 @@ impl AppState {
                     self.conn
                 );
                 if self.conn == Conn::Live {
-                    self.conn = Conn::Dead(format!("{reason:?}"));
+                    let mut message = format!("{reason:?}");
+                    if let Some(tail) = self.client.as_ref().map(PiClient::last_stderr)
+                        && !tail.is_empty()
+                    {
+                        message.push('\n');
+                        message.push_str(&tail);
+                    }
+                    self.conn = Conn::Dead(message);
                     self.streaming = false;
                 }
                 // No AgentSettled will ever arrive: freeze any half-streamed
@@ -761,8 +1121,8 @@ impl AppState {
                 && !view.finished
             {
                 view.finished = true;
-                view.text_live = false;
-                view.thinking_live = false;
+                view.live_text = None;
+                view.live_thinking = None;
                 if view.took.is_none() {
                     view.took = Some(view.started.elapsed());
                 }
@@ -774,16 +1134,35 @@ impl AppState {
         match record {
             RpcRecord::Response(response) => self.on_unmatched_response(response),
             RpcRecord::ExtensionUiRequest(request) => {
-                // MVP: dialog requests are left to time out agent-side;
-                // fire-and-forget notices become banners.
-                if !request.method.is_dialog() {
+                if request.method.is_dialog() {
+                    // Dialog methods block the extension until answered, and
+                    // pi only auto-resolves them when a timeout was supplied.
+                    // Until native dialogs exist, cancel explicitly so an
+                    // extension cannot wedge the whole agent.
+                    if let Some(client) = self.client()
+                        && let Err(error) = client.send_uncorrelated(Command::ExtensionUiResponse {
+                            id: request.id.clone(),
+                            value: None,
+                            confirmed: None,
+                            cancelled: Some(true),
+                        })
+                    {
+                        log::warn!("state: failed to cancel extension dialog: {error}");
+                    }
+                    let detail = request
+                        .title
+                        .or(request.message)
+                        .unwrap_or_else(|| i18n::t(cx, "extension_notify").to_string());
+                    self.push_notice(
+                        NoticeKind::Warn,
+                        format!("{}: {detail}", i18n::t(cx, "extension_dialog_cancelled")),
+                    );
+                } else {
                     let text = request
                         .message
                         .or(request.title)
                         .unwrap_or_else(|| i18n::t(cx, "extension_notify").to_string());
                     self.push_notice(NoticeKind::Warn, text);
-                } else {
-                    log::debug!("extension dialog ignored (agent times out): {request:?}");
                 }
             }
             RpcRecord::Event(event) => self.on_event(event, cx),
@@ -812,18 +1191,27 @@ impl AppState {
             }
             Event::AgentSettled { aborted } => {
                 self.streaming = false;
+                self.pending_steers.clear();
                 // Any assistant view still live is finished now.
                 self.finalize_open_views();
                 if aborted {
-                    self.push_notice(NoticeKind::Warn, i18n::t(cx, "disconnected").to_string());
+                    self.push_notice(NoticeKind::Warn, i18n::t(cx, "aborted").to_string());
                 }
+                // The first message creates the session file; refresh so it
+                // becomes the persisted resume target.
+                self.query_state(cx);
                 self.refresh_stats(cx);
                 self.refresh_sessions(cx);
             }
-            Event::MessageStart { .. } => {
-                self.transcript.push(TranscriptItem::Assistant(Box::new(
-                    AssistantView::streaming(),
-                )));
+            Event::MessageStart { message } => {
+                // pi also emits message_start for user prompts, steering
+                // messages, tool results and custom messages. Only an
+                // assistant message may open a transcript view.
+                if opens_assistant_view(&message) {
+                    self.transcript.push(TranscriptItem::Assistant(Box::new(
+                        AssistantView::streaming(),
+                    )));
+                }
             }
             Event::MessageUpdate {
                 assistant_message_event,
@@ -903,26 +1291,54 @@ impl AppState {
             }
             Event::CompactionStart { .. } => {}
             Event::CompactionEnd {
-                aborted, result, ..
+                aborted,
+                result,
+                error_message,
+                ..
             } => {
-                let text = if aborted {
-                    format!("{} (aborted)", i18n::t(cx, "context_compacted"))
+                if aborted {
+                    self.push_notice(
+                        NoticeKind::Warn,
+                        i18n::t(cx, "context_compacted_aborted").to_string(),
+                    );
                 } else if result.is_some() {
-                    i18n::t(cx, "context_compacted").to_string()
+                    self.push_notice(
+                        NoticeKind::Info,
+                        i18n::t(cx, "context_compacted").to_string(),
+                    );
                 } else {
-                    format!("{}: {}", i18n::t(cx, "context_compacted"), "failed")
-                };
-                self.push_notice(NoticeKind::Info, text);
+                    let detail = error_message
+                        .unwrap_or_else(|| i18n::t(cx, "context_compacted_failed").to_string());
+                    self.push_notice(NoticeKind::Error, detail);
+                }
             }
             Event::AutoRetryStart { .. } => {
                 self.push_notice(NoticeKind::Warn, i18n::t(cx, "retrying").to_string());
+            }
+            Event::AutoRetryEnd {
+                success,
+                final_error,
+                ..
+            } => {
+                if success {
+                    self.push_notice(NoticeKind::Info, i18n::t(cx, "retry_succeeded").to_string());
+                } else {
+                    let detail = final_error
+                        .unwrap_or_else(|| i18n::t(cx, "retry_failed_unknown").to_string());
+                    self.push_notice(
+                        NoticeKind::Error,
+                        i18n::t_arg(cx, "retry_failed", "e", &detail).to_string(),
+                    );
+                }
             }
             Event::ExtensionError { error, .. } => {
                 if let Some(error) = error {
                     self.push_notice(NoticeKind::Error, error);
                 }
             }
-            Event::QueueUpdate { .. } => {}
+            Event::QueueUpdate { steering, .. } => {
+                self.pending_steers = steering;
+            }
             Event::BashExecutionUpdate { .. } => {}
             other => {
                 log::debug!("event not shown in MVP UI: {:?}", other);
@@ -943,16 +1359,47 @@ impl AppState {
             return;
         };
         match delta {
-            AssistantMessageEvent::TextStart { .. } => view.text_live = true,
-            AssistantMessageEvent::TextDelta { delta, .. } => view.text.push_str(&delta),
-            AssistantMessageEvent::TextEnd { content, .. } => {
-                view.text = content;
-                view.text_live = false;
+            AssistantMessageEvent::TextStart { content_index } => {
+                view.live_text = Some(content_index);
+                view.text_blocks.entry(content_index).or_default();
             }
-            AssistantMessageEvent::ThinkingStart { .. } => view.thinking_live = true,
-            AssistantMessageEvent::ThinkingDelta { delta, .. } => view.thinking.push_str(&delta),
-            AssistantMessageEvent::ThinkingEnd { .. } => {
-                view.thinking_live = false;
+            AssistantMessageEvent::TextDelta {
+                content_index,
+                delta,
+            } => {
+                view.live_text = Some(content_index);
+                view.text_blocks
+                    .entry(content_index)
+                    .or_default()
+                    .push_str(&delta);
+            }
+            AssistantMessageEvent::TextEnd {
+                content_index,
+                content,
+            } => {
+                view.text_blocks.insert(content_index, content);
+                if view.live_text == Some(content_index) {
+                    view.live_text = None;
+                }
+            }
+            AssistantMessageEvent::ThinkingStart { content_index } => {
+                view.live_thinking = Some(content_index);
+                view.thinking_blocks.entry(content_index).or_default();
+            }
+            AssistantMessageEvent::ThinkingDelta {
+                content_index,
+                delta,
+            } => {
+                view.live_thinking = Some(content_index);
+                view.thinking_blocks
+                    .entry(content_index)
+                    .or_default()
+                    .push_str(&delta);
+            }
+            AssistantMessageEvent::ThinkingEnd { content_index } => {
+                if view.live_thinking == Some(content_index) {
+                    view.live_thinking = None;
+                }
                 // Freeze the thinking duration here: the header switches from
                 // the live indicator to a static value at exactly this point.
                 if view.took.is_none() {
@@ -1048,9 +1495,9 @@ impl AppState {
     }
 
     /// Rebuild the transcript from `get_entries` payload.
-    fn load_entries(&mut self, entries: &[SessionEntry]) {
+    fn load_entries(&mut self, entries: &[SessionEntry], leaf_id: Option<&str>) {
         self.transcript.clear();
-        for entry in entries {
+        for entry in active_branch(entries, leaf_id) {
             let Some(message) = &entry.message else {
                 if entry.entry_type == "compaction" {
                     // The compacted summary is a checkpoint, not chat.
@@ -1065,6 +1512,12 @@ impl AppState {
                     }
                 }
                 AgentMessage::Assistant(assistant) => {
+                    let mut view = AssistantView::from_message(assistant);
+                    view.took = None;
+                    self.transcript
+                        .push(TranscriptItem::Assistant(Box::new(view)));
+                    // Cards follow the message in both live and restored
+                    // transcripts, so ordering stays consistent.
                     for block in &assistant.content {
                         if let pi_rpc::protocol::AssistantContent::ToolCall(call) = block {
                             self.ensure_tool_card(
@@ -1074,10 +1527,6 @@ impl AppState {
                             );
                         }
                     }
-                    let mut view = AssistantView::from_message(assistant);
-                    view.took = None;
-                    self.transcript
-                        .push(TranscriptItem::Assistant(Box::new(view)));
                 }
                 AgentMessage::ToolResult(result) => {
                     let text = result.text();
@@ -1110,6 +1559,80 @@ impl AppState {
             }
         }
     }
+}
+
+/// Only assistant message starts open a transcript view. Pi emits the same
+/// event for user prompts/steering, tool results and custom messages.
+fn opens_assistant_view(message: &Option<AgentMessage>) -> bool {
+    matches!(message, Some(AgentMessage::Assistant(_)))
+}
+
+/// Whether a `new_session` / `switch_session` response was cancelled by an
+/// extension's `session_before_switch` handler.
+fn session_action_cancelled(response: &Response) -> bool {
+    response
+        .data
+        .as_ref()
+        .and_then(|data| data.get("cancelled"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+}
+
+/// Entries on the path from the root to `leaf_id`, in append order. Falls
+/// back to every entry when the leaf is missing or the tree is malformed.
+fn active_branch<'a>(entries: &'a [SessionEntry], leaf_id: Option<&str>) -> Vec<&'a SessionEntry> {
+    let Some(leaf_id) = leaf_id else {
+        return entries.iter().collect();
+    };
+    let by_id: HashMap<&str, &SessionEntry> = entries
+        .iter()
+        .map(|entry| (entry.id.as_str(), entry))
+        .collect();
+    let mut chain = Vec::new();
+    let mut seen = HashSet::new();
+    let mut current = leaf_id;
+    while let Some(entry) = by_id.get(current).copied() {
+        if !seen.insert(current) {
+            log::warn!("session tree has a cycle at {current}");
+            break;
+        }
+        chain.push(entry);
+        match entry.parent_id.as_deref() {
+            Some(parent) => current = parent,
+            None => break,
+        }
+    }
+    if chain.is_empty() {
+        log::warn!("leaf {leaf_id} not found in {} entries", entries.len());
+        return entries.iter().collect();
+    }
+    chain.reverse();
+    chain
+}
+
+/// Providers worth probing for onboarding: those in `auth.json` plus the
+/// common env-var-backed ones. Only their names are read; credentials stay
+/// with pi.
+fn probe_providers() -> Vec<String> {
+    let mut providers = vec![
+        "deepseek".to_string(),
+        "anthropic".to_string(),
+        "openai".to_string(),
+        "openrouter".to_string(),
+        "google".to_string(),
+    ];
+    if let Some(home) = dirs::home_dir() {
+        let path = home.join(".pi").join("agent").join("auth.json");
+        if let Ok(text) = std::fs::read_to_string(path)
+            && let Ok(serde_json::Value::Object(map)) =
+                serde_json::from_str::<serde_json::Value>(&text)
+        {
+            providers.extend(map.into_iter().map(|(provider, _)| provider));
+        }
+    }
+    providers.sort();
+    providers.dedup();
+    providers
 }
 
 /// Pretty-print JSON arguments for the tool card.
@@ -1186,4 +1709,203 @@ fn workspace_files(root: &std::path::Path) -> Vec<String> {
     }
     files.sort();
     files
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(id: &str, parent: Option<&str>) -> SessionEntry {
+        SessionEntry {
+            entry_type: "message".into(),
+            id: id.into(),
+            parent_id: parent.map(str::to_string),
+            timestamp: None,
+            message: None,
+        }
+    }
+
+    #[test]
+    fn only_assistant_message_starts_open_a_view() {
+        let user = AgentMessage::User(pi_rpc::protocol::UserMessage {
+            content: pi_rpc::protocol::UserContent::Text("hi".into()),
+            timestamp: 1.0,
+            attachments: None,
+        });
+        let tool = AgentMessage::ToolResult(pi_rpc::protocol::ToolResultMessage {
+            tool_call_id: "call-1".into(),
+            tool_name: "bash".into(),
+            content: None,
+            usage: None,
+            is_error: false,
+            timestamp: 2.0,
+        });
+        let assistant = AgentMessage::Assistant(pi_rpc::protocol::AssistantMessage {
+            content: Vec::new(),
+            api: None,
+            provider: None,
+            model: None,
+            usage: None,
+            stop_reason: None,
+            error_message: None,
+            timestamp: 3.0,
+        });
+
+        assert!(!opens_assistant_view(&Some(user)));
+        assert!(!opens_assistant_view(&Some(tool)));
+        assert!(!opens_assistant_view(&None));
+        assert!(opens_assistant_view(&Some(assistant)));
+    }
+
+    #[test]
+    fn active_branch_follows_parents_and_skips_abandoned_entries() {
+        let entries = vec![
+            entry("root", None),
+            entry("a", Some("root")),
+            entry("b", Some("a")),
+            entry("abandoned", Some("root")),
+        ];
+        let ids = active_branch(&entries, Some("b"))
+            .into_iter()
+            .map(|entry| entry.id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(ids, ["root", "a", "b"]);
+    }
+
+    #[test]
+    fn active_branch_falls_back_when_leaf_is_unknown() {
+        let entries = vec![entry("root", None), entry("a", Some("root"))];
+        assert_eq!(active_branch(&entries, Some("missing")).len(), 2);
+        assert_eq!(active_branch(&entries, None).len(), 2);
+    }
+
+    fn empty_state() -> AppState {
+        AppState {
+            conn: Conn::Idle,
+            environment: Environment::default(),
+            cwd: None,
+            transcript: Vec::new(),
+            streaming: false,
+            models: Vec::new(),
+            current_model: None,
+            thinking_levels: Vec::new(),
+            thinking_level: None,
+            session_groups: Vec::new(),
+            session_name: None,
+            session_file: None,
+            last_session_loaded: false,
+            stats: None,
+            notice: None,
+            last_project: None,
+            commands: Vec::new(),
+            workspace_files: Vec::new(),
+            session_epoch: 0,
+            pending_steers: Vec::new(),
+            pending_composer_text: None,
+            session_scan: Arc::new(Mutex::new(sessions::SessionScanner::default())),
+            client: None,
+        }
+    }
+
+    fn message_entry(id: &str, parent: Option<&str>, message: AgentMessage) -> SessionEntry {
+        SessionEntry {
+            entry_type: "message".into(),
+            id: id.into(),
+            parent_id: parent.map(str::to_string),
+            timestamp: None,
+            message: Some(message),
+        }
+    }
+
+    #[test]
+    fn load_entries_follows_the_branch_and_orders_cards_after_messages() {
+        let mut state = empty_state();
+        let user = AgentMessage::User(pi_rpc::protocol::UserMessage {
+            content: pi_rpc::protocol::UserContent::Text("hi".into()),
+            timestamp: 1.0,
+            attachments: None,
+        });
+        let assistant = AgentMessage::Assistant(pi_rpc::protocol::AssistantMessage {
+            content: vec![
+                pi_rpc::protocol::AssistantContent::Text {
+                    text: "hello".into(),
+                },
+                pi_rpc::protocol::AssistantContent::ToolCall(pi_rpc::protocol::ToolCall {
+                    id: "call-1".into(),
+                    name: "bash".into(),
+                    arguments: serde_json::json!({"command": "ls"}),
+                }),
+            ],
+            api: None,
+            provider: None,
+            model: None,
+            usage: None,
+            stop_reason: None,
+            error_message: None,
+            timestamp: 2.0,
+        });
+        let result = AgentMessage::ToolResult(pi_rpc::protocol::ToolResultMessage {
+            tool_call_id: "call-1".into(),
+            tool_name: "bash".into(),
+            content: Some(pi_rpc::protocol::ToolResultContent {
+                content: vec![pi_rpc::protocol::ToolResultBlock::Text {
+                    text: "a.txt".into(),
+                }],
+                details: None,
+            }),
+            usage: None,
+            is_error: false,
+            timestamp: 3.0,
+        });
+        let abandoned = AgentMessage::User(pi_rpc::protocol::UserMessage {
+            content: pi_rpc::protocol::UserContent::Text("abandoned".into()),
+            timestamp: 4.0,
+            attachments: None,
+        });
+        let entries = vec![
+            message_entry("u1", None, user),
+            message_entry("a1", Some("u1"), assistant),
+            message_entry("t1", Some("a1"), result),
+            message_entry("x1", Some("u1"), abandoned),
+        ];
+
+        state.load_entries(&entries, Some("t1"));
+
+        let kinds = state
+            .transcript
+            .iter()
+            .map(|item| match item {
+                TranscriptItem::User { text } => format!("user:{text}"),
+                TranscriptItem::Assistant(view) => format!("assistant:{}", view.text()),
+                TranscriptItem::Tool(card) => {
+                    format!("tool:{}:{:?}", card.name, card.result.as_deref())
+                }
+                TranscriptItem::Notice { text, .. } => format!("notice:{text}"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            kinds,
+            ["user:hi", "assistant:hello", "tool:bash:Some(\"a.txt\")"],
+            "only the active branch is rendered and the card follows the message"
+        );
+    }
+
+    #[test]
+    fn cancelled_session_actions_are_recognized() {
+        let response = Response {
+            id: None,
+            record_type: "response".into(),
+            command: "switch_session".into(),
+            success: true,
+            error: None,
+            data: Some(serde_json::json!({"cancelled": true})),
+        };
+        assert!(session_action_cancelled(&response));
+
+        let response = Response {
+            data: Some(serde_json::json!({"cancelled": false})),
+            ..response
+        };
+        assert!(!session_action_cancelled(&response));
+    }
 }

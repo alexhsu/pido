@@ -17,6 +17,7 @@ use gpui::{
 
 use crate::i18n;
 use crate::state::{AppState, Conn};
+use crate::ui::chat;
 
 /// Render the welcome pane shown before a session starts.
 pub fn render(
@@ -27,19 +28,22 @@ pub fn render(
 ) -> impl IntoElement + use<> {
     let theme = cx.theme();
     let (danger_fill, danger_ink) = (theme.colors.danger_subtle, theme.colors.danger);
-    let s = state.read(cx);
-    let connecting = s.conn == Conn::Connecting;
-    let dead_reason = match &s.conn {
-        Conn::Dead(reason) => Some(reason.clone()),
-        _ => None,
+    let (connecting, dead_reason, last_project, notice) = {
+        let s = state.read(cx);
+        (
+            s.conn == Conn::Connecting,
+            match &s.conn {
+                Conn::Dead(reason) => Some(reason.clone()),
+                _ => None,
+            },
+            s.last_project.clone(),
+            s.notice.clone(),
+        )
     };
 
     // The path field needs a Window, so it is created lazily on first render.
     let dir_field = app.welcome_dir.clone().unwrap_or_else(|| {
-        let cwd_guess = state
-            .read(cx)
-            .last_project
-            .clone()
+        let cwd_guess = last_project
             .or_else(|| {
                 std::env::current_dir()
                     .ok()
@@ -51,10 +55,15 @@ pub fn render(
             input.set_text(cwd_guess, cx);
             input
         });
+        // Re-render the welcome pane as the path changes so the start button
+        // and validation stay in sync with the field.
+        cx.observe(&field, |_, _, cx| cx.notify()).detach();
         app.welcome_dir = Some(field.clone());
         field
     });
     let typed = dir_field.read(cx).text().trim().to_string();
+    let typed_invalid = !typed.is_empty() && !std::path::Path::new(&typed).is_dir();
+    let next_locale = i18n::other_locale(cx);
 
     let start_state = state.clone();
     let dir_for_start = dir_field.clone();
@@ -82,6 +91,28 @@ pub fn render(
                 .flex()
                 .flex_col()
                 .gap_6()
+                .child(
+                    div()
+                        .flex()
+                        .justify_end()
+                        .gap_2()
+                        .child(
+                            ely_gpui_component::buttons::Button::new(
+                                "welcome-theme",
+                                i18n::t(cx, "theme"),
+                            )
+                            .on_click(|_, _, cx| crate::ui::app::toggle_theme(cx)),
+                        )
+                        .child(
+                            ely_gpui_component::buttons::Button::new("welcome-locale", next_locale)
+                                .on_click(move |_, _, cx| {
+                                    crate::settings::save_setting(|s| {
+                                        s.locale = Some(next_locale.to_string());
+                                    });
+                                    ely_gpui_component::i18n::I18n::set_locale(next_locale, cx);
+                                }),
+                        ),
+                )
                 .child(
                     div()
                         .flex()
@@ -113,13 +144,23 @@ pub fn render(
                         .w_full()
                         .child(Caption::new(i18n::t(cx, "welcome_desc")))
                         .child(render_environment(state, cx))
+                        .when_some(notice, |this, (kind, text)| {
+                            this.child(chat::render_notice(kind, text, state.clone(), cx))
+                        })
                         .child(
                             div()
                                 .flex()
                                 .flex_col()
                                 .gap_2()
                                 .child(Caption::new(i18n::t(cx, "project_dir")))
-                                .child(PathInput::new("project-dir", &dir_field).directories()),
+                                .child(PathInput::new("project-dir", &dir_field).directories())
+                                .when(typed_invalid, |this| {
+                                    this.child(
+                                        div()
+                                            .text_color(danger_ink)
+                                            .child(Caption::new(i18n::t(cx, "dir_invalid"))),
+                                    )
+                                }),
                         )
                         .child(
                             Button::new(
@@ -130,7 +171,7 @@ pub fn render(
                                     i18n::t(cx, "start")
                                 },
                             )
-                            .disabled(connecting || typed.is_empty())
+                            .disabled(connecting || typed.is_empty() || typed_invalid)
                             .on_click(move |_, _, cx| {
                                 let path = std::path::PathBuf::from(
                                     dir_for_start.read(cx).text().trim().to_string(),
@@ -140,6 +181,7 @@ pub fn render(
                         )
                         .when_some(dead_reason, |this, reason| {
                             let reset_state = state.clone();
+                            let retry_state = state.clone();
                             this.child(banner(
                                 danger_fill,
                                 danger_ink,
@@ -147,13 +189,18 @@ pub fn render(
                                 reason.into(),
                             ))
                             .child(
-                                ely_gpui_component::buttons::Button::new(
-                                    "reconnect",
-                                    i18n::t(cx, "reconnect"),
-                                )
-                                .on_click(move |_, _, cx| {
-                                    reset_state.update(cx, |s, cx| s.disconnect(cx));
-                                }),
+                                div()
+                                    .flex()
+                                    .gap_2()
+                                    .child(Button::new("retry", i18n::t(cx, "retry")).on_click(
+                                        move |_, _, cx| retry_state.update(cx, |s, cx| s.retry(cx)),
+                                    ))
+                                    .child(
+                                        Button::new("reconnect", i18n::t(cx, "reconnect"))
+                                            .on_click(move |_, _, cx| {
+                                                reset_state.update(cx, |s, cx| s.disconnect(cx));
+                                            }),
+                                    ),
                             )
                         }),
                 ),
