@@ -63,6 +63,8 @@ pub fn render(state: &Entity<AppState>, cx: &App) -> impl IntoElement + use<> {
 
     div()
         .w(px(264.))
+        .h_full()
+        .min_h_0()
         .flex()
         .flex_col()
         .border_r_1()
@@ -89,19 +91,20 @@ pub fn render(state: &Entity<AppState>, cx: &App) -> impl IntoElement + use<> {
                 })),
         )
         .child(
-            ScrollArea::new("sessions").vertical().child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_4()
-                    .when(empty, |this| {
-                        this.child(Caption::new(i18n::t(cx, "no_sessions")))
-                    })
-                    .children(
-                        groups
-                            .into_iter()
-                            .enumerate()
-                            .map(|(group_ix, (cwd, sessions))| {
+            // The list must be the only growing part and stay inside the
+            // window; without a bound its content stretches the whole row and
+            // the session pane's composer lands below the window.
+            div().flex_1().min_h_0().min_w_0().child(
+                ScrollArea::new("sessions").vertical().child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_4()
+                        .when(empty, |this| {
+                            this.child(Caption::new(i18n::t(cx, "no_sessions")))
+                        })
+                        .children(groups.into_iter().enumerate().map(
+                            |(group_ix, (cwd, sessions))| {
                                 let app = app.clone();
                                 div()
                                     .flex()
@@ -181,8 +184,9 @@ pub fn render(state: &Entity<AppState>, cx: &App) -> impl IntoElement + use<> {
                                                 )
                                         },
                                     ))
-                            }),
-                    ),
+                            },
+                        )),
+                ),
             ),
         )
 }

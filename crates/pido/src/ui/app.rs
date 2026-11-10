@@ -13,7 +13,15 @@ use crate::ui::{chat, composer, sidebar, welcome};
 
 actions!(pido, [Stop]);
 
+/// Height of the session header above the chat pane.
+pub const HEADER_HEIGHT: f32 = 52.;
+
+/// Height reserved for the composer below the transcript.
+pub const COMPOSER_HEIGHT: f32 = 150.;
+
 pub struct PidoApp {
+    /// Set once the window has been grown to match the display scale.
+    scaled_for_dpi: bool,
     pub focus: FocusHandle,
     pub state: gpui::Entity<AppState>,
     /// The composer's multi-line field, owned here so it survives re-renders.
@@ -31,6 +39,7 @@ impl PidoApp {
         // Re-render whenever the state entity changes.
         cx.observe(&state, |_, _, cx| cx.notify()).detach();
         let app = Self {
+            scaled_for_dpi: false,
             focus,
             state,
             draft: None,
@@ -102,8 +111,24 @@ impl Render for PidoApp {
         let (bg, fg) = (theme.colors.bg, theme.colors.fg);
         let bounds = window.bounds();
         self.window_size = Some((f32::from(bounds.size.width), f32::from(bounds.size.height)));
+        // Windows takes the requested bounds as physical pixels while gpui
+        // lays out in logical ones: on a 150% display the surface comes out
+        // 1.5x too small and the bottom of the UI (the composer) is clipped.
+        // Grow the window once, after the first real frame.
+        if !self.scaled_for_dpi {
+            self.scaled_for_dpi = true;
+            let scale = window.scale_factor();
+            if (scale - 1.0).abs() > 0.001 {
+                let logical = window.viewport_size();
+                window.resize(gpui::size(logical.width * scale, logical.height * scale));
+            }
+        }
         let state = self.state.clone();
         let live = state.read(cx).conn == Conn::Live;
+        // Layout units are logical: the viewport is reported in physical
+        // pixels on this backend, so divide by the scale first.
+        let logical_height = window.viewport_size().height / window.scale_factor();
+        let pane_height = logical_height - gpui::px(HEADER_HEIGHT);
 
         let main: gpui::AnyElement = if live {
             // Ely's ChatContainer supplies the canonical chat layout: a
@@ -111,41 +136,77 @@ impl Render for PidoApp {
             // width-constrained beneath it.
             div()
                 .flex_1()
+                .h(logical_height)
                 .flex()
                 .flex_col()
                 .min_w_0()
+                .min_h_0()
                 .child(chat::render_header(&state, cx))
                 .child(
-                    ely_gpui_component::chat::ChatContainer::new(chat::render_transcript(
-                        &state, window, cx,
-                    ))
-                    .composer(composer::render(&state, self, cx)),
+                    // Both panes get explicit heights. A flexible column let
+                    // gpui's virtualized list claim every pixel and push the
+                    // composer past the window edge; fixed slots are
+                    // deterministic and still resize with the window.
+                    div()
+                        .w_full()
+                        .min_w_0()
+                        .h(pane_height - gpui::px(COMPOSER_HEIGHT))
+                        .min_h_0()
+                        .overflow_hidden()
+                        .child(chat::render_transcript(
+                            &state,
+                            window,
+                            pane_height - gpui::px(COMPOSER_HEIGHT),
+                            cx,
+                        )),
+                )
+                .child(
+                    div()
+                        .w_full()
+                        .min_w_0()
+                        .h(gpui::px(COMPOSER_HEIGHT))
+                        .min_h_0()
+                        .flex_none()
+                        .overflow_hidden()
+                        .child(composer::render(&state, self, cx)),
                 )
                 .into_any_element()
         } else {
             welcome::render(&state, self, window, cx).into_any_element()
         };
 
-        FocusScope::new(&self.focus).root().child(
-            div()
-                .id("pido-root")
-                .size_full()
-                .flex()
-                .flex_row()
-                .bg(bg)
-                .text_color(fg)
-                .child(sidebar::render(&state, cx))
-                .child(main)
-                // Esc stops a running agent (clear queue + abort, the
-                // protocol's recommended Esc semantics). TextInput does not
-                // consume Escape, so this also works while the composer is
-                // focused.
-                .on_action(cx.listener(|this, _: &Stop, _window, cx| {
-                    if this.state.read(cx).streaming {
-                        this.state.update(cx, |s, cx| s.stop(cx));
-                    }
-                })),
-        )
+        // The FocusScope must carry the window size itself: a percentage
+        // height inside an unsized root resolves against auto, so the whole
+        // tree would otherwise grow to content height and push the composer
+        // below the window.
+        FocusScope::new(&self.focus)
+            .root()
+            .size_full()
+            .flex()
+            .flex_row()
+            .child(
+                div()
+                    .id("pido-root")
+                    .w(window.viewport_size().width / window.scale_factor())
+                    .h(window.viewport_size().height / window.scale_factor())
+                    .min_w_0()
+                    .min_h_0()
+                    .flex()
+                    .flex_row()
+                    .bg(bg)
+                    .text_color(fg)
+                    .child(sidebar::render(&state, cx))
+                    .child(main)
+                    // Esc stops a running agent (clear queue + abort, the
+                    // protocol's recommended Esc semantics). TextInput does not
+                    // consume Escape, so this also works while the composer is
+                    // focused.
+                    .on_action(cx.listener(|this, _: &Stop, _window, cx| {
+                        if this.state.read(cx).streaming {
+                            this.state.update(cx, |s, cx| s.stop(cx));
+                        }
+                    })),
+            )
     }
 }
 

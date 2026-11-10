@@ -32,7 +32,7 @@ pub fn render_header(state: &Entity<AppState>, cx: &App) -> impl IntoElement + u
         .items_center()
         .gap_3()
         .px_4()
-        .py_2()
+        .h(gpui::px(crate::ui::app::HEADER_HEIGHT))
         .border_b_1()
         .border_color(theme.colors.border)
         .min_w_0()
@@ -79,10 +79,9 @@ pub fn render_header(state: &Entity<AppState>, cx: &App) -> impl IntoElement + u
 pub fn render_transcript(
     state: &Entity<AppState>,
     _window: &mut Window,
+    height: gpui::Pixels,
     cx: &App,
 ) -> impl IntoElement + use<> {
-    let theme = cx.theme();
-    let column = theme.container_width(ely_gpui_component::theme::ContainerSize::Md);
     let s = state.read(cx);
     let count = s.transcript.len();
     let empty = count == 0;
@@ -92,52 +91,58 @@ pub fn render_transcript(
         .clone()
         .map(|(kind, text)| render_notice(kind, text, app.clone(), cx));
 
+    // MessageList is rendered as the direct child of ChatContainer's
+    // messages slot: it needs that flex height to resolve its 100%. The
+    // centered column is applied per row instead, so the list itself stays
+    // full-bleed and scrolls correctly.
     div()
         .relative()
-        .size_full()
+        .w_full()
+        .h(height)
+        .min_h_0()
+        .overflow_hidden()
         .flex()
         .flex_col()
         .when_some(notice, |this, banner| {
             this.child(div().px_4().pt_2().child(banner))
         })
-        .child(
+        .child(if empty {
             div()
                 .flex_1()
-                .min_h_0()
-                .w_full()
                 .flex()
+                .items_center()
                 .justify_center()
-                .px_4()
-                .child(
-                    div()
-                        .w_full()
-                        .max_w(column)
-                        .flex()
-                        .flex_col()
-                        .child(if empty {
-                            div()
-                                .flex_1()
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .child(Caption::new(i18n::t(cx, "empty_transcript")))
-                                .into_any_element()
-                        } else {
-                            div()
-                                .flex_1()
-                                .min_h_0()
-                                .child(MessageList::new(
-                                    "transcript",
-                                    count,
-                                    move |ix, _window, cx| {
-                                        let s = app.read(cx);
-                                        render_item(&s.transcript[ix], ix, cx).into_any_element()
-                                    },
-                                ))
-                                .into_any_element()
-                        }),
-                ),
-        )
+                .child(Caption::new(i18n::t(cx, "empty_transcript")))
+                .into_any_element()
+        } else {
+            div()
+                .w_full()
+                .h(height)
+                .min_h_0()
+                .overflow_hidden()
+                .child(MessageList::new(
+                    "transcript",
+                    count,
+                    move |ix, _window, cx| {
+                        let s = app.read(cx);
+                        let column = cx
+                            .theme()
+                            .container_width(ely_gpui_component::theme::ContainerSize::Md);
+                        div()
+                            .w_full()
+                            .flex()
+                            .justify_center()
+                            .px_4()
+                            .child(div().w_full().max_w(column).min_w_0().child(render_item(
+                                &s.transcript[ix],
+                                ix,
+                                cx,
+                            )))
+                            .into_any_element()
+                    },
+                ))
+                .into_any_element()
+        })
 }
 
 /// One transcript row. `ix` keys element ids so streaming text is stable.

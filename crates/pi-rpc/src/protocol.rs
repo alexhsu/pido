@@ -1012,6 +1012,31 @@ pub struct ContextUsage {
     pub percent: Option<f64>,
 }
 
+/// `get_commands` payload.
+#[derive(Debug, Clone, Deserialize)]
+pub struct AvailableCommands {
+    #[serde(default)]
+    pub commands: Vec<CommandInfo>,
+}
+
+/// One invocable command: an extension command, a prompt template or a skill.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CommandInfo {
+    /// Invoked by sending `/name`.
+    pub name: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    /// `extension`, `prompt` or `skill`.
+    #[serde(default)]
+    pub source: Option<String>,
+    /// `user`, `project` or `path`, for non-extension commands.
+    #[serde(default)]
+    pub location: Option<String>,
+    #[serde(default)]
+    pub path: Option<String>,
+}
+
 /// `get_messages` payload.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Messages {

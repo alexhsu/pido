@@ -135,6 +135,10 @@ pub struct AppState {
     pub notice: Option<(NoticeKind, String)>,
     /// The last-used project directory, to prefill the welcome picker.
     pub last_project: Option<String>,
+    /// Extension commands, prompt templates and skills pi offers at `/`.
+    pub commands: Vec<pi_rpc::protocol::CommandInfo>,
+    /// Workspace files offered at `@`, as project-relative paths.
+    pub workspace_files: Vec<String>,
     client: Option<PiClient>,
 }
 
@@ -159,6 +163,8 @@ impl AppState {
                 stats: None,
                 notice: None,
                 last_project,
+                commands: Vec::new(),
+                workspace_files: Vec::new(),
                 client: None,
             };
             state.probe_environment(cx);
@@ -301,6 +307,8 @@ impl AppState {
                                     s.last_session_loaded = false;
                                     s.load_history(cx);
                                 }
+                                s.load_commands(cx);
+                                s.scan_workspace_files(cx);
                             }
                         }
                         s.refresh_sessions(cx);
@@ -333,6 +341,51 @@ impl AppState {
 
     /// Fetch all entries and rebuild the transcript (used by session resume
     /// and by the sidebar's session picker).
+    /// Fetch the `/` command list pi offers (extensions, templates, skills).
+    fn load_commands(&self, cx: &Context<Self>) {
+        let Some(client) = self.client() else { return };
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    let response = client.request(Command::GetCommands)?;
+                    if !response.success {
+                        anyhow::bail!("get_commands failed: {:?}", response.error);
+                    }
+                    response.data_as::<pi_rpc::protocol::AvailableCommands>()
+                })
+                .await;
+            this.update(cx, |s, cx| {
+                if let Ok(Some(payload)) = result {
+                    log::info!("state: {} commands available", payload.commands.len());
+                    s.commands = payload.commands;
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Walk the project for the `@` mention list. A convenience index, not a
+    /// git-aware one: it skips the heavy directories most projects have.
+    fn scan_workspace_files(&self, cx: &Context<Self>) {
+        let Some(root) = self.cwd.clone() else { return };
+        cx.spawn(async move |this, cx| {
+            let files = cx
+                .background_executor()
+                .spawn(async move { workspace_files(&root) })
+                .await;
+            this.update(cx, |s, cx| {
+                log::info!("state: {} files indexed for @", files.len());
+                s.workspace_files = files;
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     fn load_history(&self, cx: &Context<Self>) {
         let Some(client) = self.client() else { return };
         cx.spawn(async move |this, cx| {
@@ -1076,4 +1129,61 @@ fn truncate_for_display(text: &str, max_chars: usize) -> String {
     }
     let truncated: String = text.chars().take(max_chars).collect();
     format!("{truncated}\n…")
+}
+
+/// Project-relative file paths for `@` mentions.
+///
+/// A cheap index rather than a git-aware one: skips the directories nearly
+/// every project wants ignored, caps depth and count so a huge tree cannot
+/// stall startup.
+fn workspace_files(root: &std::path::Path) -> Vec<String> {
+    const SKIP: &[&str] = &[
+        ".git",
+        "node_modules",
+        "target",
+        "dist",
+        "build",
+        "out",
+        ".venv",
+        "venv",
+        "__pycache__",
+        ".next",
+        ".nuxt",
+        ".cache",
+        ".idea",
+        ".vscode",
+        "vendor",
+        ".gradle",
+        ".dart_tool",
+        "Pods",
+    ];
+    const MAX_FILES: usize = 3000;
+    const MAX_DEPTH: usize = 6;
+
+    let mut files = Vec::new();
+    let mut stack = vec![(root.to_path_buf(), 0usize)];
+    while let Some((dir, depth)) = stack.pop() {
+        if depth > MAX_DEPTH || files.len() >= MAX_FILES {
+            continue;
+        }
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if path.is_dir() {
+                if !SKIP.contains(&name.as_str()) && !name.starts_with('.') {
+                    stack.push((path, depth + 1));
+                }
+            } else if let Ok(relative) = path.strip_prefix(root) {
+                files.push(relative.to_string_lossy().replace(char::from(92), "/"));
+                if files.len() >= MAX_FILES {
+                    break;
+                }
+            }
+        }
+    }
+    files.sort();
+    files
 }

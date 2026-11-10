@@ -1,14 +1,13 @@
-//! The composer: Ely's PromptInput wired to prompt/steer/stop, with the
-//! model and thinking pickers in its tool row and a stats line beneath —
-//! matching the reference layout (picks bottom-left, send bottom-right,
-//! run stats centered under the box).
+//! The composer: Ely's PromptInput wired to prompt/steer/stop, offering
+//! `/` commands and `@` file mentions, with a single model pill on the right
+//! of the tool row and a stats line beneath.
 //!
 //! Spacing and the centered column width come from Ely's `ChatContainer`.
 
 use ely_gpui_component::chat::PromptInput;
+use ely_gpui_component::forms::Choice;
 use ely_gpui_component::menus::{DropdownMenu, Menu, MenuItem};
 use ely_gpui_component::theme::ActiveTheme;
-use ely_gpui_component::typography::Caption;
 use gpui::{
     App, Entity, IntoElement, ParentElement, SharedString, Styled, div, prelude::FluentBuilder, px,
 };
@@ -25,11 +24,6 @@ pub fn render(state: &Entity<AppState>, app: &mut PidoApp, cx: &App) -> impl Int
     let colors = theme.colors.clone();
     let s = state.read(cx);
     let streaming = s.streaming;
-    let hint = if streaming {
-        i18n::t(cx, "steer_hint")
-    } else {
-        i18n::t(cx, "idle_hint")
-    };
     let Some(draft) = app.draft.clone() else {
         return div().into_any_element();
     };
@@ -51,19 +45,58 @@ pub fn render(state: &Entity<AppState>, app: &mut PidoApp, cx: &App) -> impl Int
         input
     };
 
-    // Tool-row picks, bottom-left: the model, then the thinking level.
-    let picker_state = state.clone();
-    let model_menu = model_menu(s, picker_state);
-    let thinking_menu = thinking_menu(s, state.clone());
+    // `/` offers pi's extension commands, prompt templates and skills. The
+    // component strips the typed `/query` and hands us the value; commands
+    // run by sending `/name`, so the text goes back at the message start.
+    let command_choices: Vec<Choice> = s
+        .commands
+        .iter()
+        .map(|command| {
+            let slash = format!("/{}", command.name);
+            let label = match command.description.as_deref() {
+                Some(note) if !note.is_empty() => format!("{slash} — {note}"),
+                _ => slash.clone(),
+            };
+            Choice::new(slash, label)
+        })
+        .collect();
+    let command_draft = draft.clone();
+    let input = input.commands(command_choices, move |command, _, cx| {
+        let command = command.to_string();
+        command_draft.update(cx, |field, cx| {
+            let rest = field.text().trim_start().to_string();
+            field.set_text(format!("{command} {rest}"), cx);
+        });
+    });
 
-    // Run stats under the box: turns, tokens, cache hit, context fill.
+    // `@` inserts a project-relative path. Pi expands `@path` only as CLI
+    // arguments, never inside a prompt, so the path goes in as plain text and
+    // the agent reads it with its own tools.
+    let file_choices: Vec<Choice> = s
+        .workspace_files
+        .iter()
+        .map(|path| Choice::new(path.as_str(), path.as_str()))
+        .collect();
+    let mention_draft = draft.clone();
+    let input = input.context(file_choices, move |path, _, cx| {
+        let path = format!("{path} ");
+        mention_draft.update(cx, |field, cx| field.insert(&path, cx));
+    });
+
+    // The model pill sits at the right of the tool row, beside send.
+    let pill = model_pill(s, state.clone(), cx);
+
     let stats_line = stats_caption(s, cx);
 
     div()
         .flex()
         .flex_col()
         .gap_2()
-        .child(input.tool(model_menu).tool(thinking_menu))
+        .child(input.tool(
+            // A growable spacer with the pill pinned to its right edge:
+            // the component's own spacer then gets no space to expand.
+            div().w_full().flex().justify_end().child(pill),
+        ))
         .when_some(stats_line, |this, line| {
             this.child(
                 div()
@@ -74,53 +107,73 @@ pub fn render(state: &Entity<AppState>, app: &mut PidoApp, cx: &App) -> impl Int
                     .child(line),
             )
         })
-        .child(div().flex().justify_end().child(Caption::new(hint)))
         .into_any_element()
 }
 
-/// The model picker as a dropdown button reading the current model's name.
-fn model_menu(s: &AppState, picker: Entity<AppState>) -> DropdownMenu {
-    let current = s.current_model.clone();
-    let label = current
+/// One pill reading `Model Level`, opening a two-row menu: the model list and
+/// the thinking levels, each as a submenu with the active value on the right.
+fn model_pill(s: &AppState, picker: Entity<AppState>, cx: &App) -> DropdownMenu {
+    let model_name = s
+        .current_model
         .as_ref()
         .map(|m| m.name.clone())
-        .unwrap_or_else(|| "model".into());
-    let current_id = current.as_ref().map(|m| m.id.clone());
-    let mut menu = Menu::new();
+        .unwrap_or_else(|| i18n::t(cx, "model").to_string());
+    let level = s
+        .thinking_level
+        .map(|level| level_slug(level).to_string())
+        .unwrap_or_default();
+    let label = if level.is_empty() {
+        model_name.clone()
+    } else {
+        format!("{model_name} {level}")
+    };
+
+    // 模型 ▸ every configured model, the active one checked.
+    let current_id = s.current_model.as_ref().map(|m| m.id.clone());
+    let mut models = Menu::new();
     for model in &s.models {
         let picker = picker.clone();
-        let model_id = model.id.clone();
+        let id = model.id.clone();
         let checked = current_id.as_deref() == Some(model.id.as_str());
-        menu = menu.item(
-            MenuItem::check(model.name.clone(), checked).on_click(move |_, cx| {
-                let model_id = model_id.clone();
-                picker.update(cx, |s, cx| s.set_model(&model_id, cx));
-            }),
-        );
+        models = models.item(MenuItem::radio(model.name.clone(), checked).on_click(
+            move |_, cx| {
+                let id = id.clone();
+                picker.update(cx, |s, cx| s.set_model(&id, cx));
+            },
+        ));
     }
-    DropdownMenu::new("composer-model", label, menu)
-}
 
-/// The thinking-level picker, beside the model's.
-fn thinking_menu(s: &AppState, picker: Entity<AppState>) -> DropdownMenu {
-    let label = s
-        .thinking_level
-        .map(|level| SharedString::from(level_slug(level)))
-        .unwrap_or_else(|| "-".into());
-    let mut menu = Menu::new();
-    for level in s.thinking_levels.iter().copied() {
+    // 推理等级 ▸ the levels the current model supports.
+    let mut levels = Menu::new();
+    for &level in &s.thinking_levels {
         let picker = picker.clone();
         let checked = s.thinking_level == Some(level);
-        menu = menu.item(
-            MenuItem::check(level_slug(level), checked).on_click(move |_, cx| {
+        levels = levels.item(
+            MenuItem::radio(level_slug(level), checked).on_click(move |_, cx| {
                 picker.update(cx, |s, cx| s.set_thinking(level, cx));
             }),
         );
     }
-    DropdownMenu::new("composer-thinking", label, menu)
+
+    let menu = Menu::new()
+        .item(MenuItem::submenu(i18n::t(cx, "model"), models).keys(model_name))
+        .item(
+            MenuItem::submenu(i18n::t(cx, "thinking"), levels)
+                .keys(level_default(s, i18n::t(cx, "thinking"))),
+        );
+
+    DropdownMenu::new("composer-model", label, menu)
 }
 
-/// `12 轮 · 3.4M tok · 缓存命中 99.6% · 上下文 61%`, or nothing before a run.
+/// The row's trailing value, falling back to a dash when unset.
+fn level_default(s: &AppState, fallback: SharedString) -> SharedString {
+    match s.thinking_level {
+        Some(level) => SharedString::from(level_slug(level)),
+        None => fallback,
+    }
+}
+
+/// `12 轮 · 3.4M tok · 缓存命中 99% · 上下文 61%`, or nothing before a run.
 fn stats_caption(s: &AppState, cx: &App) -> Option<SharedString> {
     let stats = s.stats.as_ref()?;
     let turns = stats.user_messages + stats.assistant_messages;
@@ -132,8 +185,7 @@ fn stats_caption(s: &AppState, cx: &App) -> Option<SharedString> {
         let total = tokens.total_tokens.unwrap_or(tokens.input + tokens.output);
         if total > 0 {
             parts.push(format!("{} tok", compact_count(total)));
-            let hit = cache_hit_percent(tokens.input, tokens.cache_read);
-            if let Some(hit) = hit {
+            if let Some(hit) = cache_hit_percent(tokens.input, tokens.cache_read) {
                 parts.push(i18n::t_arg(cx, "status_cache", "p", &hit).to_string());
             }
         }
