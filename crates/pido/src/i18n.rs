@@ -108,6 +108,9 @@ pub fn init(cx: &mut App, default: &str) {
                     ("session_forked", "已分叉会话"),
                     ("session_archived", "已归档该会话"),
                     ("session_unarchived", "已取消归档"),
+                    ("usage", "用量"),
+                    ("text_copied", "已复制"),
+                    ("copy_message", "复制内容"),
                     ("queued_steer", "转向"),
                     ("queued_follow_up", "追加"),
                 ],
@@ -204,6 +207,9 @@ pub fn init(cx: &mut App, default: &str) {
                     ("session_forked", "Session forked"),
                     ("session_archived", "Session archived"),
                     ("session_unarchived", "Session unarchived"),
+                    ("usage", "Usage"),
+                    ("text_copied", "Copied"),
+                    ("copy_message", "Copy text"),
                     ("queued_steer", "Steer"),
                     ("queued_follow_up", "Follow-up"),
                 ],
@@ -219,6 +225,51 @@ pub fn t(cx: &App, key: &str) -> SharedString {
 /// Look up `key` with one `{name}` argument filled.
 pub fn t_arg(cx: &App, key: &str, name: &str, value: &str) -> SharedString {
     cx.global::<I18n>().text(key, &[(name, value)])
+}
+
+/// Whether the active locale is Chinese, for formats a catalog cannot
+/// express (dates assembled from parts).
+pub fn is_zh(cx: &App) -> bool {
+    cx.global::<I18n>().locale().tag == ZH
+}
+
+/// A wall-clock stamp ("11月10日 23:22" / "Nov 10, 23:22").
+pub fn format_time(cx: &App, unix_secs: Option<i64>) -> SharedString {
+    let Some(secs) = unix_secs else {
+        return SharedString::default();
+    };
+    let (year, month, day) = civil_from_days(secs.div_euclid(86_400));
+    let rest = secs.rem_euclid(86_400);
+    let (hour, minute) = (rest / 3_600, rest % 3_600 / 60);
+    let _ = year;
+    let stamp = if is_zh(cx) {
+        format!("{month}月{day}日 {hour:02}:{minute:02}")
+    } else {
+        format!(
+            "{} {}, {hour:02}:{minute:02}",
+            MONTH_EN[month as usize - 1],
+            day
+        )
+    };
+    stamp.into()
+}
+
+const MONTH_EN: [&str; 12] = [
+    "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+];
+
+/// Days since the Unix epoch to a civil date (Howard Hinnant's algorithm).
+fn civil_from_days(days: i64) -> (i64, u32, u32) {
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let year = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    (if month <= 2 { year + 1 } else { year }, month, day)
 }
 
 /// Relative age of `unix_secs`, in the active locale ("3天" / "3d").

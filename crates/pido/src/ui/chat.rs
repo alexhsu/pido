@@ -6,15 +6,16 @@ use ely_gpui_component::chat::{
     MessageBubble, MessageHeader, MessageList, Role, StepState, ThinkingBlock,
 };
 
-use ely_gpui_component::theme::ActiveTheme;
+use ely_gpui_component::theme::{ActiveTheme, ControlSize, IconSize, TextSize};
 use ely_gpui_component::typography::{Caption, Paragraph};
 use gpui::{
-    AnyElement, App, Entity, IntoElement, ParentElement, Styled, div, prelude::FluentBuilder,
+    AnyElement, App, Entity, InteractiveElement, IntoElement, ParentElement, SharedString, Styled,
+    div, prelude::FluentBuilder,
 };
 use pi_rpc::protocol::ThinkingLevel;
 
 use crate::i18n;
-use crate::state::{AppState, NoticeKind, TranscriptItem};
+use crate::state::{AppState, AssistantView, NoticeKind, TranscriptItem};
 use crate::ui::app::toggle_theme;
 
 /// The header row above the transcript: session title, theme and language
@@ -175,10 +176,48 @@ pub fn render_transcript(state: &Entity<AppState>, cx: &App) -> impl IntoElement
 fn render_item(item: &TranscriptItem, ix: usize, cx: &App) -> AnyElement {
     let theme = cx.theme();
     match item {
-        TranscriptItem::User { text } => MessageBubble::new(Role::User)
-            .header(MessageHeader::new(("header", ix), i18n::t(cx, "you")))
-            .child(Paragraph::new(text.clone()))
-            .into_any_element(),
+        TranscriptItem::User { text, time } => {
+            let group = SharedString::from(format!("user-{ix}"));
+            let footer = div()
+                .flex_none()
+                .invisible()
+                .group_hover(group.clone(), |style| style.visible())
+                .flex()
+                .items_center()
+                .justify_end()
+                .gap_1p5()
+                .pt_0p5()
+                .child(
+                    div()
+                        .text_size(theme.text_size(TextSize::Xs))
+                        .text_color(theme.colors.fg_subtle)
+                        .child(i18n::format_time(cx, *time)),
+                )
+                .child({
+                    let copy = text.clone();
+                    ely_gpui_component::buttons::IconButton::new(
+                        ("copy-user", ix),
+                        ely_gpui_component::primitives::IconName::Copy,
+                    )
+                    .variant(ely_gpui_component::buttons::ButtonVariant::Ghost)
+                    .size(ControlSize::Sm)
+                    .tooltip(i18n::t(cx, "copy_message"))
+                    .on_click(move |_, _, cx| {
+                        cx.write_to_clipboard(gpui::ClipboardItem::new_string(copy.to_string()));
+                    })
+                });
+            div()
+                .group(group)
+                .flex()
+                .flex_col()
+                .child(
+                    MessageBubble::new(Role::User)
+                        .header(MessageHeader::new(("header", ix), i18n::t(cx, "you")))
+                        .child(Paragraph::new(text.clone())),
+                )
+                .child(footer)
+                .into_any_element()
+        }
         TranscriptItem::Assistant(view) => {
             let thinking = view.thinking();
             let text = view.text();
@@ -242,7 +281,16 @@ fn render_item(item: &TranscriptItem, ix: usize, cx: &App) -> AnyElement {
                     "wait", ix,
                 )));
             }
-            bubble.into_any_element()
+            let wrapper = div().group(group(ix)).flex().flex_col().child(bubble);
+            // A finished message shows its actions on hover; a streaming one
+            // has nothing stable to copy yet.
+            if view.finished {
+                wrapper
+                    .child(assistant_footer(ix, view, cx))
+                    .into_any_element()
+            } else {
+                wrapper.into_any_element()
+            }
         }
         TranscriptItem::Tool(card) => {
             let status = if card.running {
@@ -281,6 +329,76 @@ fn render_item(item: &TranscriptItem, ix: usize, cx: &App) -> AnyElement {
                 .child(Caption::new(text.clone()))
                 .into_any_element()
         }
+    }
+}
+
+/// Hover group id for a row's wrapper, shared by both message kinds.
+fn group(ix: usize) -> SharedString {
+    SharedString::from(format!("msg-{ix}"))
+}
+
+/// The action row under a finished assistant message: copy, what the turn
+/// cost in tokens, and when it landed.
+fn assistant_footer(ix: usize, view: &AssistantView, cx: &App) -> AnyElement {
+    let theme = cx.theme();
+    let copy = view.text();
+    let usage = view
+        .tokens
+        .map(|tokens| format!("{} {}", i18n::t(cx, "usage"), compact_tokens(tokens)));
+    div()
+        .flex_none()
+        .invisible()
+        .group_hover(group(ix), |style| style.visible())
+        .flex()
+        .items_center()
+        .gap_2()
+        .pt_0p5()
+        .child({
+            ely_gpui_component::buttons::IconButton::new(
+                ("copy-assistant", ix),
+                ely_gpui_component::primitives::IconName::Copy,
+            )
+            .variant(ely_gpui_component::buttons::ButtonVariant::Ghost)
+            .size(ControlSize::Sm)
+            .tooltip(i18n::t(cx, "copy_message"))
+            .on_click(move |_, _, cx| {
+                cx.write_to_clipboard(gpui::ClipboardItem::new_string(copy.to_string()));
+            })
+        })
+        .when_some(usage, |this, usage| {
+            this.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .text_size(theme.text_size(TextSize::Xs))
+                    .text_color(theme.colors.fg_subtle)
+                    .child(
+                        ely_gpui_component::primitives::Icon::new(
+                            ely_gpui_component::primitives::IconName::Database,
+                        )
+                        .size(IconSize::Xs),
+                    )
+                    .child(usage),
+            )
+        })
+        .child(
+            div()
+                .text_size(theme.text_size(TextSize::Xs))
+                .text_color(theme.colors.fg_subtle)
+                .child(i18n::format_time(cx, view.time)),
+        )
+        .into_any_element()
+}
+
+/// Tokens in review notation: 5.1M, 512k, 999.
+fn compact_tokens(tokens: u64) -> String {
+    if tokens >= 1_000_000 {
+        format!("{:.1}M", tokens as f64 / 1e6)
+    } else if tokens >= 1_000 {
+        format!("{}k", tokens / 1_000)
+    } else {
+        tokens.to_string()
     }
 }
 
@@ -325,5 +443,17 @@ pub fn level_slug(level: ThinkingLevel) -> &'static str {
         ThinkingLevel::Xhigh => "xhigh",
         ThinkingLevel::Max => "max",
         ThinkingLevel::Unknown => "unknown",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tokens_read_in_review_notation() {
+        assert_eq!(compact_tokens(999), "999");
+        assert_eq!(compact_tokens(5_120), "5k");
+        assert_eq!(compact_tokens(5_100_000), "5.1M");
     }
 }

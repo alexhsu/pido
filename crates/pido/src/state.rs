@@ -52,10 +52,50 @@ pub struct Environment {
 /// A line in the transcript.
 #[derive(Debug, Clone)]
 pub enum TranscriptItem {
-    User { text: gpui::SharedString },
+    User {
+        text: gpui::SharedString,
+        /// Wall-clock stamp, unix seconds; drives the hover footer.
+        time: Option<i64>,
+    },
     Assistant(Box<AssistantView>),
     Tool(ToolView),
-    Notice { kind: NoticeKind, text: String },
+    Notice {
+        kind: NoticeKind,
+        text: String,
+    },
+}
+
+/// Pi's message timestamps are unix **milliseconds** as f64; older builds
+/// may send seconds. Returns seconds, or None for zero/absent stamps.
+fn unix_secs(timestamp: f64) -> Option<i64> {
+    if timestamp <= 0.0 {
+        return None;
+    }
+    let secs = if timestamp >= 1e11 {
+        // Milliseconds: a date after ~5138 CE cannot be a sane seconds value.
+        (timestamp / 1000.0) as i64
+    } else {
+        timestamp as i64
+    };
+    (secs > 0).then_some(secs)
+}
+
+/// Tokens used by one assistant message, from its usage report.
+fn message_tokens(usage: Option<&pi_rpc::protocol::Usage>) -> Option<u64> {
+    let usage = usage?;
+    Some(
+        usage
+            .total_tokens
+            .unwrap_or(usage.input + usage.output + usage.cache_read + usage.cache_write),
+    )
+}
+
+/// Now, as unix seconds.
+fn now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 #[derive(Clone)]
@@ -72,6 +112,10 @@ pub struct AssistantView {
     pub took: Option<Duration>,
     /// Provider error text for a failed assistant message, when any.
     pub error: Option<String>,
+    /// Wall-clock stamp of the finished message, unix seconds.
+    pub time: Option<i64>,
+    /// Tokens the message's turn reported, from its usage.
+    pub tokens: Option<u64>,
     /// Finished messages keep their joined text and parsed blocks, so a
     /// repaint does not re-join strings or re-parse Markdown.
     /// Filled the first time a finished message is drawn: parsing at load
@@ -101,6 +145,8 @@ impl AssistantView {
             started: Instant::now(),
             took: None,
             error: None,
+            time: None,
+            tokens: None,
             geometry_cache: std::cell::RefCell::new(None),
             thinking_cache: std::cell::RefCell::new(None),
         }
@@ -123,6 +169,8 @@ impl AssistantView {
         }
         view.finished = true;
         view.error = message.error_message.clone();
+        view.time = unix_secs(message.timestamp);
+        view.tokens = message_tokens(message.usage.as_ref());
         view
     }
 
@@ -1628,6 +1676,7 @@ impl AppState {
         }
         self.transcript.push(TranscriptItem::User {
             text: text.clone().into(),
+            time: Some(now_secs()),
         });
         cx.notify();
 
@@ -1663,7 +1712,7 @@ impl AppState {
         if let Some(index) = self
             .transcript
             .iter()
-            .rposition(|item| matches!(item, TranscriptItem::User { text: t } if t == text))
+            .rposition(|item| matches!(item, TranscriptItem::User { text: t, .. } if t == text))
         {
             self.transcript.remove(index);
         }
@@ -2533,8 +2582,10 @@ impl AppState {
                 AgentMessage::User(user) => {
                     let text = user.text();
                     if !text.is_empty() {
-                        self.transcript
-                            .push(TranscriptItem::User { text: text.into() });
+                        self.transcript.push(TranscriptItem::User {
+                            text: text.into(),
+                            time: unix_secs(user.timestamp),
+                        });
                     }
                 }
                 AgentMessage::Assistant(assistant) => {
@@ -2916,7 +2967,7 @@ mod tests {
             .transcript
             .iter()
             .map(|item| match item {
-                TranscriptItem::User { text } => format!("user:{text}"),
+                TranscriptItem::User { text, .. } => format!("user:{text}"),
                 TranscriptItem::Assistant(view) => format!("assistant:{}", view.text()),
                 TranscriptItem::Tool(card) => {
                     format!("tool:{}:{:?}", card.name, card.result.as_deref())
@@ -2959,6 +3010,13 @@ mod tests {
 +let c = 4;
  let d = 5;
 ";
+
+    #[test]
+    fn timestamps_understand_seconds_and_milliseconds() {
+        assert_eq!(unix_secs(0.0), None);
+        assert_eq!(unix_secs(1_762_700_000.0), Some(1_762_700_000));
+        assert_eq!(unix_secs(1_762_700_000_000.0), Some(1_762_700_000));
+    }
 
     #[test]
     fn a_patch_becomes_hunks_with_both_sides_numbered() {
