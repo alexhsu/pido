@@ -20,8 +20,8 @@ fn main() -> anyhow::Result<()> {
     println!("pi version: {:?}", pi_rpc::client::probe_pi_install(None));
     println!("spawning pi --mode rpc in {} ...", cwd.display());
 
-    let config = pi_rpc::client::PiProcessConfig::new(&cwd)
-        .with_args(vec!["--no-session".to_string()]);
+    let config =
+        pi_rpc::client::PiProcessConfig::new(&cwd).with_args(vec!["--no-session".to_string()]);
     let client = PiClient::spawn(&config)?;
     let subscriber = client.subscribe();
 
@@ -45,28 +45,21 @@ fn main() -> anyhow::Result<()> {
         let mut text = String::new();
         loop {
             match subscriber.recv_timeout(Duration::from_secs(120))? {
-                pi_rpc::client::ClientEvent::Record(RpcRecord::Event(event)) => {
-                    match event {
-                        pi_rpc::protocol::Event::MessageUpdate {
-                            assistant_message_event,
-                            ..
-                        } => {
-                            if let pi_rpc::protocol::AssistantMessageEvent::TextDelta {
-                                delta,
-                                ..
-                            } = assistant_message_event
-                            {
-                                text.push_str(&delta);
-                                print!("{delta}");
-                            }
-                        }
-                        pi_rpc::protocol::Event::AgentSettled { aborted } => {
-                            println!("\n-- agent settled (aborted={aborted}) --");
-                            break;
-                        }
-                        _ => {}
+                pi_rpc::client::ClientEvent::Record(RpcRecord::Event(event)) => match event {
+                    pi_rpc::protocol::Event::MessageUpdate {
+                        assistant_message_event:
+                            pi_rpc::protocol::AssistantMessageEvent::TextDelta { delta, .. },
+                        ..
+                    } => {
+                        text.push_str(&delta);
+                        print!("{delta}");
                     }
-                }
+                    pi_rpc::protocol::Event::AgentSettled { aborted } => {
+                        println!("\n-- agent settled (aborted={aborted}) --");
+                        break;
+                    }
+                    _ => {}
+                },
                 pi_rpc::client::ClientEvent::Disconnected(reason) => {
                     anyhow::bail!("disconnected: {reason:?}");
                 }

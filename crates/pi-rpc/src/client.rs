@@ -20,8 +20,8 @@
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, Stdio};
 use std::process::Command as ProcessCommand;
+use std::process::{Child, ChildStdin, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -55,14 +55,15 @@ fn resolve_pi_program(program: &Path) -> PathBuf {
     #[cfg(windows)]
     {
         let is_bare_name = program.parent().is_none_or(|p| p.as_os_str().is_empty());
-        if program.extension().is_none() && is_bare_name {
-            if let Some(path_var) = std::env::var_os("PATH") {
-                for dir in std::env::split_paths(&path_var) {
-                    for name in ["pi.cmd", "pi.exe", "pi.bat"] {
-                        let candidate = dir.join(name);
-                        if candidate.is_file() {
-                            return candidate;
-                        }
+        if program.extension().is_none()
+            && is_bare_name
+            && let Some(path_var) = std::env::var_os("PATH")
+        {
+            for dir in std::env::split_paths(&path_var) {
+                for name in ["pi.cmd", "pi.exe", "pi.bat"] {
+                    let candidate = dir.join(name);
+                    if candidate.is_file() {
+                        return candidate;
                     }
                 }
             }
@@ -117,7 +118,12 @@ pub enum DisconnectReason {
 }
 
 /// What a running client broadcasts to subscribers.
+///
+/// The size skew between variants is fine: each event is sent through a
+/// channel exactly once, so the occasional large `Record` costs less than a
+/// box allocation per event.
 #[derive(Debug, Clone)]
+#[allow(clippy::large_enum_variant)]
 pub enum ClientEvent {
     /// A record arrived from Pi's stdout.
     Record(RpcRecord),
@@ -156,10 +162,7 @@ impl PiClient {
     /// crashes) is reported through the event stream.
     pub fn spawn(config: &PiProcessConfig) -> anyhow::Result<Self> {
         if !config.cwd.exists() {
-            anyhow::bail!(
-                "working directory does not exist: {}",
-                config.cwd.display()
-            );
+            anyhow::bail!("working directory does not exist: {}", config.cwd.display());
         }
         let program = resolve_pi_program(&config.pi_path.clone().unwrap_or_else(|| "pi".into()));
         let mut command = ProcessCommand::new(&program);
@@ -244,9 +247,10 @@ impl PiClient {
                     for event in raw_rx {
                         match &event {
                             ClientEvent::Record(RpcRecord::Response(response)) => {
-                                let waiter = response.id.as_ref().and_then(|id| {
-                                    inner.pending.lock().unwrap().remove(id)
-                                });
+                                let waiter = response
+                                    .id
+                                    .as_ref()
+                                    .and_then(|id| inner.pending.lock().unwrap().remove(id));
                                 match waiter {
                                     // Consumed by its requester; do not also
                                     // fan out (an unmatched response, such as
@@ -356,12 +360,12 @@ impl PiClient {
         self.inner.pending.lock().unwrap().remove(&id);
         match received {
             Ok(response) => Ok(response),
-            Err(crossbeam_channel::RecvTimeoutError::Timeout) => Err(anyhow::anyhow!(
-                "timed out waiting for response to {id}"
-            )),
-            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => Err(anyhow::anyhow!(
-                "pi disconnected before answering {id}"
-            )),
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                Err(anyhow::anyhow!("timed out waiting for response to {id}"))
+            }
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                Err(anyhow::anyhow!("pi disconnected before answering {id}"))
+            }
         }
     }
 

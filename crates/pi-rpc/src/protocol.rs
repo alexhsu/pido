@@ -136,28 +136,40 @@ pub enum Command {
     /// List all configured models.
     GetAvailableModels,
     /// Set the reasoning/thinking level.
-    SetThinkingLevel { level: ThinkingLevel },
+    SetThinkingLevel {
+        level: ThinkingLevel,
+    },
     /// Cycle through available thinking levels.
     CycleThinkingLevel,
     /// List thinking levels supported by the current model.
     GetAvailableThinkingLevels,
     /// Control how steering messages are delivered.
-    SetSteeringMode { mode: QueueMode },
+    SetSteeringMode {
+        mode: QueueMode,
+    },
     /// Control how follow-up messages are delivered.
-    SetFollowUpMode { mode: QueueMode },
+    SetFollowUpMode {
+        mode: QueueMode,
+    },
     /// Manually compact the conversation context.
     #[serde(rename_all = "camelCase")]
     Compact {
         #[serde(skip_serializing_if = "Option::is_none")]
         custom_instructions: Option<String>,
     },
-    SetAutoCompaction { enabled: bool },
-    SetAutoRetry { enabled: bool },
+    SetAutoCompaction {
+        enabled: bool,
+    },
+    SetAutoRetry {
+        enabled: bool,
+    },
     AbortRetry,
     /// Run a shell command now; output joins the LLM context on the next
     /// prompt. Streamed chunks arrive as `bash_execution_update` events
     /// carrying this command's id.
-    Bash { command: String },
+    Bash {
+        command: String,
+    },
     AbortBash,
     GetSessionStats,
     #[serde(rename_all = "camelCase")]
@@ -172,7 +184,9 @@ pub enum Command {
     },
     /// Fork the active branch from a previous user message.
     #[serde(rename_all = "camelCase")]
-    Fork { entry_id: String },
+    Fork {
+        entry_id: String,
+    },
     /// Duplicate the current active branch into a new session.
     Clone,
     GetForkMessages,
@@ -184,7 +198,9 @@ pub enum Command {
     /// The session as a tree of entries.
     GetTree,
     GetLastAssistantText,
-    SetSessionName { name: String },
+    SetSessionName {
+        name: String,
+    },
     GetCommands,
     /// Answer an `extension_ui_request` dialog (select/input/editor/confirm).
     #[serde(rename_all = "camelCase")]
@@ -252,9 +268,9 @@ pub fn parse_record(line: &str) -> anyhow::Result<RpcRecord> {
         .ok_or_else(|| anyhow::anyhow!("record missing \"type\" field: {line}"))?;
     match record_type {
         "response" => Ok(RpcRecord::Response(serde_json::from_value(value)?)),
-        "extension_ui_request" => Ok(RpcRecord::ExtensionUiRequest(
-            serde_json::from_value(value)?,
-        )),
+        "extension_ui_request" => Ok(RpcRecord::ExtensionUiRequest(serde_json::from_value(
+            value,
+        )?)),
         _ => match serde_json::from_value::<Event>(value.clone()) {
             Ok(event) => Ok(RpcRecord::Event(event)),
             Err(_err) if Event::is_unknown(&value) => Ok(RpcRecord::Unknown {
@@ -361,7 +377,9 @@ pub enum Event {
         usage: Option<Usage>,
         assistant_message_event: AssistantMessageEvent,
     },
-    MessageEnd { message: AgentMessage },
+    MessageEnd {
+        message: AgentMessage,
+    },
     /// Output chunk from a direct `bash` command; `id` echoes the command id.
     BashExecutionUpdate {
         #[serde(default)]
@@ -400,7 +418,9 @@ pub enum Event {
         #[serde(default)]
         follow_up: Vec<String>,
     },
-    CompactionStart { reason: CompactionReason },
+    CompactionStart {
+        reason: CompactionReason,
+    },
     #[serde(rename_all = "camelCase")]
     CompactionEnd {
         reason: CompactionReason,
@@ -487,23 +507,14 @@ pub enum AssistantMessageEvent {
     #[serde(rename_all = "camelCase")]
     TextStart { content_index: u32 },
     #[serde(rename_all = "camelCase")]
-    TextDelta {
-        content_index: u32,
-        delta: String,
-    },
+    TextDelta { content_index: u32, delta: String },
     /// Authoritative text for the block; replaces buffered deltas.
     #[serde(rename_all = "camelCase")]
-    TextEnd {
-        content_index: u32,
-        content: String,
-    },
+    TextEnd { content_index: u32, content: String },
     #[serde(rename_all = "camelCase")]
     ThinkingStart { content_index: u32 },
     #[serde(rename_all = "camelCase")]
-    ThinkingDelta {
-        content_index: u32,
-        delta: String,
-    },
+    ThinkingDelta { content_index: u32, delta: String },
     #[serde(rename_all = "camelCase")]
     ThinkingEnd { content_index: u32 },
     #[serde(rename_all = "camelCase")]
@@ -514,10 +525,7 @@ pub enum AssistantMessageEvent {
     },
     /// Chunk of tool-call arguments; buffer and concatenate.
     #[serde(rename_all = "camelCase")]
-    ToolCallDelta {
-        content_index: u32,
-        delta: String,
-    },
+    ToolCallDelta { content_index: u32, delta: String },
     #[serde(rename_all = "camelCase")]
     ToolCallEnd {
         content_index: u32,
@@ -586,7 +594,9 @@ pub enum UserContent {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum UserContentBlock {
-    Text { text: String },
+    Text {
+        text: String,
+    },
     #[serde(rename_all = "camelCase")]
     Image {
         data: String,
@@ -616,8 +626,12 @@ pub struct AssistantMessage {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AssistantContent {
-    Text { text: String },
-    Thinking { thinking: String },
+    Text {
+        text: String,
+    },
+    Thinking {
+        thinking: String,
+    },
     #[serde(rename = "toolCall")]
     ToolCall(ToolCall),
 }
@@ -648,10 +662,7 @@ pub struct ToolResultMessage {
 impl ToolResultMessage {
     /// Plain-text view of the result content.
     pub fn text(&self) -> String {
-        self.content
-            .as_ref()
-            .map(|c| c.text())
-            .unwrap_or_default()
+        self.content.as_ref().map(|c| c.text()).unwrap_or_default()
     }
 }
 
@@ -680,7 +691,9 @@ impl ToolResultContent {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ToolResultBlock {
-    Text { text: String },
+    Text {
+        text: String,
+    },
     #[serde(rename_all = "camelCase")]
     Image {
         data: String,
@@ -1143,9 +1156,7 @@ mod tests {
         .unwrap();
         match end {
             RpcRecord::Event(Event::ToolExecutionEnd {
-                result,
-                is_error,
-                ..
+                result, is_error, ..
             }) => {
                 assert!(!is_error);
                 assert_eq!(result.unwrap().text(), "total 48\n");

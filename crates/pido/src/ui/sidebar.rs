@@ -73,60 +73,57 @@ pub fn render(state: &Entity<AppState>, cx: &App) -> impl IntoElement + use<> {
                         .child(Label::new(i18n::t(cx, "app_name")))
                         .child(Caption::new(pi_status_line(state, cx))),
                 )
-                .child(
-                    Button::new("new-chat", i18n::t(cx, "new_chat")).on_click({
-                        let app = app.clone();
-                        move |_, _, cx| app.update(cx, |s, cx| s.new_chat(cx))
-                    }),
-                ),
+                .child(Button::new("new-chat", i18n::t(cx, "new_chat")).on_click({
+                    let app = app.clone();
+                    move |_, _, cx| app.update(cx, |s, cx| s.new_chat(cx))
+                })),
         )
         .child(
             ScrollArea::new("sessions").vertical().child(
-                div().flex().flex_col().gap_4().child(Caption::new(
-                    i18n::t(cx, "sessions"),
-                )).children(groups.into_iter().map(|(cwd, sessions)| {
-                    let app = app.clone();
-                    div()
-                        .flex()
-                        .flex_col()
-                        .gap_1()
-                        .child(Caption::new(cwd))
-                        .children(sessions.into_iter().enumerate().map(move |(ix, row)| {
-                            let app = app.clone();
-                            div()
-                                .id(("session", ix as u64))
-                                .px_2()
-                                .py_1p5()
-                                .rounded_md()
-                                .cursor_pointer()
-                                .hover(|style| style.bg(theme.colors.hover))
-                                .on_click({
-                                    let app = app.clone();
-                                    let path = row.path.clone();
-                                    move |_, _, cx| {
-                                        app.update(cx, |s, cx| {
-                                            s.switch_session(
-                                                std::path::PathBuf::from(&path),
-                                                cx,
-                                            )
-                                        });
-                                    }
-                                })
-                                .child(
-                                    div()
-                                        .flex()
-                                        .flex_col()
-                                        .gap_0p5()
-                                        .min_w_0()
-                                        .child(div().truncate().child(Label::new(row.title)))
-                                        .child(
-                                            div()
-                                                .truncate()
-                                                .child(Caption::new(row.meta)),
-                                        ),
-                                )
-                        }))
-                })),
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_4()
+                    .child(Caption::new(i18n::t(cx, "sessions")))
+                    .children(groups.into_iter().map(|(cwd, sessions)| {
+                        let app = app.clone();
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(Caption::new(cwd))
+                            .children(sessions.into_iter().enumerate().map(move |(ix, row)| {
+                                let app = app.clone();
+                                div()
+                                    .id(("session", ix as u64))
+                                    .px_2()
+                                    .py_1p5()
+                                    .rounded_md()
+                                    .cursor_pointer()
+                                    .hover(|style| style.bg(theme.colors.hover))
+                                    .on_click({
+                                        let app = app.clone();
+                                        let path = row.path.clone();
+                                        move |_, _, cx| {
+                                            app.update(cx, |s, cx| {
+                                                s.switch_session(
+                                                    std::path::PathBuf::from(&path),
+                                                    cx,
+                                                )
+                                            });
+                                        }
+                                    })
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .flex_col()
+                                            .gap_0p5()
+                                            .min_w_0()
+                                            .child(div().truncate().child(Label::new(row.title)))
+                                            .child(div().truncate().child(Caption::new(row.meta))),
+                                    )
+                            }))
+                    })),
             ),
         )
         .when(!live, |this| {

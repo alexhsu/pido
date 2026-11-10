@@ -99,7 +99,11 @@ fn main() {
     }
 }
 
-fn respond(id: Option<serde_json::Value>, command: &str, data: serde_json::Value) -> Option<String> {
+fn respond(
+    id: Option<serde_json::Value>,
+    command: &str,
+    data: serde_json::Value,
+) -> Option<String> {
     let mut record = serde_json::json!({
         "type": "response",
         "command": command,
@@ -124,11 +128,7 @@ fn respond_ok(id: Option<serde_json::Value>, command: &str) -> Option<String> {
     Some(record.to_string())
 }
 
-fn respond_err(
-    id: Option<serde_json::Value>,
-    command: &str,
-    error: &str,
-) -> Option<String> {
+fn respond_err(id: Option<serde_json::Value>, command: &str, error: &str) -> Option<String> {
     let mut record = serde_json::json!({
         "type": "response",
         "command": command,

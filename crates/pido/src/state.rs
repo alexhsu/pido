@@ -129,11 +129,14 @@ pub struct AppState {
     pub stats: Option<SessionStats>,
     /// A dismissible banner over the transcript.
     pub notice: Option<(NoticeKind, String)>,
+    /// The last-used project directory, to prefill the welcome picker.
+    pub last_project: Option<String>,
     client: Option<PiClient>,
 }
 
 impl AppState {
     pub fn new(cx: &mut App) -> Entity<Self> {
+        let last_project = crate::settings::Settings::load().last_project;
         cx.new(|cx| {
             let state = Self {
                 conn: Conn::Idle,
@@ -149,6 +152,7 @@ impl AppState {
                 session_name: None,
                 stats: None,
                 notice: None,
+                last_project,
                 client: None,
             };
             state.probe_environment(cx);
@@ -172,7 +176,8 @@ impl AppState {
                     let pi_version = pi_rpc::client::probe_pi_install(None);
                     let mut ready_providers = Vec::new();
                     if pi_version.is_some() {
-                        for provider in ["deepseek", "anthropic", "openai", "openrouter", "google"] {
+                        for provider in ["deepseek", "anthropic", "openai", "openrouter", "google"]
+                        {
                             if pi_rpc::client::probe_auth(provider, None).unwrap_or(false) {
                                 ready_providers.push(provider.to_string());
                             }
@@ -206,6 +211,10 @@ impl AppState {
         self.cwd = Some(cwd.clone());
         self.transcript.clear();
         self.notice = None;
+        self.last_project = Some(cwd.to_string_lossy().into_owned());
+        crate::settings::save_setting(|s| {
+            s.last_project = self.last_project.clone();
+        });
         cx.notify();
 
         let config = PiProcessConfig::new(&cwd);
@@ -248,9 +257,9 @@ impl AppState {
                                 {
                                     s.models = payload.models;
                                 }
-                                if let Ok(Ok(Some(payload))) = levels
-                                    .map(|r| r.data_as::<pi_rpc::protocol::AvailableThinkingLevels>())
-                                {
+                                if let Ok(Ok(Some(payload))) = levels.map(|r| {
+                                    r.data_as::<pi_rpc::protocol::AvailableThinkingLevels>()
+                                }) {
                                     s.thinking_levels = payload.levels;
                                 }
                                 s.start_pump(client.clone(), cx);
@@ -292,7 +301,10 @@ impl AppState {
         cx.spawn(async move |this, cx| {
             loop {
                 let rx = Arc::clone(&events);
-                let next = cx.background_executor().spawn(async move { rx.recv() }).await;
+                let next = cx
+                    .background_executor()
+                    .spawn(async move { rx.recv() })
+                    .await;
                 match next {
                     Ok(event) => {
                         let keep_going = this.update(cx, |s, cx| {
@@ -384,7 +396,13 @@ impl AppState {
         if self.conn != Conn::Live {
             return;
         }
-        self.check_command(Command::NewSession { parent_session: None }, "new_session", cx);
+        self.check_command(
+            Command::NewSession {
+                parent_session: None,
+            },
+            "new_session",
+            cx,
+        );
         self.transcript.clear();
         self.session_name = None;
         self.stats = None;
@@ -469,7 +487,13 @@ impl AppState {
     }
 
     pub fn compact_now(&mut self, cx: &Context<Self>) {
-        self.check_command(Command::Compact { custom_instructions: None }, "compact", cx);
+        self.check_command(
+            Command::Compact {
+                custom_instructions: None,
+            },
+            "compact",
+            cx,
+        );
     }
 
     /// Run a command in the background and surface failures as notices.
@@ -526,9 +550,7 @@ impl AppState {
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
-                .spawn(async move {
-                    client.request(Command::GetAvailableThinkingLevels)
-                })
+                .spawn(async move { client.request(Command::GetAvailableThinkingLevels) })
                 .await;
             this.update(cx, |s, cx| {
                 if let Ok(Ok(Some(payload))) =
@@ -633,13 +655,13 @@ impl AppState {
                 self.streaming = false;
                 // Any assistant view still live is finished now.
                 for item in &mut self.transcript {
-                    if let TranscriptItem::Assistant(view) = item {
-                        if !view.finished {
-                            view.finished = true;
-                            view.text_live = false;
-                            view.thinking_live = false;
-                            view.took = Some(view.started.elapsed());
-                        }
+                    if let TranscriptItem::Assistant(view) = item
+                        && !view.finished
+                    {
+                        view.finished = true;
+                        view.text_live = false;
+                        view.thinking_live = false;
+                        view.took = Some(view.started.elapsed());
                     }
                 }
                 if aborted {
@@ -649,8 +671,9 @@ impl AppState {
                 self.refresh_sessions(cx);
             }
             Event::MessageStart { .. } => {
-                self.transcript
-                    .push(TranscriptItem::Assistant(Box::new(AssistantView::streaming())));
+                self.transcript.push(TranscriptItem::Assistant(Box::new(
+                    AssistantView::streaming(),
+                )));
             }
             Event::MessageUpdate {
                 assistant_message_event,
@@ -669,7 +692,7 @@ impl AppState {
                     {
                         Some(TranscriptItem::Assistant(existing)) => {
                             let took = Some(existing.started.elapsed());
-                            *existing = Box::new(view);
+                            **existing = view;
                             existing.took = took;
                         }
                         _ => self
@@ -680,7 +703,11 @@ impl AppState {
                     // cards if execution events have not made them already.
                     for block in &assistant.content {
                         if let pi_rpc::protocol::AssistantContent::ToolCall(call) = block {
-                            self.ensure_tool_card(call.id.clone(), call.name.clone(), Some(&call.arguments));
+                            self.ensure_tool_card(
+                                call.id.clone(),
+                                call.name.clone(),
+                                Some(&call.arguments),
+                            );
                         }
                     }
                 }
@@ -690,7 +717,8 @@ impl AppState {
                 tool_name,
                 args,
             } => {
-                let card = self.ensure_tool_card(tool_call_id.clone(), tool_name.clone(), args.as_ref());
+                let card =
+                    self.ensure_tool_card(tool_call_id.clone(), tool_name.clone(), args.as_ref());
                 card.running = true;
                 card.started = Instant::now();
             }
@@ -699,11 +727,11 @@ impl AppState {
                 partial_result,
                 ..
             } => {
-                if let Some(card) = self.tool_card_mut(&tool_call_id) {
-                    if let Some(partial) = partial_result {
-                        // Updates carry accumulated output; replace.
-                        card.result = Some(truncate_for_display(&partial.text(), 2000));
-                    }
+                if let Some(card) = self.tool_card_mut(&tool_call_id)
+                    && let Some(partial) = partial_result
+                {
+                    // Updates carry accumulated output; replace.
+                    card.result = Some(truncate_for_display(&partial.text(), 2000));
                 }
             }
             Event::ToolExecutionEnd {
@@ -784,8 +812,14 @@ impl AppState {
                     "tool call {id} ({tool_name}) announced at {content_index}; awaiting execution"
                 );
             }
-            AssistantMessageEvent::ToolCallDelta { content_index, delta } => {
-                log::debug!("tool call args delta at {content_index}: {} bytes", delta.len());
+            AssistantMessageEvent::ToolCallDelta {
+                content_index,
+                delta,
+            } => {
+                log::debug!(
+                    "tool call args delta at {content_index}: {} bytes",
+                    delta.len()
+                );
             }
             AssistantMessageEvent::ToolCallEnd { tool_call, .. } => {
                 self.ensure_tool_card(tool_call.id, tool_call.name, Some(&tool_call.arguments));
@@ -874,7 +908,11 @@ impl AppState {
                 AgentMessage::Assistant(assistant) => {
                     for block in &assistant.content {
                         if let pi_rpc::protocol::AssistantContent::ToolCall(call) = block {
-                            self.ensure_tool_card(call.id.clone(), call.name.clone(), Some(&call.arguments));
+                            self.ensure_tool_card(
+                                call.id.clone(),
+                                call.name.clone(),
+                                Some(&call.arguments),
+                            );
                         }
                     }
                     let mut view = AssistantView::from_message(assistant);

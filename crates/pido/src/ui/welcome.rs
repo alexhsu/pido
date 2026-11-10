@@ -31,8 +31,15 @@ pub fn render(
 
     // The path field needs a Window, so it is created lazily on first render.
     let dir_field = app.welcome_dir.clone().unwrap_or_else(|| {
-        let cwd_guess = std::env::current_dir()
-            .map(|p| p.to_string_lossy().into_owned())
+        let cwd_guess = state
+            .read(cx)
+            .last_project
+            .clone()
+            .or_else(|| {
+                std::env::current_dir()
+                    .ok()
+                    .map(|p| p.to_string_lossy().into_owned())
+            })
             .unwrap_or_default();
         let field = cx.new(|cx| {
             let mut input = TextInput::new(window, cx).placeholder("D:\\develop\\my-project");
@@ -76,20 +83,23 @@ pub fn render(
                         .child(Caption::new(i18n::t(cx, "project_dir")))
                         .child(PathInput::new("project-dir", &dir_field).directories()),
                 )
-                .child(Button::new(
-                    "start",
-                    if connecting {
-                        i18n::t(cx, "starting")
-                    } else {
-                        i18n::t(cx, "start")
-                    },
+                .child(
+                    Button::new(
+                        "start",
+                        if connecting {
+                            i18n::t(cx, "starting")
+                        } else {
+                            i18n::t(cx, "start")
+                        },
+                    )
+                    .disabled(connecting || typed.is_empty())
+                    .on_click(move |_, _, cx| {
+                        let path = std::path::PathBuf::from(
+                            dir_for_start.read(cx).text().trim().to_string(),
+                        );
+                        start_state.update(cx, |s, cx| s.connect(path, cx));
+                    }),
                 )
-                .disabled(connecting || typed.is_empty())
-                .on_click(move |_, _, cx| {
-                    let path =
-                        std::path::PathBuf::from(dir_for_start.read(cx).text().trim().to_string());
-                    start_state.update(cx, |s, cx| s.connect(path, cx));
-                }))
                 .when_some(dead_reason, |this, reason| {
                     let reset_state = state.clone();
                     this.child(banner(
@@ -150,12 +160,7 @@ fn render_environment(
     banner(fill, ink, title, detail)
 }
 
-fn banner(
-    fill: Hsla,
-    ink: Hsla,
-    title: SharedString,
-    detail: SharedString,
-) -> impl IntoElement {
+fn banner(fill: Hsla, ink: Hsla, title: SharedString, detail: SharedString) -> impl IntoElement {
     let has_detail = !detail.as_ref().is_empty();
     div()
         .flex()

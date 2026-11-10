@@ -76,15 +76,10 @@ fn prompt_streams_events_to_subscribers() {
         match subscriber.recv_timeout(Duration::from_secs(10)) {
             Ok(ClientEvent::Record(RpcRecord::Event(event))) => match event {
                 Event::MessageUpdate {
-                    assistant_message_event,
+                    assistant_message_event:
+                        pi_rpc::protocol::AssistantMessageEvent::TextDelta { delta, .. },
                     ..
-                } => {
-                    if let pi_rpc::protocol::AssistantMessageEvent::TextDelta { delta, .. } =
-                        assistant_message_event
-                    {
-                        text.push_str(&delta);
-                    }
-                }
+                } => text.push_str(&delta),
                 Event::AgentSettled { .. } => {
                     settled = true;
                     break;
@@ -148,7 +143,7 @@ fn closing_stdin_disconnects_gracefully() {
 
     client.shutdown();
 
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let _deadline = std::time::Instant::now() + Duration::from_secs(10);
     loop {
         match subscriber.recv_timeout(Duration::from_secs(10)) {
             Ok(ClientEvent::Disconnected(reason)) => {

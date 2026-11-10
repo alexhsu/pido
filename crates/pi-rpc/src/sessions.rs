@@ -89,7 +89,7 @@ pub fn scan_sessions(root: &Path) -> anyhow::Result<Vec<SessionGroup>> {
     }
 
     // Newest first within a group.
-    summaries.sort_by(|a, b| sort_key(b).cmp(&sort_key(a)));
+    summaries.sort_by_key(|summary| std::cmp::Reverse(sort_key(summary)));
 
     let mut groups: Vec<SessionGroup> = Vec::new();
     for summary in summaries {
@@ -134,13 +134,13 @@ fn walk_dirs(root: &Path) -> anyhow::Result<Vec<PathBuf>> {
         .map_err(|err| anyhow::anyhow!("cannot read session dir {}: {err}", root.display()))?;
     for entry in entries.flatten() {
         let path = entry.path();
-        if path.is_dir() {
-            if let Ok(children) = std::fs::read_dir(&path) {
-                for child in children.flatten() {
-                    let child_path = child.path();
-                    if child_path.extension().is_some_and(|ext| ext == "jsonl") {
-                        files.push(child_path);
-                    }
+        if path.is_dir()
+            && let Ok(children) = std::fs::read_dir(&path)
+        {
+            for child in children.flatten() {
+                let child_path = child.path();
+                if child_path.extension().is_some_and(|ext| ext == "jsonl") {
+                    files.push(child_path);
                 }
             }
         }
@@ -176,12 +176,11 @@ fn parse_session_file(path: &Path) -> Option<SessionSummary> {
             }
             Some("message") => {
                 message_count += 1;
-                if preview.is_none() {
-                    if let Some(message) = &entry.message {
-                        if message.get("role").and_then(|r| r.as_str()) == Some("user") {
-                            preview = user_message_preview(message);
-                        }
-                    }
+                if preview.is_none()
+                    && let Some(message) = &entry.message
+                    && message.get("role").and_then(|r| r.as_str()) == Some("user")
+                {
+                    preview = user_message_preview(message);
                 }
             }
             _ => {}

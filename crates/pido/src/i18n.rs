@@ -10,10 +10,12 @@ use gpui::{App, SharedString};
 pub const ZH: &str = "zh-CN";
 pub const EN: &str = "en-US";
 
-/// Install the catalogs. Call once at startup, before the first window.
-pub fn init(cx: &mut App) {
+/// Install the catalogs with `default` as the starting locale (the persisted
+/// user choice, or [`ZH`]). Call once at startup, before the first window.
+pub fn init(cx: &mut App, default: &str) {
+    let default = if default == EN { EN } else { ZH };
     cx.set_global(
-        I18n::new(ZH)
+        I18n::new(default)
             .catalog(
                 ZH,
                 &[

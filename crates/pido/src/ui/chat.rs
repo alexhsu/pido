@@ -2,13 +2,15 @@
 //! cards, and the session header (model / thinking / stats pickers).
 
 use ely_gpui_component::agent::ToolCallCard;
-use ely_gpui_component::chat::{MessageBubble, MessageHeader, MessageList, Role, StepState, ThinkingBlock};
+use ely_gpui_component::chat::{
+    MessageBubble, MessageHeader, MessageList, Role, StepState, ThinkingBlock,
+};
 use ely_gpui_component::forms::{Choice, Select};
 use ely_gpui_component::theme::ActiveTheme;
 use ely_gpui_component::typography::{Caption, Paragraph};
 use gpui::{
-    AnyElement, App, Entity, IntoElement, ParentElement, SharedString, Styled,
-    Window, div, prelude::FluentBuilder, px,
+    AnyElement, App, Entity, IntoElement, ParentElement, SharedString, Styled, Window, div,
+    prelude::FluentBuilder, px,
 };
 use pi_rpc::protocol::ThinkingLevel;
 
@@ -27,9 +29,7 @@ pub fn render_header(state: &Entity<AppState>, cx: &App) -> impl IntoElement + u
         .models
         .iter()
         .map(|model| {
-            let note = model
-                .context_window
-                .map(|window| format!("{window} ctx"));
+            let note = model.context_window.map(|window| format!("{window} ctx"));
             Choice {
                 note: note.map(Into::into),
                 ..Choice::new(model.id.clone(), model.name.clone())
@@ -47,11 +47,7 @@ pub fn render_header(state: &Entity<AppState>, cx: &App) -> impl IntoElement + u
         .iter()
         .map(|&level| Choice::new(level_slug(level), level_slug(level)))
         .collect();
-    let selected_level: SharedString = s
-        .thinking_level
-        .map(level_slug)
-        .unwrap_or_default()
-        .into();
+    let selected_level: SharedString = s.thinking_level.map(level_slug).unwrap_or_default().into();
 
     let stats_line: SharedString = match &s.stats {
         Some(stats) => {
@@ -60,7 +56,10 @@ pub fn render_header(state: &Entity<AppState>, cx: &App) -> impl IntoElement + u
                 .as_ref()
                 .map(|t| t.total_tokens.unwrap_or(t.input + t.output))
                 .unwrap_or(0);
-            let cost = stats.cost.map(|c| format!(" · ${c:.3}")).unwrap_or_default();
+            let cost = stats
+                .cost
+                .map(|c| format!(" · ${c:.3}"))
+                .unwrap_or_default();
             format!("{tokens} {}{cost}", i18n::t(cx, "tokens")).into()
         }
         None => String::new().into(),
@@ -84,46 +83,40 @@ pub fn render_header(state: &Entity<AppState>, cx: &App) -> impl IntoElement + u
                 .flex()
                 .flex_col()
                 .gap_0p5()
-                .child(
-                    div().truncate().child(Paragraph::new(
-                        s.session_name.clone().unwrap_or_else(|| {
-                            s.cwd
-                                .as_ref()
-                                .map(|p| p.to_string_lossy().into_owned())
-                                .unwrap_or_default()
-                        }),
-                    )),
-                )
+                .child(div().truncate().child(Paragraph::new(
+                    s.session_name.clone().unwrap_or_else(|| {
+                        s.cwd
+                            .as_ref()
+                            .map(|p| p.to_string_lossy().into_owned())
+                            .unwrap_or_default()
+                    }),
+                )))
                 .child(Caption::new(stats_line)),
         )
-        .child(
-            div().w(px(240.)).when(!model_choices.is_empty(), |this| {
-                let app = app.clone();
-                this.child(
-                    Select::new("model", model_choices)
-                        .label(i18n::t(cx, "model"))
-                        .selected(selected_model)
-                        .on_change(move |next, _, cx| {
-                            app.update(cx, |s, cx| s.set_model(&next, cx));
-                        }),
-                )
-            }),
-        )
-        .child(
-            div().w(px(130.)).when(!level_choices.is_empty(), |this| {
-                let app = app.clone();
-                this.child(
-                    Select::new("thinking", level_choices)
-                        .label(i18n::t(cx, "thinking"))
-                        .selected(selected_level)
-                        .on_change(move |next, _, cx| {
-                            if let Some(level) = parse_level_slug(&next) {
-                                app.update(cx, |s, cx| s.set_thinking(level, cx));
-                            }
-                        }),
-                )
-            }),
-        )
+        .child(div().w(px(240.)).when(!model_choices.is_empty(), |this| {
+            let app = app.clone();
+            this.child(
+                Select::new("model", model_choices)
+                    .label(i18n::t(cx, "model"))
+                    .selected(selected_model)
+                    .on_change(move |next, _, cx| {
+                        app.update(cx, |s, cx| s.set_model(next, cx));
+                    }),
+            )
+        }))
+        .child(div().w(px(130.)).when(!level_choices.is_empty(), |this| {
+            let app = app.clone();
+            this.child(
+                Select::new("thinking", level_choices)
+                    .label(i18n::t(cx, "thinking"))
+                    .selected(selected_level)
+                    .on_change(move |next, _, cx| {
+                        if let Some(level) = parse_level_slug(next) {
+                            app.update(cx, |s, cx| s.set_thinking(level, cx));
+                        }
+                    }),
+            )
+        }))
         .child(
             ely_gpui_component::buttons::Button::new("theme", i18n::t(cx, "theme"))
                 .on_click(|_, _, cx| toggle_theme(cx)),
@@ -131,6 +124,9 @@ pub fn render_header(state: &Entity<AppState>, cx: &App) -> impl IntoElement + u
         .child(
             ely_gpui_component::buttons::Button::new("locale", next_locale).on_click(
                 move |_, _, cx| {
+                    crate::settings::save_setting(|s| {
+                        s.locale = Some(next_locale.to_string());
+                    });
                     ely_gpui_component::i18n::I18n::set_locale(next_locale, cx);
                 },
             ),
@@ -152,7 +148,10 @@ pub fn render_transcript(
     let count = s.transcript.len();
     let empty = count == 0;
     let app = state.clone();
-    let notice = s.notice.clone().map(|(kind, text)| render_notice(kind, text, app.clone(), cx));
+    let notice = s
+        .notice
+        .clone()
+        .map(|(kind, text)| render_notice(kind, text, app.clone(), cx));
 
     div()
         .relative()
@@ -209,9 +208,9 @@ fn render_item(item: &TranscriptItem, ix: usize, cx: &App) -> AnyElement {
             }
             if !view.finished && view.thinking.is_empty() && view.text.is_empty() {
                 // Message announced, first delta still in flight.
-                bubble = bubble.child(ely_gpui_component::chat::ThinkingIndicator::new(
-                    ("wait", ix),
-                ));
+                bubble = bubble.child(ely_gpui_component::chat::ThinkingIndicator::new((
+                    "wait", ix,
+                )));
             }
             bubble.into_any_element()
         }
@@ -279,9 +278,8 @@ fn render_notice(
         .text_color(ink)
         .child(Paragraph::new(text))
         .child(
-            ely_gpui_component::buttons::Button::new("dismiss", i18n::t(cx, "dismiss")).on_click(
-                move |_, _, cx| app.update(cx, |s, cx| s.dismiss_notice(cx)),
-            ),
+            ely_gpui_component::buttons::Button::new("dismiss", i18n::t(cx, "dismiss"))
+                .on_click(move |_, _, cx| app.update(cx, |s, cx| s.dismiss_notice(cx))),
         )
 }
 
