@@ -79,11 +79,22 @@ pub fn render(state: &Entity<AppState>, cx: &App) -> impl IntoElement + use<> {
                 .items_center()
                 .justify_between()
                 .child(
+                    // The mark stands for the app; the name is in the
+                    // window title already.
                     div()
                         .flex()
-                        .flex_col()
-                        .gap_0p5()
-                        .child(Label::new(i18n::t(cx, "app_name")))
+                        .items_center()
+                        .gap_2()
+                        .min_w_0()
+                        .child(
+                            ely_gpui_component::primitives::Image::new(
+                                "pido-mark",
+                                crate::brand::mark(1),
+                            )
+                            .fit(gpui::ObjectFit::Contain)
+                            .w(px(22.))
+                            .h(px(22.)),
+                        )
                         .child(Caption::new(pi_status_line(state, cx))),
                 )
                 .child(

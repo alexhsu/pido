@@ -1,5 +1,6 @@
 //! pido: a desktop client for the Pi coding agent, built with GPUI and Ely.
 
+mod brand;
 mod i18n;
 mod settings;
 mod state;

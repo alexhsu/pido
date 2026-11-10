@@ -114,25 +114,27 @@ pub fn render(
                         ),
                 )
                 .child(
+                    // The wordmark says what this is; the time of day greets
+                    // underneath it.
                     div()
                         .flex()
+                        .flex_col()
                         .items_center()
-                        .justify_center()
-                        .gap_3()
+                        .gap_2()
+                        .w_full()
                         .child(
-                            ely_gpui_component::primitives::Icon::new(
-                                ely_gpui_component::primitives::IconName::Sparkles,
+                            ely_gpui_component::primitives::Image::new(
+                                "pido-wordmark",
+                                crate::brand::wordmark(2),
                             )
-                            .size(ely_gpui_component::theme::IconSize::Lg)
-                            .color(theme.colors.accent),
+                            .fit(gpui::ObjectFit::Contain)
+                            .w(gpui::px(220.))
+                            .h(gpui::px(101.)),
                         )
                         .child(
                             div()
-                                .min_w_0()
-                                .text_size(
-                                    theme.text_size(ely_gpui_component::theme::TextSize::Xxl),
-                                )
-                                .text_color(theme.colors.fg)
+                                .text_size(theme.text_size(ely_gpui_component::theme::TextSize::Lg))
+                                .text_color(theme.colors.fg_muted)
                                 .child(greeting(cx)),
                         ),
                 )
