@@ -186,27 +186,88 @@ pub fn extra_args() -> Vec<String> {
 #[derive(Debug, Clone)]
 pub enum SidebarRow {
     /// A project directory: its short label, its full path (for the fold and
-    /// for starting a session there) and whether it is folded.
+    /// for starting a session there) and whether it is folded. The archive
+    /// fold has an empty `cwd` and its label comes from the locale.
     Group {
         label: gpui::SharedString,
         cwd: gpui::SharedString,
         folded: bool,
         sessions: usize,
+        archived: bool,
     },
     /// A session file.
     Session {
         path: gpui::SharedString,
+        session_id: gpui::SharedString,
         title: gpui::SharedString,
         /// Last activity, unix seconds: the age label is built at draw time,
         /// so it follows the locale without rebuilding the rows.
         updated: Option<i64>,
+        pinned: bool,
+        archived: bool,
     },
 }
 
-/// Flatten grouped sessions into the sidebar's row order.
+/// A session path as the pin and archive sets compare it.
+pub fn session_key(path: &str) -> String {
+    let key = path.replace('\\', "/");
+    if cfg!(windows) {
+        key.to_lowercase()
+    } else {
+        key
+    }
+}
+
+/// Show a session's file in the platform's file manager, with the file
+/// itself picked where the platform supports it.
+pub fn reveal_in_folder(path: &Path) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        let _ = std::process::Command::new("explorer")
+            .raw_arg(format!("/select,\"{}\"", path.display()))
+            .creation_flags(0x0800_0000)
+            .spawn();
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let _ = std::process::Command::new("open")
+            .arg("-R")
+            .arg(path)
+            .spawn();
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        let dir = path.parent().unwrap_or(path);
+        let _ = std::process::Command::new("xdg-open").arg(dir).spawn();
+    }
+}
+
+/// One session as a sidebar row.
+fn session_row(session: &sessions::SessionSummary, pinned: bool, archived: bool) -> SidebarRow {
+    let title = session
+        .name
+        .clone()
+        .or_else(|| session.preview.clone())
+        .unwrap_or_else(|| session.session_id.clone());
+    SidebarRow::Session {
+        path: session.path.to_string_lossy().into_owned().into(),
+        session_id: session.session_id.clone().into(),
+        title: title.into(),
+        updated: session.updated_secs,
+        pinned,
+        archived,
+    }
+}
+
+/// Flatten grouped sessions into the sidebar's row order: pinned sessions
+/// first inside their project, archived ones collected into a fold at the
+/// bottom. The archive fold sits under the empty-string key.
 fn flatten_groups(
     groups: &[SessionGroup],
     collapsed: &std::collections::HashSet<String>,
+    pinned: &HashSet<String>,
+    archived: &HashSet<String>,
 ) -> Vec<SidebarRow> {
     let mut rows = Vec::with_capacity(
         groups
@@ -214,28 +275,55 @@ fn flatten_groups(
             .map(|group| group.sessions.len() + 1)
             .sum::<usize>(),
     );
+    let mut archived_sessions: Vec<&sessions::SessionSummary> = Vec::new();
     for group in groups {
+        let is_archived = |session: &sessions::SessionSummary| {
+            archived.contains(&session_key(&session.path.to_string_lossy()))
+        };
+        let active: Vec<&sessions::SessionSummary> = group
+            .sessions
+            .iter()
+            .filter(|session| !is_archived(session))
+            .collect();
+        archived_sessions.extend(group.sessions.iter().filter(|session| is_archived(session)));
         let folded = collapsed.contains(&group.cwd);
         rows.push(SidebarRow::Group {
             label: shorten_project(&group.cwd).into(),
             cwd: group.cwd.clone().into(),
             folded,
-            sessions: group.sessions.len(),
+            sessions: active.len(),
+            archived: false,
         });
         if folded {
             continue;
         }
-        for session in &group.sessions {
-            let title = session
-                .name
-                .clone()
-                .or_else(|| session.preview.clone())
-                .unwrap_or_else(|| session.session_id.clone());
-            rows.push(SidebarRow::Session {
-                path: session.path.to_string_lossy().into_owned().into(),
-                title: title.into(),
-                updated: session.updated_secs,
-            });
+        // Stable sort: pinned first, everything else in the scanner's order.
+        let mut active = active;
+        active
+            .sort_by_key(|session| !pinned.contains(&session_key(&session.path.to_string_lossy())));
+        for session in active {
+            let pinned = pinned.contains(&session_key(&session.path.to_string_lossy()));
+            rows.push(session_row(session, pinned, false));
+        }
+    }
+    if !archived_sessions.is_empty() {
+        archived_sessions.sort_by_key(|session| std::cmp::Reverse(session.updated_secs));
+        let folded = collapsed.contains("");
+        rows.push(SidebarRow::Group {
+            label: "".into(),
+            cwd: "".into(),
+            folded,
+            sessions: archived_sessions.len(),
+            archived: true,
+        });
+        if !folded {
+            for session in archived_sessions {
+                rows.push(session_row(
+                    session,
+                    pinned.contains(&session_key(&session.path.to_string_lossy())),
+                    true,
+                ));
+            }
         }
     }
     rows
@@ -503,8 +591,13 @@ pub struct AppState {
     /// Sessions per project, as last scanned. The sidebar draws
     /// `sidebar_rows`, which is this flattened once per scan.
     pub session_groups: Vec<SessionGroup>,
-    /// Projects the user folded shut, keyed by working directory.
+    /// Projects the user folded shut, keyed by working directory. The
+    /// archive fold uses the empty string.
     pub collapsed_projects: std::collections::HashSet<String>,
+    /// Sessions the user pinned, as normalized keys.
+    pub pinned_sessions: HashSet<String>,
+    /// Sessions the user archived, as normalized keys.
+    pub archived_sessions: HashSet<String>,
     /// The sidebar's rows, flattened once per scan: a header per project and
     /// a row per session. Rendering reads these instead of rebuilding strings
     /// per frame, and the list virtualises over the same order.
@@ -554,8 +647,22 @@ pub struct AppState {
 
 impl AppState {
     pub fn new(cx: &mut App) -> Entity<Self> {
-        let last_project = crate::settings::Settings::load().last_project;
+        let persisted = crate::settings::Settings::load();
+        let last_project = persisted.last_project;
+        let pinned_sessions = persisted
+            .pinned_sessions
+            .iter()
+            .map(|path| session_key(path))
+            .collect();
+        let archived_sessions = persisted
+            .archived_sessions
+            .iter()
+            .map(|path| session_key(path))
+            .collect();
         cx.new(|cx| {
+            // The archive fold starts shut; it only lists when something is in it.
+            let mut collapsed = HashSet::new();
+            collapsed.insert(String::new());
             let state = Self {
                 conn: Conn::Idle,
                 environment: Environment::default(),
@@ -568,7 +675,9 @@ impl AppState {
                 thinking_level: None,
                 session_groups: Vec::new(),
                 sidebar_rows: Vec::new(),
-                collapsed_projects: std::collections::HashSet::new(),
+                collapsed_projects: collapsed,
+                pinned_sessions,
+                archived_sessions,
                 session_name: None,
                 session_file: None,
                 last_session_loaded: false,
@@ -828,10 +937,87 @@ impl AppState {
         });
     }
 
-    /// Fold or unfold a project in the sidebar.
+    /// The sidebar's rows from the last scan and the current pin/archive sets.
+    fn sidebar_rows_now(&self) -> Vec<SidebarRow> {
+        flatten_groups(
+            &self.session_groups,
+            &self.collapsed_projects,
+            &self.pinned_sessions,
+            &self.archived_sessions,
+        )
+    }
+
+    /// Fold or unfold a project in the sidebar. An empty `cwd` folds the
+    /// archive list.
     pub fn toggle_project(&mut self, cwd: &str, cx: &mut Context<Self>) {
         toggle_fold(&mut self.collapsed_projects, cwd);
-        self.sidebar_rows = flatten_groups(&self.session_groups, &self.collapsed_projects);
+        self.sidebar_rows = self.sidebar_rows_now();
+        cx.notify();
+    }
+
+    /// Pin or unpin a session; pinned sessions lead their project group.
+    pub fn toggle_pin(&mut self, path: &str, cx: &mut Context<Self>) {
+        let key = session_key(path);
+        if !self.pinned_sessions.remove(&key) {
+            self.pinned_sessions.insert(key);
+        }
+        let mut pinned: Vec<String> = self.pinned_sessions.iter().cloned().collect();
+        pinned.sort();
+        crate::settings::save_setting(|s| s.pinned_sessions = pinned);
+        self.sidebar_rows = self.sidebar_rows_now();
+        cx.notify();
+    }
+
+    /// Move a session into or out of the archive fold.
+    pub fn toggle_archive(&mut self, path: &str, cx: &mut Context<Self>) {
+        let key = session_key(path);
+        let archived = if self.archived_sessions.remove(&key) {
+            false
+        } else {
+            self.archived_sessions.insert(key);
+            true
+        };
+        let mut list: Vec<String> = self.archived_sessions.iter().cloned().collect();
+        list.sort();
+        crate::settings::save_setting(|s| s.archived_sessions = list);
+        self.sidebar_rows = self.sidebar_rows_now();
+        self.push_notice(
+            NoticeKind::Info,
+            i18n::t(
+                cx,
+                if archived {
+                    "session_archived"
+                } else {
+                    "session_unarchived"
+                },
+            )
+            .to_string(),
+        );
+        cx.notify();
+    }
+
+    /// Rename a session by path: the open one through Pi, any other by
+    /// appending a `session_info` entry to its file.
+    pub fn rename_session_at(&mut self, path: &str, name: String, cx: &mut Context<Self>) {
+        let open = self
+            .session_file
+            .as_deref()
+            .is_some_and(|current| session_key(current) == session_key(path));
+        if open {
+            self.rename_session(name, cx);
+            return;
+        }
+        let name = name.trim().to_string();
+        if name.is_empty() {
+            return;
+        }
+        match sessions::append_session_name(std::path::Path::new(path), &name) {
+            Ok(()) => {
+                patch_session_title(&mut self.sidebar_rows, path, &name);
+                self.refresh_sessions(cx);
+            }
+            Err(error) => self.push_notice(NoticeKind::Error, format!("rename: {error}")),
+        }
         cx.notify();
     }
 
@@ -1208,6 +1394,98 @@ impl AppState {
         .detach();
     }
 
+    /// Duplicate a session's active branch into a new session. Forking a
+    /// session that is not open switches to it for the clone and then back,
+    /// so the user's place survives; forking the open one leaves the clone
+    /// active, as the fork is the continuation.
+    pub fn fork_session(&mut self, path: &str, cx: &mut Context<Self>) {
+        if self.conn != Conn::Live {
+            return;
+        }
+        if self.streaming {
+            self.push_notice(NoticeKind::Warn, i18n::t(cx, "agent_busy").to_string());
+            cx.notify();
+            return;
+        }
+        let Some(client) = self.client() else { return };
+        let target = path.to_string();
+        let original = self.session_file.clone();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn({
+                    let target = target.clone();
+                    let original = original.clone();
+                    async move {
+                        let same = |a: &str, b: &str| session_key(a) == session_key(b);
+                        let forking_elsewhere =
+                            original.as_deref().is_none_or(|open| !same(open, &target));
+                        if forking_elsewhere {
+                            let switched = client.request(Command::SwitchSession {
+                                session_path: target.clone(),
+                            })?;
+                            if !switched.success {
+                                anyhow::bail!("switch_session failed: {:?}", switched.error);
+                            }
+                            if session_action_cancelled(&switched) {
+                                return Ok(None);
+                            }
+                        }
+                        let cloned = client.request(Command::Clone)?;
+                        if !cloned.success {
+                            anyhow::bail!("clone failed: {:?}", cloned.error);
+                        }
+                        if session_action_cancelled(&cloned) {
+                            return Ok(None);
+                        }
+                        let fork_cwd = sessions::read_session_cwd(std::path::Path::new(&target));
+                        let mut restored = !forking_elsewhere;
+                        if forking_elsewhere && let Some(back) = original.as_deref() {
+                            let switched = client.request(Command::SwitchSession {
+                                session_path: back.to_string(),
+                            })?;
+                            restored = switched.success && !session_action_cancelled(&switched);
+                        }
+                        // True when the open session is the one we started on.
+                        Ok(Some((restored, fork_cwd)))
+                    }
+                })
+                .await;
+            this.update(cx, |s, cx| {
+                match result {
+                    Ok(Some((active_is_original, fork_cwd))) => {
+                        if active_is_original {
+                            // Back where the user was: only the list grew.
+                            s.query_state(cx);
+                        } else {
+                            // The clone is active now; rebuild around it.
+                            s.transcript.clear();
+                            s.clear_changes();
+                            s.session_name = None;
+                            s.stats = None;
+                            s.session_epoch += 1;
+                            s.pending_steers.clear();
+                            s.apply_session_cwd(fork_cwd, cx);
+                            s.query_state(cx);
+                            s.load_history(cx);
+                            s.refresh_stats(cx);
+                        }
+                        s.refresh_sessions(cx);
+                        s.push_notice(NoticeKind::Info, i18n::t(cx, "session_forked").to_string());
+                    }
+                    Ok(None) => s.push_notice(
+                        NoticeKind::Warn,
+                        i18n::t(cx, "session_cancelled").to_string(),
+                    ),
+                    Err(error) => s.push_notice(NoticeKind::Error, error.to_string()),
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     /// Drop the session and return to the welcome screen.
     pub fn disconnect(&mut self, cx: &mut Context<Self>) {
         if let Some(client) = self.client.take() {
@@ -1290,8 +1568,8 @@ impl AppState {
                 })
                 .await;
             this.update(cx, |s, cx| {
-                s.sidebar_rows = flatten_groups(&groups, &s.collapsed_projects);
                 s.session_groups = groups;
+                s.sidebar_rows = s.sidebar_rows_now();
                 cx.notify();
             })
             .ok();
@@ -1784,7 +2062,7 @@ impl AppState {
         cx.notify();
     }
 
-    fn push_notice(&mut self, kind: NoticeKind, text: String) {
+    pub fn push_notice(&mut self, kind: NoticeKind, text: String) {
         log::info!("notice: {text}");
         self.notice = Some((kind, text));
     }
@@ -2546,6 +2824,8 @@ mod tests {
             session_groups: Vec::new(),
             sidebar_rows: Vec::new(),
             collapsed_projects: std::collections::HashSet::new(),
+            pinned_sessions: HashSet::new(),
+            archived_sessions: HashSet::new(),
             session_name: None,
             session_file: None,
             last_session_loaded: false,
@@ -2953,12 +3233,17 @@ mod sidebar_tests {
     #[test]
     fn folding_a_project_hides_its_sessions() {
         let groups = vec![group("D:/a", 3), group("D:/b", 2)];
-        let open = flatten_groups(&groups, &Default::default());
+        let open = flatten_groups(
+            &groups,
+            &Default::default(),
+            &Default::default(),
+            &Default::default(),
+        );
         assert_eq!(open.len(), 2 + 3 + 2, "two headers and five sessions");
 
         let mut folded = std::collections::HashSet::new();
         folded.insert("D:/a".to_string());
-        let rows = flatten_groups(&groups, &folded);
+        let rows = flatten_groups(&groups, &folded, &Default::default(), &Default::default());
         assert_eq!(
             rows.len(),
             2 + 2,
@@ -2984,6 +3269,46 @@ mod sidebar_tests {
     }
 
     #[test]
+    fn pinned_sessions_lead_and_archived_ones_fold_to_the_bottom() {
+        let groups = vec![group("D:/a", 3), group("D:/b", 1)];
+        let mut pinned = HashSet::new();
+        pinned.insert(session_key("D:/a/s2.jsonl"));
+
+        let rows = flatten_groups(&groups, &Default::default(), &pinned, &Default::default());
+        match &rows[1] {
+            SidebarRow::Session { path, pinned, .. } => {
+                assert!(path.ends_with("s2.jsonl"), "the pinned session leads");
+                assert!(pinned);
+            }
+            other => panic!("expected a session row, got {other:?}"),
+        }
+        assert_eq!(rows.len(), 2 + 4, "both projects unfolded");
+
+        let mut archived = HashSet::new();
+        archived.insert(session_key("D:/a/s1.jsonl"));
+        let rows = flatten_groups(&groups, &Default::default(), &HashSet::new(), &archived);
+        let group_a = match &rows[0] {
+            SidebarRow::Group { sessions, .. } => *sessions,
+            other => panic!("expected a group, got {other:?}"),
+        };
+        assert_eq!(group_a, 2, "the archived session leaves its project");
+        match rows.last().unwrap() {
+            SidebarRow::Session { path, archived, .. } => {
+                assert!(path.ends_with("s1.jsonl"));
+                assert!(archived);
+            }
+            other => panic!("expected the archived session last, got {other:?}"),
+        }
+        match &rows[rows.len() - 2] {
+            SidebarRow::Group {
+                archived: is_archive,
+                ..
+            } => assert!(is_archive, "the archive fold precedes its rows"),
+            other => panic!("expected the archive fold, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn toggling_folds_and_unfolds() {
         let mut collapsed = std::collections::HashSet::new();
         toggle_fold(&mut collapsed, "D:/a");
@@ -3000,16 +3325,23 @@ mod sidebar_tests {
                 cwd: "D:/a".into(),
                 folded: false,
                 sessions: 2,
+                archived: false,
             },
             SidebarRow::Session {
                 path: "D:/a/one.jsonl".into(),
+                session_id: "one".into(),
                 title: "old".into(),
                 updated: Some(1),
+                pinned: false,
+                archived: false,
             },
             SidebarRow::Session {
                 path: "D:/a/two.jsonl".into(),
+                session_id: "two".into(),
                 title: "keep".into(),
                 updated: Some(2),
+                pinned: false,
+                archived: false,
             },
         ];
         patch_session_title(&mut rows, "D:/a/one.jsonl", "renamed");

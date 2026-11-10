@@ -12,7 +12,10 @@ use gpui::{
 use crate::state::{AppState, Conn};
 use crate::ui::{chat, composer, sidebar, welcome};
 
-actions!(pido, [Stop]);
+actions!(
+    pido,
+    [Stop, PinSession, RenameSession, ForkSession, ArchiveSession]
+);
 
 /// Height of the session header above the chat pane.
 pub const HEADER_HEIGHT: f32 = 52.;
@@ -35,9 +38,11 @@ pub struct PidoApp {
     dialog_field: Option<gpui::Entity<TextInput>>,
     /// The request id `dialog_field` was built for.
     dialog_field_for: Option<String>,
-    /// The session-rename dialog: open, with its own field.
+    /// The session-rename dialog: open, with its own field, and the session
+    /// it names (None means the open session without a file yet).
     rename_open: bool,
     rename_field: Option<gpui::Entity<TextInput>>,
+    rename_target: Option<String>,
     /// The changes panel: open, which file is picked, and its diff layout.
     pub diff_open: bool,
     pub diff_selected: Option<String>,
@@ -81,6 +86,7 @@ impl PidoApp {
             dialog_field_for: None,
             rename_open: false,
             rename_field: None,
+            rename_target: None,
             diff_open: false,
             diff_selected: None,
             diff_layout: ely_gpui_component::git::DiffLayout::Unified,
@@ -223,7 +229,7 @@ impl Render for PidoApp {
         // Extension and rename dialogs ride at the root, above every pane.
         let overlay = self
             .extension_dialog_overlay(&state, window, cx)
-            .or_else(|| self.rename_dialog(&state, cx));
+            .or_else(|| self.rename_dialog(cx));
         // The changes panel slides over the chat; it closes itself when a new
         // session empties the list.
         let changes_open = self.diff_open && !state.read(cx).changes.is_empty();
@@ -262,7 +268,7 @@ impl Render for PidoApp {
                     .child(
                         SplitPane::new("shell", gpui::Axis::Horizontal, gpui::px(200.))
                             .sizes(&self.split_seed)
-                            .pane(sidebar::render(&state, window, cx))
+                            .pane(sidebar::render(&state, &cx.entity(), window, cx))
                             .pane(main)
                             .on_resize({
                                 let width = f32::from(window.bounds().size.width);
@@ -294,6 +300,26 @@ impl Render for PidoApp {
                         if this.state.read(cx).streaming {
                             this.state.update(cx, |s, cx| s.stop(cx));
                         }
+                    }))
+                    .on_action(cx.listener(|this, _: &PinSession, _window, cx| {
+                        if let Some(file) = this.state.read(cx).session_file.clone() {
+                            this.state.update(cx, |s, cx| s.toggle_pin(&file, cx));
+                        }
+                    }))
+                    .on_action(cx.listener(|this, _: &RenameSession, window, cx| {
+                        if this.state.read(cx).conn == Conn::Live {
+                            this.open_rename(window, cx);
+                        }
+                    }))
+                    .on_action(cx.listener(|this, _: &ForkSession, _window, cx| {
+                        if let Some(file) = this.state.read(cx).session_file.clone() {
+                            this.state.update(cx, |s, cx| s.fork_session(&file, cx));
+                        }
+                    }))
+                    .on_action(cx.listener(|this, _: &ArchiveSession, _window, cx| {
+                        if let Some(file) = this.state.read(cx).session_file.clone() {
+                            this.state.update(cx, |s, cx| s.toggle_archive(&file, cx));
+                        }
                     })),
             )
     }
@@ -302,37 +328,87 @@ impl Render for PidoApp {
 impl PidoApp {
     /// Open the rename dialog over the current session's name.
     pub fn open_rename(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let current = self.state.read(cx).session_name.clone().unwrap_or_default();
+        let (target, current) = {
+            let state = self.state.read(cx);
+            (
+                state.session_file.clone(),
+                state.session_name.clone().unwrap_or_default(),
+            )
+        };
+        self.open_rename_with(target, current, window, cx);
+    }
+
+    /// Open the rename dialog for a session picked in the sidebar: its own
+    /// name prefills the field, and saving renames that session rather than
+    /// whichever one is open.
+    pub fn open_rename_at(
+        &mut self,
+        path: String,
+        title: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let prefill = {
+            let state = self.state.read(cx);
+            let open = state.session_file.as_deref().is_some_and(|current| {
+                crate::state::session_key(current) == crate::state::session_key(&path)
+            });
+            if open {
+                state.session_name.clone().unwrap_or_default()
+            } else {
+                title
+            }
+        };
+        self.open_rename_with(Some(path), prefill, window, cx);
+    }
+
+    fn open_rename_with(
+        &mut self,
+        target: Option<String>,
+        prefill: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let field = cx.new(|cx| {
             let mut input = TextInput::new(window, cx);
-            if !current.is_empty() {
-                input.set_text(current, cx);
+            if !prefill.is_empty() {
+                input.set_text(prefill, cx);
             }
             input
         });
         self.rename_field = Some(field.clone());
         self.rename_open = true;
+        self.rename_target = target;
         // Enter in the field saves, the same path the Save button takes.
         cx.subscribe(&field, move |this, field, event: &InputEvent, cx| {
             if *event != InputEvent::Submit {
                 return;
             }
-            let name = field.read(cx).text().to_string();
-            this.state.update(cx, |s, cx| s.rename_session(name, cx));
-            this.rename_open = false;
-            this.rename_field = None;
-            cx.notify();
+            this.finish_rename(&field, cx);
         })
         .detach();
         cx.notify();
     }
 
+    /// Commit the rename dialog's field, then close it.
+    fn finish_rename(&mut self, field: &gpui::Entity<TextInput>, cx: &mut Context<Self>) {
+        let name = field.read(cx).text().to_string();
+        match self.rename_target.clone() {
+            Some(path) => self
+                .state
+                .update(cx, |state, cx| state.rename_session_at(&path, name, cx)),
+            None => self
+                .state
+                .update(cx, |state, cx| state.rename_session(name, cx)),
+        }
+        self.rename_open = false;
+        self.rename_field = None;
+        self.rename_target = None;
+        cx.notify();
+    }
+
     /// The rename dialog, while open.
-    fn rename_dialog(
-        &mut self,
-        state: &gpui::Entity<AppState>,
-        cx: &mut Context<Self>,
-    ) -> Option<gpui::AnyElement> {
+    fn rename_dialog(&mut self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
         use ely_gpui_component::buttons::{Button, ButtonVariant};
         use ely_gpui_component::overlays::Dialog;
 
@@ -345,10 +421,10 @@ impl PidoApp {
             close_me.update(cx, |this, cx| {
                 this.rename_open = false;
                 this.rename_field = None;
+                this.rename_target = None;
                 cx.notify();
             });
         };
-        let save_state = state.clone();
         let save_field = field.clone();
         let save_me = cx.entity();
         // The dialog is rebuilt every frame, so focus goes back to the field
@@ -372,6 +448,7 @@ impl PidoApp {
                                 me.update(cx, |this, cx| {
                                     this.rename_open = false;
                                     this.rename_field = None;
+                                    this.rename_target = None;
                                     cx.notify();
                                 });
                                 close(window, cx);
@@ -382,13 +459,7 @@ impl PidoApp {
                     Button::new("rename-save", save_label.clone())
                         .primary()
                         .on_click(move |_, window, cx| {
-                            let name = save_field.read(cx).text().to_string();
-                            save_state.update(cx, |s, cx| s.rename_session(name, cx));
-                            save_me.update(cx, |this, cx| {
-                                this.rename_open = false;
-                                this.rename_field = None;
-                                cx.notify();
-                            });
+                            save_me.update(cx, |this, cx| this.finish_rename(&save_field, cx));
                             close(window, cx);
                         })
                 })

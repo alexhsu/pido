@@ -11,14 +11,14 @@ A native desktop client for the [Pi coding agent](https://github.com/earendil-wo
 - **完整聊天闭环** — 选择项目目录启动会话,流式输出、思考过程、工具调用卡片实时呈现
 - **运行中转向** — agent 执行中继续输入即 steer(转向);排队中的消息以标签显示在输入框上方,可一键清空;Esc 或停止按钮 = 清空队列 + 中止
 - **模型与思考级别切换** — 输入框右下角的模型胶囊,两级菜单切换 provider 模型和 thinking level
-- **会话管理** — 侧栏按项目分组列出 `~/.pi/agent/sessions` 的历史会话,支持折叠、悬浮新建、拖拽调宽;点击恢复继续,可重命名当前会话
+- **会话管理** — 侧栏按项目分组列出 `~/.pi/agent/sessions` 的历史会话,支持折叠、悬浮新建、拖拽调宽;点击恢复继续。右键菜单可置顶、重命名、分叉、复制 Session ID、在文件夹显示、归档(归档项收进侧栏底部的「已归档」折叠)
 - **改动审查** — agent 用 `edit`/`write` 改过的文件按项目路径汇总,点开看统一/并排 diff,打开的历史会话也能重建
 - **统计** — token 用量、成本、上下文占用,每轮结束后刷新
 - **亮暗主题 + 中英双语** — 一键切换,偏好持久化(含窗口尺寸、最近项目)
 - **A complete chat loop** — pick a project directory, stream replies, thinking, and tool-call cards live
 - **Steering** — typing while the agent runs steers it; queued messages show as chips over the composer and can be cleared in one click; Esc or the stop button clears the queue and aborts
 - **Model & thinking switching** — the model pill at the composer's right opens two levels: model and thinking level
-- **Sessions** — the sidebar lists past sessions grouped by project, with folding, a hover new-chat button and a draggable width; click to resume, rename the open session from the header
+- **Sessions** — the sidebar lists past sessions grouped by project, with folding, a hover new-chat button and a draggable width; click to resume. The right-click menu pins, renames, forks, copies the session ID, reveals the file, and archives (archived sessions collect under an "Archived" fold at the bottom)
 - **Change review** — files the agent edited or wrote, with unified/split diffs, rebuilt for sessions loaded from history too
 - **Stats** — tokens, cost, and context usage refresh after every run
 - **Dark/light + 中文/English** — one-click toggle, persisted along with window size and last project

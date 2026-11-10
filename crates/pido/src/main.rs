@@ -19,7 +19,14 @@ fn main() {
         .with_assets(Assets)
         .run(move |cx: &mut App| {
             ely_gpui_component::init(cx).expect("Ely failed to start");
-            cx.bind_keys([gpui::KeyBinding::new("escape", ui::app::Stop, None)]);
+            cx.bind_keys([
+                gpui::KeyBinding::new("escape", ui::app::Stop, None),
+                // The session menu's chords act on the open session.
+                gpui::KeyBinding::new("ctrl-alt-p", ui::app::PinSession, None),
+                gpui::KeyBinding::new("ctrl-alt-g", ui::app::RenameSession, None),
+                gpui::KeyBinding::new("ctrl-alt-f", ui::app::ForkSession, None),
+                gpui::KeyBinding::new("ctrl-shift-a", ui::app::ArchiveSession, None),
+            ]);
             match settings.theme.as_deref() {
                 Some("light") => Theme::set_mode_now(Mode::Light, cx),
                 _ => Theme::set_mode_now(Mode::Dark, cx),

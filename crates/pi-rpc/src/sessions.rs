@@ -11,9 +11,9 @@
 //! client lists sessions by scanning this directory.
 
 use std::collections::{HashMap, HashSet};
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::Deserialize;
 
@@ -152,6 +152,92 @@ pub fn read_session_cwd(path: &Path) -> Option<String> {
     BufReader::new(file).read_line(&mut line).ok()?;
     let header: SessionHeader = serde_json::from_str(&line).ok()?;
     header.cwd
+}
+
+/// Append a `session_info` entry naming the session. Pi does the same when it
+/// renames; writing it here lets pido rename a session that is not open
+/// without switching to it first. The entry hangs off the file's last entry,
+/// so the tree stays linear.
+pub fn append_session_name(path: &Path, name: &str) -> std::io::Result<()> {
+    let name = name.replace(['\r', '\n'], " ").trim().to_string();
+    if name.is_empty() {
+        return Ok(());
+    }
+    let text = std::fs::read_to_string(path)?;
+    let mut parent = None;
+    let mut taken = HashSet::new();
+    for line in text.lines() {
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(line)
+            && let Some(id) = value.get("id").and_then(|id| id.as_str())
+        {
+            taken.insert(id.to_string());
+            parent = Some(id.to_string());
+        }
+    }
+    let entry = serde_json::json!({
+        "type": "session_info",
+        "id": fresh_id(&taken),
+        "parentId": parent,
+        "timestamp": iso8601_now(),
+        "name": name,
+    });
+    let mut file = std::fs::OpenOptions::new().append(true).open(path)?;
+    if !text.ends_with('\n') {
+        file.write_all(b"\n")?;
+    }
+    writeln!(file, "{entry}")
+}
+
+/// An id Pi's session tree has not used yet: eight hex digits, like its own.
+fn fresh_id(taken: &HashSet<String>) -> String {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_nanos() as u64)
+        .unwrap_or(0);
+    let mut seed = nanos ^ (u64::from(std::process::id())).rotate_left(17);
+    loop {
+        seed = seed
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        let id = format!("{:08x}", (seed >> 24) as u32);
+        if !taken.contains(&id) {
+            return id;
+        }
+    }
+}
+
+/// Now, in the ISO-8601 form Pi writes.
+fn iso8601_now() -> String {
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs() as i64)
+        .unwrap_or(0);
+    iso8601(secs)
+}
+
+fn iso8601(secs: i64) -> String {
+    let (days, rest) = (secs.div_euclid(86_400), secs.rem_euclid(86_400));
+    let (year, month, day) = civil_from_days(days);
+    format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}.000Z",
+        rest / 3_600,
+        rest % 3_600 / 60,
+        rest % 60
+    )
+}
+
+/// Days since the Unix epoch to a civil date (Howard Hinnant's algorithm).
+fn civil_from_days(days: i64) -> (i64, u32, u32) {
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let year = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    (if month <= 2 { year + 1 } else { year }, month, day)
 }
 
 /// Group summaries by cwd, newest activity first. Because `summaries` is
@@ -451,5 +537,52 @@ mod tests {
     /// Minimal tempdir helper.
     fn tempdir() -> tempfile::TempDir {
         tempfile::tempdir().unwrap()
+    }
+
+    #[test]
+    fn appending_a_name_becomes_the_latest_session_info() {
+        let root = tempdir();
+        let path = write_session(
+            &root.path().join("--C--one--"),
+            "2026-01-01T10-00-00-000Z_id.jsonl",
+            &[
+                r#"{"type":"session","version":3,"id":"id","timestamp":"2026-01-01T10:00:00.000Z","cwd":"C:\\one"}"#.into(),
+                r#"{"type":"message","id":"m1","parentId":null,"timestamp":"2026-01-01T10:01:00.000Z","message":{"role":"user","content":"hi","timestamp":1}}"#.into(),
+            ],
+            1_000,
+        );
+        append_session_name(&path, "  renamed\nnow  ").unwrap();
+        let summary = parse_session_file(&path).expect("parses");
+        assert_eq!(summary.name.as_deref(), Some("renamed now"));
+        let text = std::fs::read_to_string(&path).unwrap();
+        let last = text.lines().last().unwrap();
+        let entry: serde_json::Value = serde_json::from_str(last).unwrap();
+        assert_eq!(entry["type"], "session_info");
+        assert_eq!(entry["parentId"], "m1", "hangs off the last entry");
+        assert_eq!(entry["id"].as_str().unwrap().len(), 8);
+    }
+
+    #[test]
+    fn an_appended_name_keeps_the_file_newline_discipline() {
+        let root = tempdir();
+        let dir = root.path().join("--C--one--");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("s.jsonl");
+        // No trailing newline: the appended entry must start on its own line.
+        std::fs::write(
+            &path,
+            "{\"type\":\"session\",\"version\":3,\"id\":\"id\",\"cwd\":\"C:/one\"}",
+        )
+        .unwrap();
+        append_session_name(&path, "named").unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.lines().last().unwrap().contains("\"named\""));
+        assert_eq!(text.lines().count(), 2);
+    }
+
+    #[test]
+    fn iso8601_matches_a_known_instant() {
+        assert_eq!(iso8601(0), "1970-01-01T00:00:00.000Z");
+        assert_eq!(iso8601(1_700_000_000), "2023-11-14T22:13:20.000Z");
     }
 }

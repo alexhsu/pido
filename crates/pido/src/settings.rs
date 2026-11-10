@@ -20,6 +20,12 @@ pub struct Settings {
     /// The session file of the last active session; the app resumes it on
     /// startup instead of starting a fresh empty one.
     pub last_session: Option<String>,
+    /// Session paths the user pinned, normalized keys as pido compares them.
+    #[serde(default)]
+    pub pinned_sessions: Vec<String>,
+    /// Session paths the user archived; they list under the archive fold.
+    #[serde(default)]
+    pub archived_sessions: Vec<String>,
     /// The sidebar's width in logical pixels, as last dragged.
     pub sidebar_width: Option<f32>,
     pub window: Option<WindowState>,

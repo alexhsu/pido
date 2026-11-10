@@ -5,23 +5,35 @@
 //! addition the component has no slot for: a relative age on the right.
 //! Grouping is by project, matching pido's model, rather than the
 //! component's built-in day buckets.
+//!
+//! Rows sit edge to edge: the pane's horizontal padding lives on the header
+//! and captions, not on the list, so the hover and active backgrounds span
+//! the full sidebar width. A right click opens the session menu.
 
 use ely_gpui_component::buttons::Button;
 use ely_gpui_component::lists::VirtualList;
+use ely_gpui_component::menus::{ContextMenu, Menu, MenuItem};
 use ely_gpui_component::primitives::{Disclosure, Icon, IconName};
 use ely_gpui_component::theme::{ActiveTheme, ControlSize, IconSize, Radius, TextSize};
 use ely_gpui_component::typography::{Caption, Ellipsis, Label};
 use gpui::{
-    App, Entity, InteractiveElement, IntoElement, MouseButton, ParentElement, SharedString,
-    StatefulInteractiveElement, Styled, Window, div, prelude::FluentBuilder, px,
+    AnyElement, App, ClipboardItem, Entity, InteractiveElement, IntoElement, MouseButton,
+    ParentElement, Pixels, SharedString, StatefulInteractiveElement, Styled, Window, div,
+    prelude::FluentBuilder, px,
 };
 
 use crate::i18n;
-use crate::state::{AppState, Conn, SidebarRow};
+use crate::state::{AppState, Conn, NoticeKind, SidebarRow};
+use crate::ui::app::PidoApp;
 
 /// Render the whole sidebar. Session clicks switch the running pi process to
-/// that session file.
-pub fn render(state: &Entity<AppState>, window: &Window, cx: &App) -> impl IntoElement + use<> {
+/// that session file; a right click opens its menu.
+pub fn render(
+    state: &Entity<AppState>,
+    view: &Entity<PidoApp>,
+    window: &Window,
+    cx: &App,
+) -> impl IntoElement + use<> {
     let theme = cx.theme();
     let colors = theme.colors.clone();
     let (control_h, radius_md, text_sm, text_xs) = (
@@ -51,11 +63,15 @@ pub fn render(state: &Entity<AppState>, window: &Window, cx: &App) -> impl IntoE
         .border_r_1()
         .border_color(colors.border)
         .bg(colors.surface)
-        .p_3()
+        // No horizontal padding: rows carry it, so their backgrounds reach
+        // the pane's edges.
+        .py_3()
         .gap_3()
         .child(
             div()
                 .flex()
+                .flex_none()
+                .px_3()
                 .items_center()
                 .justify_between()
                 .child(
@@ -87,153 +103,63 @@ pub fn render(state: &Entity<AppState>, window: &Window, cx: &App) -> impl IntoE
                 .min_h_0()
                 .min_w_0()
                 .when(empty, |this| {
-                    this.child(Caption::new(i18n::t(cx, "no_sessions")))
+                    this.child(div().px_3().child(Caption::new(i18n::t(cx, "no_sessions"))))
                 })
                 .when(!empty, |this| {
                     // Only the rows in view are built: a project's whole
                     // history can be long, and this list redraws whenever the
                     // transcript does.
                     let rows = s.sidebar_rows.clone();
-                    let app = app.clone();
                     let state = state.clone();
+                    let view = view.clone();
+                    let (text_sm, text_xs, radius_md) = (text_sm, text_xs, radius_md);
                     this.child(
                         VirtualList::new(
                             ("sessions", rows.len() as u64),
                             rows.len(),
                             move |ix, _, cx| {
                                 let row = &rows[ix];
-                                let colors = cx.theme().colors.clone();
                                 match row {
                                     SidebarRow::Group {
                                         label,
                                         cwd,
                                         folded,
                                         sessions,
-                                    } => {
-                                        let group = SharedString::from(format!("project-{ix}"));
-                                        let fold_state = state.clone();
-                                        let fold_cwd = cwd.to_string();
-                                        let new_state = state.clone();
-                                        let new_cwd = cwd.to_string();
-                                        div()
-                                            .id(("project", ix as u64))
-                                            .group(group.clone())
-                                            .w_full()
-                                            .flex()
-                                            .items_center()
-                                            .gap_1p5()
-                                            .px_2()
-                                            .pt_3()
-                                            .pb_1()
-                                            .cursor_pointer()
-                                            .hover(|style| style.bg(colors.hover))
-                                            .on_click(move |_, _, cx| {
-                                                fold_state.update(cx, |s, cx| {
-                                                    s.toggle_project(&fold_cwd, cx)
-                                                });
-                                            })
-                                            .child(Disclosure::new(("fold", ix as u64), !*folded))
-                                            .child(
-                                                Icon::new(IconName::Folder)
-                                                    .size(IconSize::Sm)
-                                                    .color(colors.fg_subtle),
-                                            )
-                                            .child(
-                                                div()
-                                                    .flex_1()
-                                                    .min_w_0()
-                                                    .child(Label::new(label.clone())),
-                                            )
-                                            .when(*folded, |this| {
-                                                this.child(Caption::new(sessions.to_string()))
-                                            })
-                                            // The row's own action, shown while hovered:
-                                            // a new session in this project.
-                                            .child(
-                                                div()
-                                                    .id(("project-new", ix as u64))
-                                                    .flex_none()
-                                                    .invisible()
-                                                    .group_hover(group, |style| style.visible())
-                                                    .on_mouse_down(
-                                                        MouseButton::Left,
-                                                        |_, window, _| window.prevent_default(),
-                                                    )
-                                                    .on_click(move |_, _, cx| {
-                                                        cx.stop_propagation();
-                                                        let cwd =
-                                                            std::path::PathBuf::from(&new_cwd);
-                                                        new_state.update(cx, |s, cx| {
-                                                            s.new_session_in(cwd, cx)
-                                                        });
-                                                    })
-                                                    .child(
-                                                        Icon::new(IconName::SquarePen)
-                                                            .size(IconSize::Xs)
-                                                            .color(colors.fg_subtle),
-                                                    ),
-                                            )
-                                            .into_any_element()
-                                    }
+                                        archived,
+                                    } => group_row(
+                                        cx,
+                                        ix,
+                                        &state,
+                                        label.clone(),
+                                        cwd.clone(),
+                                        *folded,
+                                        *sessions,
+                                        *archived,
+                                    ),
                                     SidebarRow::Session {
                                         path,
+                                        session_id,
                                         title,
                                         updated,
-                                    } => {
-                                        let active = state
-                                            .read(cx)
-                                            .session_file
-                                            .as_deref()
-                                            .is_some_and(|open| same_file(open, path));
-                                        let age = i18n::relative_time(cx, *updated);
-                                        let app = app.clone();
-                                        let path = path.clone();
-                                        div()
-                                            .id(("session", ix as u64))
-                                            .role(gpui::Role::ListItem)
-                                            .aria_label(title.clone())
-                                            .aria_selected(active)
-                                            .flex()
-                                            .items_center()
-                                            .gap_1()
-                                            .h(control_h)
-                                            .pl(px(8.) + label_lead)
-                                            .pr_0p5()
-                                            .rounded(radius_md)
-                                            .text_size(text_sm)
-                                            .text_color(if active {
-                                                colors.fg
-                                            } else {
-                                                colors.fg_muted
-                                            })
-                                            .when(active, |row| row.bg(colors.active))
-                                            .when(!active, |row| {
-                                                row.cursor_pointer()
-                                                    .hover(|style| style.bg(colors.hover))
-                                            })
-                                            .on_click(move |_, _, cx| {
-                                                app.update(cx, |s, cx| {
-                                                    s.switch_session(
-                                                        std::path::PathBuf::from(path.to_string()),
-                                                        cx,
-                                                    )
-                                                });
-                                            })
-                                            .child(
-                                                div()
-                                                    .flex_1()
-                                                    .min_w_0()
-                                                    .child(Ellipsis::new(title.clone())),
-                                            )
-                                            .child(
-                                                div()
-                                                    .flex_none()
-                                                    .text_size(text_xs)
-                                                    .text_color(colors.fg_subtle)
-                                                    .child(age),
-                                            )
-                                            .into_any_element()
-                                    }
+                                        pinned,
+                                        archived,
+                                    } => session_row(
+                                        cx,
+                                        ix,
+                                        &state,
+                                        &view,
+                                        path.clone(),
+                                        session_id.clone(),
+                                        title.clone(),
+                                        *updated,
+                                        *pinned,
+                                        *archived,
+                                        control_h,
+                                        radius_md,
+                                        text_sm,
+                                        text_xs,
+                                        label_lead,
+                                    ),
                                 }
                             },
                         )
@@ -241,6 +167,279 @@ pub fn render(state: &Entity<AppState>, window: &Window, cx: &App) -> impl IntoE
                     )
                 }),
         )
+}
+
+/// A project header, or the archive fold: chevron, mark, label, and (while
+/// hovered) a new-session button for projects.
+#[allow(clippy::too_many_arguments)]
+fn group_row(
+    cx: &App,
+    ix: usize,
+    state: &Entity<AppState>,
+    label: SharedString,
+    cwd: SharedString,
+    folded: bool,
+    sessions: usize,
+    archived: bool,
+) -> AnyElement {
+    let colors = cx.theme().colors.clone();
+    let group = SharedString::from(format!("project-{ix}"));
+    let fold_state = state.clone();
+    let fold_cwd = cwd.to_string();
+    let new_state = state.clone();
+    let new_cwd = cwd.to_string();
+    let shown = if archived {
+        i18n::t(cx, "archived")
+    } else {
+        label
+    };
+    let mark = if archived {
+        IconName::Archive
+    } else {
+        IconName::Folder
+    };
+    div()
+        .id(("project", ix as u64))
+        .group(group.clone())
+        .w_full()
+        .flex()
+        .items_center()
+        .gap_1p5()
+        .px_2()
+        .pt_3()
+        .pb_1()
+        .cursor_pointer()
+        .hover(|style| style.bg(colors.hover))
+        .on_click(move |_, _, cx| {
+            fold_state.update(cx, |s, cx| s.toggle_project(&fold_cwd, cx));
+        })
+        .child(Disclosure::new(("fold", ix as u64), !folded))
+        .child(Icon::new(mark).size(IconSize::Sm).color(colors.fg_subtle))
+        .child(div().flex_1().min_w_0().child(Label::new(shown)))
+        .when(folded, |this| {
+            this.child(Caption::new(sessions.to_string()))
+        })
+        // The row's own action, shown while hovered: a new session in this
+        // project. The archive fold starts no sessions.
+        .when(!archived, |this| {
+            this.child(
+                div()
+                    .id(("project-new", ix as u64))
+                    .flex_none()
+                    .invisible()
+                    .group_hover(group, |style| style.visible())
+                    .on_mouse_down(MouseButton::Left, |_, window, _| window.prevent_default())
+                    .on_click(move |_, _, cx| {
+                        cx.stop_propagation();
+                        let cwd = std::path::PathBuf::from(&new_cwd);
+                        new_state.update(cx, |s, cx| s.new_session_in(cwd, cx));
+                    })
+                    .child(
+                        Icon::new(IconName::SquarePen)
+                            .size(IconSize::Xs)
+                            .color(colors.fg_subtle),
+                    ),
+            )
+        })
+        .into_any_element()
+}
+
+/// One session row, wrapped in its right-click menu.
+#[allow(clippy::too_many_arguments)]
+fn session_row(
+    cx: &App,
+    ix: usize,
+    state: &Entity<AppState>,
+    view: &Entity<PidoApp>,
+    path: SharedString,
+    session_id: SharedString,
+    title: SharedString,
+    updated: Option<i64>,
+    pinned: bool,
+    archived: bool,
+    control_h: gpui::Rems,
+    radius_md: gpui::Rems,
+    text_sm: gpui::Rems,
+    text_xs: gpui::Rems,
+    label_lead: Pixels,
+) -> AnyElement {
+    let colors = cx.theme().colors.clone();
+    let active = state
+        .read(cx)
+        .session_file
+        .as_deref()
+        .is_some_and(|open| same_file(open, &path));
+    let age = i18n::relative_time(cx, updated);
+    let app = state.clone();
+    let click_path = path.clone();
+    let row = div()
+        .id(("session", ix as u64))
+        .role(gpui::Role::ListItem)
+        .aria_label(title.clone())
+        .aria_selected(active)
+        .w_full()
+        .flex()
+        .items_center()
+        .gap_1()
+        .h(control_h)
+        .pl(px(8.) + label_lead)
+        .pr_0p5()
+        .rounded(radius_md)
+        .text_size(text_sm)
+        .text_color(if active { colors.fg } else { colors.fg_muted })
+        .when(active, |row| row.bg(colors.active))
+        .when(!active, |row| {
+            row.cursor_pointer().hover(|style| style.bg(colors.hover))
+        })
+        .on_click(move |_, _, cx| {
+            app.update(cx, |s, cx| {
+                s.switch_session(std::path::PathBuf::from(click_path.to_string()), cx)
+            });
+        })
+        .child(div().flex_1().min_w_0().child(Ellipsis::new(title.clone())))
+        .when(pinned, |row| {
+            row.child(
+                Icon::new(IconName::Pin)
+                    .size(IconSize::Xs)
+                    .color(colors.fg_subtle),
+            )
+        })
+        .child(
+            div()
+                .flex_none()
+                .text_size(text_xs)
+                .text_color(colors.fg_subtle)
+                .child(age),
+        );
+
+    let menu = session_menu(
+        cx,
+        state,
+        view,
+        &path,
+        &title,
+        &session_id,
+        pinned,
+        archived,
+        active,
+    );
+    ContextMenu::new(("session-menu", ix as u64), menu)
+        .w_full()
+        .child(row)
+        .into_any_element()
+}
+
+/// The session's right-click menu. Chords are shown only on the open session,
+/// since they act on it.
+#[allow(clippy::too_many_arguments)]
+fn session_menu(
+    cx: &App,
+    state: &Entity<AppState>,
+    view: &Entity<PidoApp>,
+    path: &SharedString,
+    title: &SharedString,
+    session_id: &SharedString,
+    pinned: bool,
+    archived: bool,
+    active: bool,
+) -> Menu {
+    let mut pin = MenuItem::new(i18n::t(
+        cx,
+        if pinned {
+            "unpin_session"
+        } else {
+            "pin_session"
+        },
+    ))
+    .icon(if pinned {
+        IconName::PinOff
+    } else {
+        IconName::Pin
+    })
+    .on_click({
+        let state = state.clone();
+        let path = path.to_string();
+        move |_, cx| state.update(cx, |s, cx| s.toggle_pin(&path, cx))
+    });
+
+    let mut rename = MenuItem::new(i18n::t(cx, "rename_action"))
+        .icon(IconName::Pencil)
+        .on_click({
+            let view = view.clone();
+            let path = path.to_string();
+            let title = title.to_string();
+            move |window, cx| {
+                view.update(cx, |this, cx| {
+                    this.open_rename_at(path.clone(), title.clone(), window, cx)
+                });
+            }
+        });
+
+    let mut fork = MenuItem::new(i18n::t(cx, "fork_session"))
+        .icon(IconName::GitBranch)
+        .on_click({
+            let state = state.clone();
+            let path = path.to_string();
+            move |_, cx| state.update(cx, |s, cx| s.fork_session(&path, cx))
+        });
+
+    let copy = MenuItem::new(i18n::t(cx, "copy_session_id"))
+        .icon(IconName::Copy)
+        .on_click({
+            let state = state.clone();
+            let id = session_id.to_string();
+            move |_, cx| {
+                cx.write_to_clipboard(ClipboardItem::new_string(id.clone()));
+                state.update(cx, |s, cx| {
+                    s.push_notice(
+                        NoticeKind::Info,
+                        i18n::t(cx, "session_id_copied").to_string(),
+                    );
+                    cx.notify();
+                });
+            }
+        });
+
+    let reveal = MenuItem::new(i18n::t(cx, "reveal_in_folder"))
+        .icon(IconName::FolderOpen)
+        .on_click({
+            let path = path.to_string();
+            move |_, _| crate::state::reveal_in_folder(std::path::Path::new(&path))
+        });
+
+    let mut archive = MenuItem::new(i18n::t(
+        cx,
+        if archived {
+            "unarchive_session"
+        } else {
+            "archive_session"
+        },
+    ))
+    .icon(IconName::Archive)
+    .on_click({
+        let state = state.clone();
+        let path = path.to_string();
+        move |_, cx| state.update(cx, |s, cx| s.toggle_archive(&path, cx))
+    });
+
+    if active {
+        // These chords act on the open session; showing them on other rows
+        // would promise something the shortcut does not do.
+        pin = pin.keys("ctrl-alt-p");
+        rename = rename.keys("ctrl-alt-g");
+        fork = fork.keys("ctrl-alt-f");
+        archive = archive.keys("ctrl-shift-a");
+    }
+
+    Menu::new()
+        .item(pin)
+        .item(rename)
+        .item(fork)
+        .separator()
+        .item(copy)
+        .item(reveal)
+        .separator()
+        .item(archive)
 }
 
 /// Compare two session paths without caring about separator style; Windows
