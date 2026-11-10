@@ -51,13 +51,13 @@ pub struct Environment {
 /// A line in the transcript.
 #[derive(Debug, Clone)]
 pub enum TranscriptItem {
-    User { text: String },
+    User { text: gpui::SharedString },
     Assistant(Box<AssistantView>),
     Tool(ToolView),
     Notice { kind: NoticeKind, text: String },
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct AssistantView {
     /// Text blocks keyed by their streaming `contentIndex`. A message can hold
     /// several blocks around tool calls; a single buffer would let `text_end`
@@ -71,6 +71,22 @@ pub struct AssistantView {
     pub took: Option<Duration>,
     /// Provider error text for a failed assistant message, when any.
     pub error: Option<String>,
+    /// Finished messages keep their joined text and parsed blocks, so a
+    /// repaint does not re-join strings or re-parse Markdown.
+    /// Filled the first time a finished message is drawn: parsing at load
+    /// time would stall opening a long session on messages nobody looks at.
+    geometry_cache: std::cell::RefCell<Option<CachedMarkdown>>,
+    thinking_cache: std::cell::RefCell<Option<gpui::SharedString>>,
+}
+
+impl std::fmt::Debug for AssistantView {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AssistantView")
+            .field("blocks", &self.text_blocks.len())
+            .field("finished", &self.finished)
+            .field("live", &self.live_text.is_some())
+            .finish()
+    }
 }
 
 impl AssistantView {
@@ -84,6 +100,8 @@ impl AssistantView {
             started: Instant::now(),
             took: None,
             error: None,
+            geometry_cache: std::cell::RefCell::new(None),
+            thinking_cache: std::cell::RefCell::new(None),
         }
     }
 
@@ -108,13 +126,65 @@ impl AssistantView {
     }
 
     /// Rendered text, keeping blocks separated so two blocks never merge.
-    pub fn text(&self) -> String {
-        join_blocks(&self.text_blocks)
+    pub fn text(&self) -> gpui::SharedString {
+        let cached = self.geometry_cache.borrow().clone();
+        match cached {
+            Some(cached) => cached.text,
+            None => join_blocks(&self.text_blocks).into(),
+        }
     }
 
-    pub fn thinking(&self) -> String {
-        join_blocks(&self.thinking_blocks)
+    /// The message's text and parsed blocks, computed on first use and kept.
+    ///
+    /// `None` while the message is still streaming: those redraw from the
+    /// source, which is unavoidable for live text.
+    pub fn cached(&self) -> Option<CachedMarkdown> {
+        if !self.finished || self.live_text.is_some() {
+            return None;
+        }
+        let mut cache = self.geometry_cache.borrow_mut();
+        if cache.is_none() {
+            let text: gpui::SharedString = join_blocks(&self.text_blocks).into();
+            *cache = Some(CachedMarkdown {
+                blocks: parse_markdown(&text),
+                text,
+            });
+        }
+        cache.clone()
     }
+
+    pub fn thinking(&self) -> gpui::SharedString {
+        let cached = self.thinking_cache.borrow().clone();
+        match cached {
+            Some(text) => text,
+            None => {
+                let text: gpui::SharedString = join_blocks(&self.thinking_blocks).into();
+                *self.thinking_cache.borrow_mut() = Some(text.clone());
+                text
+            }
+        }
+    }
+}
+
+/// A finished message's text and its parsed blocks.
+#[derive(Clone)]
+pub struct CachedMarkdown {
+    pub text: gpui::SharedString,
+    pub blocks: std::rc::Rc<[ely_gpui_component::documents::MarkdownBlock]>,
+}
+
+/// Parse Markdown once into the blocks the renderer draws.
+pub fn parse_markdown(source: &str) -> std::rc::Rc<[ely_gpui_component::documents::MarkdownBlock]> {
+    use ely_gpui_component::documents::{MarkdownReader, markdown_tree, mdast};
+    let root = markdown_tree(source);
+    let reader = MarkdownReader::joined(source, &root);
+    let mut blocks = Vec::new();
+    if let mdast::Node::Root(parent) = &root {
+        for child in &parent.children {
+            reader.block(child, &mut blocks);
+        }
+    }
+    std::rc::Rc::from(blocks.as_slice())
 }
 
 fn join_blocks(blocks: &BTreeMap<u32, String>) -> String {
@@ -131,10 +201,10 @@ pub struct ToolView {
     pub call_id: String,
     pub name: String,
     /// Pretty-printed arguments, when known.
-    pub args: Option<String>,
+    pub args: Option<gpui::SharedString>,
     pub running: bool,
     pub failed: bool,
-    pub result: Option<String>,
+    pub result: Option<gpui::SharedString>,
     pub started: Instant,
     pub took: Option<Duration>,
 }
@@ -804,8 +874,9 @@ impl AppState {
         if steering {
             self.pending_steers.push(text.clone());
         }
-        self.transcript
-            .push(TranscriptItem::User { text: text.clone() });
+        self.transcript.push(TranscriptItem::User {
+            text: text.clone().into(),
+        });
         cx.notify();
 
         let label = if steering { "steer" } else { "prompt" };
@@ -1435,7 +1506,7 @@ impl AppState {
                     && let Some(partial) = partial_result
                 {
                     // Updates carry accumulated output; replace.
-                    card.result = Some(truncate_for_display(&partial.text(), 2000));
+                    card.result = Some(truncate_for_display(&partial.text(), 2000).into());
                 }
             }
             Event::ToolExecutionEnd {
@@ -1449,7 +1520,7 @@ impl AppState {
                     card.failed = is_error;
                     card.took = Some(card.started.elapsed());
                     if let Some(result) = result {
-                        card.result = Some(truncate_for_display(&result.text(), 2000));
+                        card.result = Some(truncate_for_display(&result.text(), 2000).into());
                     }
                 }
             }
@@ -1615,7 +1686,7 @@ impl AppState {
                 _ => unreachable!("position() matched a Tool"),
             };
             if card.args.is_none() {
-                card.args = args.map(pretty_json);
+                card.args = args.map(|value| pretty_json(value).into());
             }
             return card;
         }
@@ -1630,7 +1701,7 @@ impl AppState {
             TranscriptItem::Tool(ToolView {
                 call_id: call_id.clone(),
                 name,
-                args: args.map(pretty_json),
+                args: args.map(|value| pretty_json(value).into()),
                 running: false,
                 failed: false,
                 result: None,
@@ -1672,7 +1743,8 @@ impl AppState {
                 AgentMessage::User(user) => {
                     let text = user.text();
                     if !text.is_empty() {
-                        self.transcript.push(TranscriptItem::User { text });
+                        self.transcript
+                            .push(TranscriptItem::User { text: text.into() });
                     }
                 }
                 AgentMessage::Assistant(assistant) => {
@@ -1697,7 +1769,7 @@ impl AppState {
                     if let Some(card) = self.tool_card_mut(&result.tool_call_id) {
                         card.running = false;
                         card.failed = result.is_error;
-                        card.result = Some(truncate_for_display(&text, 2000));
+                        card.result = Some(truncate_for_display(&text, 2000).into());
                     } else {
                         self.transcript.push(TranscriptItem::Tool(ToolView {
                             call_id: result.tool_call_id.clone(),
@@ -1705,7 +1777,7 @@ impl AppState {
                             args: None,
                             running: false,
                             failed: result.is_error,
-                            result: Some(truncate_for_display(&text, 2000)),
+                            result: Some(truncate_for_display(&text, 2000).into()),
                             started: Instant::now(),
                             took: None,
                         }));

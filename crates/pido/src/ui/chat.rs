@@ -173,11 +173,22 @@ fn render_item(item: &TranscriptItem, ix: usize, cx: &App) -> AnyElement {
                 ));
             }
             if !text.is_empty() || view.live_text.is_some() {
-                bubble = bubble.child(ely_gpui_component::chat::StreamingMarkdown::new(
-                    ("text", ix),
-                    text,
-                    view.live_text.is_some() && !view.finished,
-                ));
+                // A finished message draws from blocks parsed once; a live one
+                // streams, which has to re-read its source each frame.
+                let cached = view.cached();
+                bubble = bubble.child(match cached {
+                    Some(cached) => ely_gpui_component::documents::MarkdownRenderer::blocks(
+                        ("text", ix),
+                        cached.blocks.clone(),
+                    )
+                    .into_any_element(),
+                    None => ely_gpui_component::chat::StreamingMarkdown::new(
+                        ("text", ix),
+                        text,
+                        view.live_text.is_some() && !view.finished,
+                    )
+                    .into_any_element(),
+                });
             }
             if let Some(error) = &view.error {
                 bubble = bubble.child(

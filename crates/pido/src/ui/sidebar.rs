@@ -86,8 +86,8 @@ pub fn render(state: &Entity<AppState>, cx: &App) -> impl IntoElement + use<> {
                         crate::brand::wordmark(theme.is_dark(), 1),
                     )
                     .fit(gpui::ObjectFit::Contain)
-                    .w(px(96.))
-                    .h(px(45.)),
+                    .w(px(72.))
+                    .h(px(34.)),
                 )
                 .child(
                     Button::new("new-chat", i18n::t(cx, "new_chat"))
