@@ -33,6 +33,36 @@ fn main() -> anyhow::Result<()> {
         anyhow::bail!("get_state failed: {:?}", response.error);
     }
 
+    if let Ok(session_path) = std::env::var("PI_SMOKE_SESSION") {
+        println!("-- switch_session: {session_path} --");
+        let switched = client.request(Command::SwitchSession {
+            session_path: session_path.clone(),
+        })?;
+        anyhow::ensure!(
+            switched.success,
+            "switch_session failed: {:?}",
+            switched.error
+        );
+        let entries = client.request(Command::GetEntries { since: None })?;
+        anyhow::ensure!(entries.success, "get_entries failed: {:?}", entries.error);
+        let payload = entries
+            .data_as::<pi_rpc::protocol::SessionEntries>()?
+            .expect("entries payload present");
+        println!(
+            "restored {} entries, leafId {:?}",
+            payload.entries.len(),
+            payload.leaf_id
+        );
+        for entry in payload.entries.iter().take(3) {
+            println!(
+                "  entry {} type={} role={:?}",
+                entry.id,
+                entry.entry_type,
+                entry.message.as_ref().map(|m| m.role_name())
+            );
+        }
+    }
+
     if let Ok(prompt) = std::env::var("PI_SMOKE_PROMPT") {
         println!("-- prompt: {prompt} --");
         let response = client.request(Command::Prompt {

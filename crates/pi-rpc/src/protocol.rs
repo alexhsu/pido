@@ -545,17 +545,49 @@ pub enum AgentMessage {
     Assistant(AssistantMessage),
     ToolResult(ToolResultMessage),
     BashExecution(BashExecutionMessage),
+    /// A system-prompt snapshot (preamble/tools sections). Sessions record
+    /// one; the UI skips it, but it must parse or the whole history fails.
+    System(SystemMessage),
+    /// A role this crate does not know. Forward compatibility: an unknown
+    /// role in restored history must not fail the entire entries payload.
+    #[serde(other)]
+    Unknown,
 }
 
 impl AgentMessage {
+    /// The wire name of this message's role, for diagnostics.
+    pub fn role_name(&self) -> &'static str {
+        match self {
+            AgentMessage::User(_) => "user",
+            AgentMessage::Assistant(_) => "assistant",
+            AgentMessage::ToolResult(_) => "toolResult",
+            AgentMessage::BashExecution(_) => "bashExecution",
+            AgentMessage::System(_) => "system",
+            AgentMessage::Unknown => "unknown",
+        }
+    }
+
     pub fn timestamp(&self) -> Option<f64> {
         match self {
             AgentMessage::User(m) => Some(m.timestamp),
             AgentMessage::Assistant(m) => Some(m.timestamp),
             AgentMessage::ToolResult(m) => Some(m.timestamp),
             AgentMessage::BashExecution(m) => Some(m.timestamp),
+            AgentMessage::System(m) => Some(m.timestamp),
+            AgentMessage::Unknown => None,
         }
     }
+}
+
+/// `role: "system"` message: the prompt snapshot pi stores per session.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SystemMessage {
+    pub content: UserContent,
+    /// Preamble/tools sections; kept opaque.
+    #[serde(default)]
+    pub sections: Option<Value>,
+    #[serde(default)]
+    pub timestamp: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1258,5 +1290,39 @@ mod tests {
         assert_eq!(stats.total_messages, 22);
         assert_eq!(stats.tokens.as_ref().unwrap().total_tokens, Some(60000));
         assert_eq!(stats.context_usage.as_ref().unwrap().percent, Some(30.0));
+    }
+
+    #[test]
+    fn agent_message_handles_system_and_unknown_roles() {
+        // Real sessions store a system-prompt snapshot per session; failing
+        // to parse it once broke loading the whole history (user report).
+        let message: AgentMessage = serde_json::from_str(
+            r#"{"role":"system","content":"","sections":{"preamble":"You are..."},"timestamp":1}"#,
+        )
+        .unwrap();
+        assert!(matches!(message, AgentMessage::System(_)));
+
+        // Forward compatibility: a role this crate has never heard of must
+        // not fail the surrounding payload.
+        let message: AgentMessage =
+            serde_json::from_str(r#"{"role":"brandNew","content":"hi"}"#).unwrap();
+        assert!(matches!(message, AgentMessage::Unknown));
+    }
+
+    #[test]
+    fn entries_with_system_message_parse() {
+        let payload: SessionEntries = serde_json::from_str(
+            r#"{"entries":[
+                {"type":"message","id":"a","parentId":null,"timestamp":"...","message":{"role":"system","content":"","sections":{"preamble":"p"}}},
+                {"type":"message","id":"b","parentId":"a","timestamp":"...","message":{"role":"user","content":"hi"}},
+                {"type":"custom","id":"c","parentId":"b"}
+            ],"leafId":"b"}"#,
+        )
+        .unwrap();
+        assert_eq!(payload.entries.len(), 3);
+        assert!(matches!(
+            payload.entries[0].message,
+            Some(AgentMessage::System(_))
+        ));
     }
 }

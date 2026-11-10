@@ -976,6 +976,9 @@ impl AppState {
                         text: format!("$ {}", bash.command),
                     });
                 }
+                // The system-prompt snapshot and unknown roles are internal
+                // bookkeeping: restored, but not part of the conversation.
+                AgentMessage::System(_) | AgentMessage::Unknown => {}
             }
         }
     }
