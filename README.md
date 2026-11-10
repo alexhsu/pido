@@ -38,8 +38,11 @@ cargo run --release -p pido
 需要 wayland/x11 开发库(见 CI 中的依赖列表),例如 Ubuntu:
 
 ```bash
-sudo apt install libwayland-dev libxkbcommon-dev libxcb1-dev libxrandr-dev libxi-dev libxinerama-dev libxcursor-dev libegl1-mesa-dev
+sudo apt install libwayland-dev libxkbcommon-dev libxkbcommon-x11-dev libxcb1-dev \
+  libxrandr-dev libxi-dev libxinerama-dev libxcursor-dev libegl1-mesa-dev libfontconfig1-dev
 ```
+
+（较新的 Debian/Ubuntu 上 fontconfig 的开发包可能叫 `libfontconfig-dev`。）
 
 ### 自动连接(测试用) / Autoconnect (for testing)
 

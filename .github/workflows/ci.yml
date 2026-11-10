@@ -23,7 +23,14 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libwayland-dev libxkbcommon-dev libxcb1-dev libxrandr-dev libxi-dev libxinerama-dev libxcursor-dev libegl1-mesa-dev
+          sudo apt-get install -y libwayland-dev libxkbcommon-dev libxkbcommon-x11-dev \
+            libxcb1-dev libxrandr-dev libxi-dev libxinerama-dev libxcursor-dev libegl1-mesa-dev
+          # cosmic-text's fontconfig probe needs the dev package; its name
+          # differs between Ubuntu and Debian releases.
+          for pkg in libfontconfig1-dev libfontconfig-dev; do
+            sudo apt-get install -y "$pkg" && break
+          done
+          pkg-config --exists fontconfig && echo "fontconfig.pc found"
 
       - uses: dtolnay/rust-toolchain@stable
         with:
