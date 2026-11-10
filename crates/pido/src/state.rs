@@ -455,32 +455,60 @@ impl AppState {
     /// Stage an image for the next prompt. Returns false when the bytes are
     /// not a format pi accepts or the file is unreasonably large.
     pub fn stage_image(&mut self, name: Option<String>, bytes: Vec<u8>) -> bool {
-        const MAX_BYTES: usize = 10 * 1024 * 1024;
         let Some((mime, ext)) = sniff_image(&bytes) else {
             self.push_notice(NoticeKind::Error, "unsupported image format".into());
             return false;
         };
-        if bytes.len() > MAX_BYTES {
+        if bytes.len() > MAX_IMAGE_BYTES {
             self.push_notice(
                 NoticeKind::Error,
-                format!("image too large ({} MB > 10 MB)", bytes.len() / 1024 / 1024),
+                format!(
+                    "image too large ({} MB > {} MB)",
+                    bytes.len() / 1024 / 1024,
+                    MAX_IMAGE_BYTES / 1024 / 1024
+                ),
             );
             return false;
         }
         let key = format!("img-{}", self.next_image_key);
         self.next_image_key += 1;
         let name = name.unwrap_or_else(|| format!("{key}.{ext}"));
+
+        // The bytes go to a temp file so the chip can show a real thumbnail;
+        // providers cap images well below this anyway.
+        let preview = preview_dir().join(format!("{key}.{ext}"));
+        if std::fs::create_dir_all(preview.parent().unwrap_or(std::path::Path::new("."))).is_ok()
+            && let Err(error) = std::fs::write(&preview, &bytes)
+        {
+            log::warn!("attachment preview write failed: {error}");
+        }
+
         self.pending_images.push(PendingImage {
-            key,
+            key: key.clone(),
             name,
             mime: mime.into(),
             data: bytes,
+            preview,
         });
         true
     }
 
     pub fn remove_image(&mut self, key: &str) {
-        self.pending_images.retain(|image| image.key != key);
+        if let Some(index) = self
+            .pending_images
+            .iter()
+            .position(|image| image.key == key)
+        {
+            let removed = self.pending_images.remove(index);
+            let _ = std::fs::remove_file(&removed.preview);
+        }
+    }
+
+    /// Drop every staged image and its preview files.
+    pub fn clear_images(&mut self) {
+        for image in self.pending_images.drain(..) {
+            let _ = std::fs::remove_file(&image.preview);
+        }
     }
 
     /// Fetch the `/` command list pi offers (extensions, templates, skills).
@@ -693,7 +721,7 @@ impl AppState {
             }
         };
         // The staged images leave with the message, whatever its fate.
-        self.pending_images.clear();
+        self.clear_images();
         if steering {
             self.pending_steers.push(text.clone());
         }
@@ -1963,6 +1991,14 @@ mod tests {
     }
 }
 
+/// The largest image one message may carry, per attachment.
+pub const MAX_IMAGE_BYTES: usize = 50 * 1024 * 1024;
+
+/// Where staged images' thumbnails live.
+fn preview_dir() -> PathBuf {
+    std::env::temp_dir().join("pido-previews")
+}
+
 /// An image staged for the next message: raw bytes plus the mime pi needs.
 #[derive(Debug, Clone)]
 pub struct PendingImage {
@@ -1970,6 +2006,8 @@ pub struct PendingImage {
     pub name: String,
     pub mime: String,
     pub data: Vec<u8>,
+    /// The staged bytes written to a temp file, for the chip's thumbnail.
+    pub preview: PathBuf,
 }
 
 /// Sniff an image's format from its magic bytes: `(mime, extension)`.
@@ -2019,6 +2057,7 @@ pub fn stage_image_files(state: &Entity<AppState>, paths: &[std::path::PathBuf],
 
 #[cfg(test)]
 mod image_tests {
+    use super::MAX_IMAGE_BYTES;
     use super::tests::empty_state;
 
     #[test]
@@ -2029,6 +2068,8 @@ mod image_tests {
         assert_eq!(state.pending_images.len(), 1);
         assert_eq!(state.pending_images[0].mime, "image/png");
         assert_eq!(state.pending_images[0].name, "img-1.png");
+        // A thumbnail file is staged beside the bytes for the chip.
+        assert!(state.pending_images[0].preview.is_file());
 
         assert!(state.stage_image(Some("photo.jpg".into()), vec![0xff, 0xd8, 0xff, 0xaa]));
         assert_eq!(state.pending_images[1].mime, "image/jpeg");
@@ -2036,9 +2077,11 @@ mod image_tests {
         assert!(!state.stage_image(None, b"just text".to_vec()));
         assert_eq!(state.pending_images.len(), 2, "junk must not stage");
 
+        let removed_preview = state.pending_images[0].preview.clone();
         state.remove_image("img-1");
         assert_eq!(state.pending_images.len(), 1);
         assert_eq!(state.pending_images[0].name, "photo.jpg");
+        assert!(!removed_preview.is_file(), "preview file cleaned up");
     }
 
     #[test]
@@ -2046,7 +2089,7 @@ mod image_tests {
         let mut state = empty_state();
         let big = vec![0x89u8, b'P', b'N', b'G', 0, 0, 0, 0]
             .into_iter()
-            .chain(std::iter::repeat_n(0u8, 11 * 1024 * 1024))
+            .chain(std::iter::repeat_n(0u8, MAX_IMAGE_BYTES + 1))
             .collect::<Vec<_>>();
         assert!(!state.stage_image(None, big));
         assert!(state.pending_images.is_empty());

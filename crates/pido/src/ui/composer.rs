@@ -93,7 +93,7 @@ pub fn render(state: &Entity<AppState>, app: &mut PidoApp, cx: &App) -> impl Int
             key: image.key.clone().into(),
             name: image.name.clone().into(),
             bytes: image.data.len() as u64,
-            preview: None,
+            preview: Some(image.preview.to_string_lossy().into_owned().into()),
             progress: None,
         };
         let remove_state = state.clone();
