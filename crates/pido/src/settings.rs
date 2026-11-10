@@ -20,6 +20,8 @@ pub struct Settings {
     /// The session file of the last active session; the app resumes it on
     /// startup instead of starting a fresh empty one.
     pub last_session: Option<String>,
+    /// The sidebar's width in logical pixels, as last dragged.
+    pub sidebar_width: Option<f32>,
     pub window: Option<WindowState>,
 }
 

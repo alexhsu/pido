@@ -42,7 +42,8 @@ pub fn render(state: &Entity<AppState>, window: &Window, cx: &App) -> impl IntoE
     let empty = s.sidebar_rows.is_empty();
 
     div()
-        .w(px(264.))
+        // Width comes from the split pane the sidebar sits in.
+        .w_full()
         .h_full()
         .min_h_0()
         .flex()

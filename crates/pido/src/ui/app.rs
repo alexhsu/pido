@@ -1,8 +1,9 @@
 //! The root view: Ely's FocusScope wrapping a sidebar and the session pane.
 
 use ely_gpui_component::forms::{InputEvent, TextInput};
+use ely_gpui_component::layout::SplitPane;
 use ely_gpui_component::primitives::FocusScope;
-use ely_gpui_component::theme::{ActiveTheme, Mode, Theme};
+use ely_gpui_component::theme::{ActiveTheme, ContainerSize, Mode, Theme};
 use gpui::{
     App, AppContext, Context, FocusHandle, InteractiveElement, IntoElement, ParentElement, Render,
     Styled, Window, actions, div,
@@ -17,6 +18,9 @@ actions!(pido, [Stop]);
 pub const HEADER_HEIGHT: f32 = 52.;
 
 pub struct PidoApp {
+    /// Sidebar share of the window, seeded once from settings so a drag stays
+    /// put across frames (SplitPane replaces its state when the seed changes).
+    split_seed: Vec<f32>,
     pub focus: FocusHandle,
     pub state: gpui::Entity<AppState>,
     /// The composer's multi-line field, owned here so it survives re-renders.
@@ -52,7 +56,14 @@ impl PidoApp {
             cx.notify();
         })
         .detach();
+        let sidebar = crate::settings::Settings::load()
+            .sidebar_width
+            .unwrap_or(264.0)
+            .clamp(200.0, 480.0);
+        let window_width = 1280.0;
+        let share = (sidebar / window_width).clamp(0.1, 0.5);
         let app = Self {
+            split_seed: vec![share, 1.0 - share],
             focus,
             state,
             draft: None,
@@ -131,6 +142,7 @@ impl Render for PidoApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
         let (bg, fg) = (theme.colors.bg, theme.colors.fg);
+        let column = theme.container_width(ContainerSize::Md);
         let bounds = window.bounds();
         self.window_size = Some((f32::from(bounds.size.width), f32::from(bounds.size.height)));
         let state = self.state.clone();
@@ -163,12 +175,23 @@ impl Render for PidoApp {
                         .child(chat::render_transcript(&state, cx)),
                 )
                 .child(
+                    // The composer sits in the same centered column as the
+                    // transcript, so the field lines up with the messages.
                     div()
                         .flex_none()
+                        .w_full()
+                        .flex()
+                        .justify_center()
                         .px_4()
                         .pt_2()
                         .pb_2()
-                        .child(composer::render(&state, self, cx)),
+                        .child(
+                            div()
+                                .w_full()
+                                .max_w(column)
+                                .min_w_0()
+                                .child(composer::render(&state, self, cx)),
+                        ),
                 )
                 .into_any_element()
         } else {
@@ -203,8 +226,23 @@ impl Render for PidoApp {
                     .flex_row()
                     .bg(bg)
                     .text_color(fg)
-                    .child(sidebar::render(&state, window, cx))
-                    .child(main)
+                    .child(
+                        SplitPane::new("shell", gpui::Axis::Horizontal, gpui::px(200.))
+                            .sizes(&self.split_seed)
+                            .pane(sidebar::render(&state, window, cx))
+                            .pane(main)
+                            .on_resize({
+                                let width = f32::from(window.bounds().size.width);
+                                move |shares, _, _| {
+                                    // Shares are fractions of the window; the
+                                    // sidebar's own width is what to keep.
+                                    let sidebar = shares[0] * width;
+                                    crate::settings::save_setting(|s| {
+                                        s.sidebar_width = Some(sidebar);
+                                    });
+                                }
+                            }),
+                    )
                     .children(overlay)
                     // Esc stops a running agent (clear queue + abort, the
                     // protocol's recommended Esc semantics). TextInput does not
