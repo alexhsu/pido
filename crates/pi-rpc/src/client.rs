@@ -142,15 +142,38 @@ struct Inner {
     /// Fan-out of everything except responses matched to a pending request.
     subscribers: Mutex<Vec<Sender<ClientEvent>>>,
     shutdown: Mutex<bool>,
+    /// How many `PiClient` handles are alive. The I/O threads hold bare
+    /// `Arc<Inner>` clones that do not count: only the last *handle* drop
+    /// may close Pi's stdin.
+    handle_count: AtomicU64,
 }
 
 /// Handle to a running Pi RPC process.
 ///
 /// The handle is cheap to clone; dropping the last clone initiates a graceful
-/// shutdown (Pi exits when its stdin closes).
-#[derive(Clone)]
+/// shutdown (Pi exits when its stdin closes). Dropping any earlier clone does
+/// nothing — the process keeps serving the remaining handles.
 pub struct PiClient {
     inner: Arc<Inner>,
+}
+
+impl Clone for PiClient {
+    fn clone(&self) -> Self {
+        self.inner.handle_count.fetch_add(1, Ordering::Relaxed);
+        Self {
+            inner: Arc::clone(&self.inner),
+        }
+    }
+}
+
+impl Drop for PiClient {
+    fn drop(&mut self) {
+        // Every handle's Drop runs, not just the last one's; only the final
+        // handle may shut Pi down. (Rust's Drop is not last-Arc-aware.)
+        if self.inner.handle_count.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.shutdown();
+        }
+    }
 }
 
 impl PiClient {
@@ -193,6 +216,7 @@ impl PiClient {
             pending: Mutex::new(HashMap::new()),
             subscribers: Mutex::new(Vec::new()),
             shutdown: Mutex::new(false),
+            handle_count: AtomicU64::new(1),
         });
 
         // Reader thread: drains stdout continuously (backpressure would stall
@@ -287,7 +311,12 @@ impl PiClient {
                             None => None,
                         }
                     };
-                    let reason = if *inner.shutdown.lock().unwrap() {
+                    let shutting_down = *inner.shutdown.lock().unwrap();
+                    log::info!(
+                        "pi-rpc: reaper fired, exit code {code:?}, shutdown flag {shutting_down}, strong refs {}",
+                        Arc::strong_count(&inner)
+                    );
+                    let reason = if shutting_down {
                         DisconnectReason::ClosedByClient
                     } else {
                         DisconnectReason::Exited { code }
@@ -376,6 +405,10 @@ impl PiClient {
         if *shutdown {
             return;
         }
+        log::info!(
+            "pi-rpc: shutdown initiated (strong refs {}), closing stdin",
+            Arc::strong_count(&self.inner)
+        );
         *shutdown = true;
         // Dropping the stdin handle closes the pipe.
         *self.inner.stdin.lock().unwrap() = None;
@@ -384,13 +417,6 @@ impl PiClient {
     /// Whether shutdown has been initiated.
     pub fn is_shut_down(&self) -> bool {
         *self.inner.shutdown.lock().unwrap()
-    }
-}
-
-impl Drop for PiClient {
-    fn drop(&mut self) {
-        // Arc>1 while other clones live; only the last one triggers this.
-        self.shutdown();
     }
 }
 

@@ -218,6 +218,7 @@ impl AppState {
         cx.notify();
 
         let config = PiProcessConfig::new(&cwd);
+        log::info!("state: connecting in {}", config.cwd.display());
         cx.spawn(async move |this, cx| {
             let spawned = cx
                 .background_executor()
@@ -225,6 +226,7 @@ impl AppState {
                 .await;
             match spawned {
                 Ok(client) => {
+                    log::info!("state: pi spawned, running init requests");
                     let init_client = client.clone();
                     let init = cx
                         .background_executor()
@@ -235,9 +237,14 @@ impl AppState {
                             (state, models, levels)
                         })
                         .await;
+                    let (state, models, levels) = init;
+                    log::info!(
+                        "state: init done, get_state ok={}",
+                        state.as_ref().map(|r| r.success).unwrap_or(false)
+                    );
                     this.update(cx, |s, cx| {
-                        let (state, models, levels) = init;
                         let failed = state.as_ref().err().map(|e| e.to_string());
+                        log::info!("state: applying connect result, failed={failed:?}");
                         s.client = Some(client.clone());
                         match failed {
                             Some(error) => {
@@ -603,6 +610,10 @@ impl AppState {
         match event {
             ClientEvent::Record(record) => self.on_record(record, cx),
             ClientEvent::Disconnected(reason) => {
+                log::warn!(
+                    "state: client disconnected ({reason:?}), conn was {:?}",
+                    self.conn
+                );
                 if self.conn == Conn::Live {
                     self.conn = Conn::Dead(format!("{reason:?}"));
                     self.streaming = false;

@@ -162,3 +162,49 @@ fn spawn_fails_for_missing_cwd() {
     config.pi_path = Some(mock_pi_path());
     assert!(PiClient::spawn(&config).is_err());
 }
+
+/// Regression: dropping a *clone* must not close Pi's stdin. The app's
+/// connect flow clones the client for its init requests and drops that clone
+/// when they finish; a premature shutdown there killed every session with
+/// `ClosedByClient` right after startup.
+#[test]
+fn dropping_a_clone_keeps_the_process_alive() {
+    let client = spawn_mock();
+    let subscriber = client.subscribe();
+
+    // Clone, use, and drop — exactly what the init sequence does.
+    {
+        let temp = client.clone();
+        let response = temp.request(Command::GetState).expect("request via clone");
+        assert!(response.success);
+    }
+
+    // The original must still work...
+    let response = client
+        .request(Command::GetState)
+        .expect("original client died after clone drop");
+    assert!(response.success);
+
+    // ...and no disconnect may have been reported.
+    while let Ok(event) = subscriber.try_recv() {
+        match event {
+            ClientEvent::Disconnected(reason) => {
+                panic!("dropping a clone disconnected pi: {reason:?}")
+            }
+            ClientEvent::Record(_) => {}
+        }
+    }
+
+    // Dropping the last handle does disconnect, gracefully.
+    client.shutdown();
+    loop {
+        match subscriber.recv_timeout(Duration::from_secs(10)) {
+            Ok(ClientEvent::Disconnected(reason)) => {
+                assert_eq!(reason, DisconnectReason::ClosedByClient);
+                return;
+            }
+            Ok(_) => continue,
+            Err(_) => panic!("timed out waiting for disconnect"),
+        }
+    }
+}
