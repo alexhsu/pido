@@ -13,7 +13,7 @@ use ely_gpui_component::theme::{ActiveTheme, ControlSize, IconSize, Radius, Text
 use ely_gpui_component::typography::{Caption, Ellipsis, Label};
 use gpui::{
     App, Entity, InteractiveElement, IntoElement, MouseButton, ParentElement, SharedString,
-    StatefulInteractiveElement, Styled, div, prelude::FluentBuilder, px,
+    StatefulInteractiveElement, Styled, Window, div, prelude::FluentBuilder, px,
 };
 
 use crate::i18n;
@@ -21,7 +21,7 @@ use crate::state::{AppState, Conn, SidebarRow};
 
 /// Render the whole sidebar. Session clicks switch the running pi process to
 /// that session file.
-pub fn render(state: &Entity<AppState>, cx: &App) -> impl IntoElement + use<> {
+pub fn render(state: &Entity<AppState>, window: &Window, cx: &App) -> impl IntoElement + use<> {
     let theme = cx.theme();
     let colors = theme.colors.clone();
     let (control_h, radius_md, text_sm, text_xs) = (
@@ -30,6 +30,12 @@ pub fn render(state: &Entity<AppState>, cx: &App) -> impl IntoElement + use<> {
         theme.text_size(TextSize::Sm),
         theme.text_size(TextSize::Xs),
     );
+    // Sessions indent to where a project's label starts: past the
+    // disclosure and the folder mark that sit in front of it.
+    // gap_1p5 is 0.375rem at the theme's base size.
+    let gap = gpui::Rems(0.375);
+    let label_lead = (theme.icon_size(IconSize::Xs) + gap + theme.icon_size(IconSize::Sm) + gap)
+        .to_pixels(window.rem_size());
     let app = state.clone();
     let s = state.read(cx);
     let can_start = s.conn == Conn::Live && !s.streaming;
@@ -190,7 +196,7 @@ pub fn render(state: &Entity<AppState>, cx: &App) -> impl IntoElement + use<> {
                                             .items_center()
                                             .gap_1()
                                             .h(control_h)
-                                            .pl_2()
+                                            .pl(px(8.) + label_lead)
                                             .pr_0p5()
                                             .rounded(radius_md)
                                             .text_size(text_sm)

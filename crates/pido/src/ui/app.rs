@@ -203,7 +203,7 @@ impl Render for PidoApp {
                     .flex_row()
                     .bg(bg)
                     .text_color(fg)
-                    .child(sidebar::render(&state, cx))
+                    .child(sidebar::render(&state, window, cx))
                     .child(main)
                     .children(overlay)
                     // Esc stops a running agent (clear queue + abort, the
