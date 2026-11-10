@@ -2,14 +2,17 @@
 
 use ely_gpui_component::chat::PromptInput;
 use ely_gpui_component::typography::Caption;
-use gpui::{App, IntoElement, ParentElement, Styled, div, px};
+use gpui::{App, IntoElement, ParentElement, Styled, div};
 
 use crate::i18n;
 use crate::state::AppState;
 use crate::ui::app::PidoApp;
 
-/// Render the composer row. While the agent runs, the send button becomes a
-/// stop button and Enter sends a steering message instead of a new prompt.
+/// Render the composer. While the agent runs, the send button becomes a stop
+/// button and Enter sends a steering message instead of a new prompt.
+///
+/// Spacing and the centered column width come from Ely's `ChatContainer`,
+/// which wraps this composer.
 pub fn render(state: &gpui::Entity<AppState>, app: &mut PidoApp, cx: &App) -> impl IntoElement {
     let streaming = state.read(cx).streaming;
     let hint = if streaming {
@@ -39,12 +42,9 @@ pub fn render(state: &gpui::Entity<AppState>, app: &mut PidoApp, cx: &App) -> im
     };
 
     div()
-        .px_4()
-        .pb_3()
         .flex()
         .flex_col()
         .gap_2()
-        .max_w(px(860.))
         .child(input)
         .child(div().flex().justify_end().child(Caption::new(hint)))
         .into_any_element()

@@ -618,6 +618,26 @@ impl AppState {
                     self.conn = Conn::Dead(format!("{reason:?}"));
                     self.streaming = false;
                 }
+                // No AgentSettled will ever arrive: freeze any half-streamed
+                // view so its timer and live indicators stop.
+                self.finalize_open_views();
+            }
+        }
+    }
+
+    /// Mark every unfinished assistant view as finished and freeze its
+    /// thinking duration. Called on settle and on disconnect.
+    fn finalize_open_views(&mut self) {
+        for item in &mut self.transcript {
+            if let TranscriptItem::Assistant(view) = item
+                && !view.finished
+            {
+                view.finished = true;
+                view.text_live = false;
+                view.thinking_live = false;
+                if view.took.is_none() {
+                    view.took = Some(view.started.elapsed());
+                }
             }
         }
     }
@@ -665,16 +685,7 @@ impl AppState {
             Event::AgentSettled { aborted } => {
                 self.streaming = false;
                 // Any assistant view still live is finished now.
-                for item in &mut self.transcript {
-                    if let TranscriptItem::Assistant(view) = item
-                        && !view.finished
-                    {
-                        view.finished = true;
-                        view.text_live = false;
-                        view.thinking_live = false;
-                        view.took = Some(view.started.elapsed());
-                    }
-                }
+                self.finalize_open_views();
                 if aborted {
                     self.push_notice(NoticeKind::Warn, i18n::t(cx, "disconnected").to_string());
                 }
@@ -702,7 +713,9 @@ impl AppState {
                         .find(|item| matches!(item, TranscriptItem::Assistant(v) if !v.finished))
                     {
                         Some(TranscriptItem::Assistant(existing)) => {
-                            let took = Some(existing.started.elapsed());
+                            // Keep a duration already frozen at ThinkingEnd;
+                            // otherwise measure from the view's start.
+                            let took = existing.took.or_else(|| Some(existing.started.elapsed()));
                             **existing = view;
                             existing.took = took;
                         }
@@ -810,7 +823,14 @@ impl AppState {
             }
             AssistantMessageEvent::ThinkingStart { .. } => view.thinking_live = true,
             AssistantMessageEvent::ThinkingDelta { delta, .. } => view.thinking.push_str(&delta),
-            AssistantMessageEvent::ThinkingEnd { .. } => view.thinking_live = false,
+            AssistantMessageEvent::ThinkingEnd { .. } => {
+                view.thinking_live = false;
+                // Freeze the thinking duration here: the header switches from
+                // the live indicator to a static value at exactly this point.
+                if view.took.is_none() {
+                    view.took = Some(view.started.elapsed());
+                }
+            }
             AssistantMessageEvent::ToolCallStart {
                 id,
                 tool_name,

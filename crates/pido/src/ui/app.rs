@@ -87,14 +87,21 @@ impl Render for PidoApp {
         let live = state.read(cx).conn == Conn::Live;
 
         let main: gpui::AnyElement = if live {
+            // Ely's ChatContainer supplies the canonical chat layout: a
+            // full-height message column with the composer centered and
+            // width-constrained beneath it.
             div()
                 .flex_1()
                 .flex()
                 .flex_col()
                 .min_w_0()
                 .child(chat::render_header(&state, cx))
-                .child(chat::render_transcript(&state, window, cx))
-                .child(composer::render(&state, self, cx))
+                .child(
+                    ely_gpui_component::chat::ChatContainer::new(chat::render_transcript(
+                        &state, window, cx,
+                    ))
+                    .composer(composer::render(&state, self, cx)),
+                )
                 .into_any_element()
         } else {
             welcome::render(&state, self, window, cx).into_any_element()

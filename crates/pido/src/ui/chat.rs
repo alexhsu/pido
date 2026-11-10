@@ -139,6 +139,7 @@ pub fn render_header(state: &Entity<AppState>, cx: &App) -> impl IntoElement + u
 }
 
 /// The scrollable transcript area with the notice banner and empty state.
+/// Parent is Ely's `ChatContainer`, which supplies the column height.
 pub fn render_transcript(
     state: &Entity<AppState>,
     _window: &mut Window,
@@ -155,8 +156,7 @@ pub fn render_transcript(
 
     div()
         .relative()
-        .flex_1()
-        .min_h_0()
+        .size_full()
         .flex()
         .flex_col()
         .when_some(notice, |this, banner| {
@@ -191,7 +191,15 @@ fn render_item(item: &TranscriptItem, ix: usize, cx: &App) -> AnyElement {
             let mut bubble = MessageBubble::new(Role::Assistant)
                 .header(MessageHeader::new(("header", ix), i18n::t(cx, "pi")));
             if !view.thinking.is_empty() {
-                let took = view.took.unwrap_or_else(|| view.started.elapsed());
+                // Only a still-thinking view ticks; a finished one shows the
+                // frozen duration. Restored history records no durations, so
+                // it falls back to "Thought for a moment" (Duration::ZERO)
+                // instead of a value that would grow on every redraw.
+                let took = if view.thinking_live {
+                    view.took.unwrap_or_else(|| view.started.elapsed())
+                } else {
+                    view.took.unwrap_or_default()
+                };
                 bubble = bubble.child(ThinkingBlock::new(
                     ("thinking", ix),
                     view.thinking.clone(),
