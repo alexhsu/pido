@@ -25,13 +25,6 @@ log.workspace = true
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
 env_logger.workspace = true
 
-# The workspace disables gpui's default features, which drops the Windows
-# DPI-awareness manifest: without it the process reports 100% scale while
-# gpui lays out at 150%, so the window surface is smaller than the layout and
-# the bottom of the UI (the composer) falls off-window.
-[target.'cfg(target_os = "windows")'.dependencies]
-gpui = { package = "gpui-pre", version = "=0.3.11", default-features = false, features = ["windows-manifest"] }
-
 # Linux needs the wayland and x11 backends enabled explicitly.
 [target.'cfg(target_os = "linux")'.dependencies]
 gpui_platform = { package = "gpui-pre-platform", version = "=0.3.11", features = ["wayland", "x11"] }

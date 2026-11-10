@@ -121,6 +121,18 @@ impl Render for PidoApp {
         // 1.5x too large and cropped the composer away.
         let scale = window.scale_factor();
         let (w, h) = (bounds.size.width / scale, bounds.size.height / scale);
+        static GEOM: std::sync::Once = std::sync::Once::new();
+        GEOM.call_once(|| {
+            log::info!(
+                "geometry: window={:?} scale={} layout={:?}x{:?} painted={:?}x{:?}",
+                bounds.size,
+                scale,
+                w,
+                h,
+                w * scale,
+                h * scale
+            )
+        });
         let sidebar_w = gpui::px(264.);
         let header_h = gpui::px(HEADER_HEIGHT);
         let composer_h = gpui::px(COMPOSER_HEIGHT);
