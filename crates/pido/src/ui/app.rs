@@ -20,8 +20,6 @@ pub const HEADER_HEIGHT: f32 = 52.;
 pub const COMPOSER_HEIGHT: f32 = 150.;
 
 pub struct PidoApp {
-    /// Set once the window has been grown to match the display scale.
-    scaled_for_dpi: bool,
     pub focus: FocusHandle,
     pub state: gpui::Entity<AppState>,
     /// The composer's multi-line field, owned here so it survives re-renders.
@@ -39,7 +37,6 @@ impl PidoApp {
         // Re-render whenever the state entity changes.
         cx.observe(&state, |_, _, cx| cx.notify()).detach();
         let app = Self {
-            scaled_for_dpi: false,
             focus,
             state,
             draft: None,
@@ -111,63 +108,63 @@ impl Render for PidoApp {
         let (bg, fg) = (theme.colors.bg, theme.colors.fg);
         let bounds = window.bounds();
         self.window_size = Some((f32::from(bounds.size.width), f32::from(bounds.size.height)));
-        // Windows takes the requested bounds as physical pixels while gpui
-        // lays out in logical ones: on a 150% display the surface comes out
-        // 1.5x too small and the bottom of the UI (the composer) is clipped.
-        // Grow the window once, after the first real frame.
-        if !self.scaled_for_dpi {
-            self.scaled_for_dpi = true;
-            let scale = window.scale_factor();
-            if (scale - 1.0).abs() > 0.001 {
-                let logical = window.viewport_size();
-                window.resize(gpui::size(logical.width * scale, logical.height * scale));
-            }
-        }
         let state = self.state.clone();
         let live = state.read(cx).conn == Conn::Live;
-        // Layout units are logical: the viewport is reported in physical
-        // pixels on this backend, so divide by the scale first.
-        let logical_height = window.viewport_size().height / window.scale_factor();
-        let pane_height = logical_height - gpui::px(HEADER_HEIGHT);
+        // Every pane is placed with explicit pixel geometry. Flex and
+        // percentage heights proved unreliable here: the virtualized message
+        // list would grow past its share and push the composer out of the
+        // window, so each band gets a definite box that content cannot
+        // change.
+        // The backend reports the window in device pixels but paints the
+        // layout scaled by the display factor, so the layout box is the
+        // window divided by that factor. Using the raw bounds here painted
+        // 1.5x too large and cropped the composer away.
+        let scale = window.scale_factor();
+        let (w, h) = (bounds.size.width / scale, bounds.size.height / scale);
+        let sidebar_w = gpui::px(264.);
+        let header_h = gpui::px(HEADER_HEIGHT);
+        let composer_h = gpui::px(COMPOSER_HEIGHT);
 
         let main: gpui::AnyElement = if live {
-            // Ely's ChatContainer supplies the canonical chat layout: a
-            // full-height message column with the composer centered and
-            // width-constrained beneath it.
             div()
-                .flex_1()
-                .h(logical_height)
-                .flex()
-                .flex_col()
-                .min_w_0()
-                .min_h_0()
-                .child(chat::render_header(&state, cx))
+                .absolute()
+                .left(sidebar_w)
+                .top(gpui::px(0.))
+                .w(w - sidebar_w)
+                .h(h)
                 .child(
-                    // Both panes get explicit heights. A flexible column let
-                    // gpui's virtualized list claim every pixel and push the
-                    // composer past the window edge; fixed slots are
-                    // deterministic and still resize with the window.
                     div()
-                        .w_full()
-                        .min_w_0()
-                        .h(pane_height - gpui::px(COMPOSER_HEIGHT))
-                        .min_h_0()
+                        .absolute()
+                        .left(gpui::px(0.))
+                        .top(gpui::px(0.))
+                        .w(w - sidebar_w)
+                        .h(header_h)
+                        .child(chat::render_header(&state, cx)),
+                )
+                .child(
+                    div()
+                        .absolute()
+                        .left(gpui::px(0.))
+                        .top(header_h)
+                        .w(w - sidebar_w)
+                        .h(h - header_h - composer_h)
                         .overflow_hidden()
                         .child(chat::render_transcript(
                             &state,
                             window,
-                            pane_height - gpui::px(COMPOSER_HEIGHT),
+                            h - header_h - composer_h,
                             cx,
                         )),
                 )
                 .child(
                     div()
-                        .w_full()
-                        .min_w_0()
-                        .h(gpui::px(COMPOSER_HEIGHT))
-                        .min_h_0()
-                        .flex_none()
-                        .overflow_hidden()
+                        .absolute()
+                        .left(gpui::px(0.))
+                        .top(h - composer_h)
+                        .w(w - sidebar_w)
+                        .h(composer_h)
+                        .px_4()
+                        .pt_2()
                         .child(composer::render(&state, self, cx)),
                 )
                 .into_any_element()
