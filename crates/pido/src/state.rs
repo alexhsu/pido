@@ -8,10 +8,11 @@
 
 use base64::Engine as _;
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use ely_gpui_component::git::{DiffLine, LineKind, Stretch, mark_words};
 use gpui::{App, AppContext, Context, Entity};
 use pi_rpc::client::{ClientEvent, PiClient, PiProcessConfig};
 use pi_rpc::protocol::{
@@ -252,6 +253,158 @@ fn patch_session_title(rows: &mut [SidebarRow], file: &str, name: &str) {
     }
 }
 
+/// `/` separators throughout, so display and keys agree everywhere.
+fn normalize_path(path: &str) -> String {
+    path.replace('\\', "/")
+}
+
+/// A unified patch's file path and its hunks, for the diff viewer. None when
+/// the patch holds no hunks.
+fn parse_patch(patch: &str) -> Option<(String, Vec<Stretch>)> {
+    let (mut old_path, mut new_path) = (None, None);
+    let mut hunks = Vec::new();
+    let mut lines = patch.lines().peekable();
+    while let Some(line) = lines.next() {
+        if let Some(rest) = line.strip_prefix("--- ") {
+            old_path = patch_path(rest);
+        } else if let Some(rest) = line.strip_prefix("+++ ") {
+            new_path = patch_path(rest);
+        } else if line.starts_with("@@") {
+            let (mut old_no, mut new_no) = hunk_starts(line)?;
+            let mut body: Vec<DiffLine> = Vec::new();
+            while let Some(next) = lines.peek() {
+                let next: &str = next;
+                // The next hunk, the next file, or the patch's end.
+                if next.starts_with("@@") || next.starts_with("--- ") || next.starts_with("+++ ") {
+                    break;
+                }
+                let next = lines.next().unwrap_or_default();
+                if next.is_empty() {
+                    break;
+                }
+                let (kind, text) = match next.as_bytes()[0] {
+                    b' ' => (LineKind::Same, &next[1..]),
+                    b'-' => (LineKind::Removed, &next[1..]),
+                    b'+' => (LineKind::Added, &next[1..]),
+                    // "\ No newline at end of file" and anything else.
+                    _ => continue,
+                };
+                let (old, new) = match kind {
+                    LineKind::Same => {
+                        old_no += 1;
+                        new_no += 1;
+                        (Some(old_no - 1), Some(new_no - 1))
+                    }
+                    LineKind::Removed => {
+                        old_no += 1;
+                        (Some(old_no - 1), None)
+                    }
+                    LineKind::Added => {
+                        new_no += 1;
+                        (None, Some(new_no - 1))
+                    }
+                };
+                body.push(DiffLine {
+                    kind,
+                    old,
+                    new,
+                    text: text.trim_end_matches('\r').to_string().into(),
+                    words: Vec::new(),
+                });
+            }
+            if !body.is_empty() {
+                mark_words(&mut body);
+                hunks.push(Stretch::Hunk {
+                    header: line.to_string().into(),
+                    lines: body,
+                });
+            }
+        }
+    }
+    if hunks.is_empty() {
+        return None;
+    }
+    let path = match (old_path, new_path) {
+        // Git-style patches prefix the two sides with `a/` and `b/`; Pi's own
+        // patches carry the same path on both sides.
+        (Some(old), Some(new)) => match (old.strip_prefix("a/"), new.strip_prefix("b/")) {
+            (Some(old), Some(new)) if old == new => new.to_string(),
+            _ => new,
+        },
+        (_, Some(new)) => new,
+        (Some(old), None) => old,
+        (None, None) => return None,
+    };
+    Some((path, hunks))
+}
+
+/// The path a patch header line names, without its timestamp.
+fn patch_path(raw: &str) -> Option<String> {
+    let raw = raw.split('\t').next().unwrap_or(raw).trim();
+    (!raw.is_empty() && raw != "/dev/null").then(|| raw.to_string())
+}
+
+/// The old and new start lines of a `@@ -a,b +c,d @@` header.
+fn hunk_starts(header: &str) -> Option<(usize, usize)> {
+    let rest = header.strip_prefix("@@")?;
+    let spec = &rest[..rest.find("@@")?];
+    let mut parts = spec.split_whitespace();
+    let start = |side: &str| {
+        side.split(',')
+            .next()
+            .and_then(|line| line.parse::<usize>().ok())
+    };
+    Some((
+        start(parts.next()?.strip_prefix('-')?)?,
+        start(parts.next()?.strip_prefix('+')?)?,
+    ))
+}
+
+/// A `write` call's path and content, when its arguments carry both.
+fn write_args(args: Option<&serde_json::Value>) -> Option<(String, String)> {
+    let args = args?;
+    let path = args.get("path")?.as_str()?;
+    let content = args.get("content")?.as_str()?;
+    Some((path.to_string(), content.to_string()))
+}
+
+/// A whole file as added lines: what a `write` shows, since its old text is
+/// gone by the time the result arrives.
+fn added_stretches(content: &str) -> Vec<Stretch> {
+    let lines: Vec<DiffLine> = content
+        .lines()
+        .enumerate()
+        .map(|(ix, text)| DiffLine {
+            kind: LineKind::Added,
+            old: None,
+            new: Some(ix + 1),
+            text: text.trim_end_matches('\r').to_string().into(),
+            words: Vec::new(),
+        })
+        .collect();
+    if lines.is_empty() {
+        return Vec::new();
+    }
+    vec![Stretch::Hunk {
+        header: format!("@@ -0,0 +1,{} @@", lines.len()).into(),
+        lines,
+    }]
+}
+
+/// Lines added and removed across hunks.
+fn stretches_stat(stretches: &[Stretch]) -> (usize, usize) {
+    stretches
+        .iter()
+        .flat_map(|stretch| match stretch {
+            Stretch::Hunk { lines, .. } | Stretch::Folded(lines) => lines.as_slice(),
+        })
+        .fold((0, 0), |(added, removed), line| match line.kind {
+            LineKind::Added => (added + 1, removed),
+            LineKind::Removed => (added, removed + 1),
+            LineKind::Same => (added, removed),
+        })
+}
+
 /// `D:\develop\code\pido` → `code / pido`, so a project header stays short.
 pub fn shorten_project(path: &str) -> String {
     let normalized = path.replace('\\', "/");
@@ -304,6 +457,29 @@ pub struct ToolView {
     pub result: Option<gpui::SharedString>,
     pub started: Instant,
     pub took: Option<Duration>,
+}
+
+/// One file the agent changed in this session, with every edit to it parsed
+/// for the diff viewer.
+#[derive(Clone)]
+pub struct ChangeFile {
+    /// Normalized identity: the absolute path with `/` separators, lowercased
+    /// on Windows, so relative and absolute reports of one file group up.
+    pub key: String,
+    /// Shown to the user: relative to the project when it lives inside it.
+    pub path: gpui::SharedString,
+    pub added: usize,
+    pub removed: usize,
+    /// Its edits, oldest first, as hunks the diff viewer draws.
+    pub stretches: std::rc::Rc<Vec<Stretch>>,
+    /// Sequence number of the last edit; files list newest first.
+    touched: u64,
+}
+
+/// Arguments of a `write` call seen at start, waiting for its result.
+struct PendingWrite {
+    path: String,
+    content: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -362,6 +538,12 @@ pub struct AppState {
     /// Messages waiting in pi's queues, as `queue_update` reports them.
     pub queued_steers: Vec<gpui::SharedString>,
     pub queued_follow_ups: Vec<gpui::SharedString>,
+    /// Files the agent changed in this session, newest first.
+    pub changes: Vec<ChangeFile>,
+    /// Counter stamped on each recorded change.
+    changes_seq: u64,
+    /// `write` calls whose arguments arrived but whose result has not.
+    pending_writes: HashMap<String, PendingWrite>,
     /// Text Esc or a failed send wants put back into the composer. The root
     /// view drains this into the draft field.
     pub pending_composer_text: Option<String>,
@@ -402,6 +584,9 @@ impl AppState {
                 pending_steers: Vec::new(),
                 queued_steers: Vec::new(),
                 queued_follow_ups: Vec::new(),
+                changes: Vec::new(),
+                changes_seq: 0,
+                pending_writes: HashMap::new(),
                 pending_composer_text: None,
                 session_scan: Arc::new(Mutex::new(sessions::SessionScanner::default())),
                 client: None,
@@ -487,6 +672,7 @@ impl AppState {
         self.conn = Conn::Connecting;
         self.cwd = Some(cwd.clone());
         self.transcript.clear();
+        self.clear_changes();
         self.notice = None;
         self.streaming = false;
         self.stats = None;
@@ -674,6 +860,132 @@ impl AppState {
         self.check_command(Command::SetSessionName { name }, "set_session_name", cx);
         self.refresh_sessions(cx);
         cx.notify();
+    }
+
+    /// Fold a restored tool result into the changes panel. Assistant tool
+    /// calls are seen before their results on the branch, so `write` content
+    /// is available by the time its result arrives.
+    fn record_history_change(
+        &mut self,
+        result: &pi_rpc::protocol::ToolResultMessage,
+        calls: &HashMap<String, pi_rpc::protocol::ToolCall>,
+    ) {
+        match result.tool_name.as_str() {
+            "edit" => {
+                let patch = result
+                    .details
+                    .as_ref()
+                    .and_then(|details| details.get("patch"))
+                    .and_then(|patch| patch.as_str());
+                match patch {
+                    Some(patch) => self.record_patch(patch),
+                    None => log::debug!("restored edit held no patch"),
+                }
+            }
+            "write" => {
+                if let Some(call) = calls.get(&result.tool_call_id)
+                    && let (Some(path), Some(content)) = (
+                        call.arguments.get("path").and_then(|value| value.as_str()),
+                        call.arguments
+                            .get("content")
+                            .and_then(|value| value.as_str()),
+                    )
+                {
+                    self.record_write(path, content);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Record a finished `edit` tool call from the unified patch Pi reports.
+    fn record_patch(&mut self, patch: &str) {
+        match parse_patch(patch) {
+            Some((path, hunks)) => self.add_change(&path, hunks),
+            None => log::debug!("edit result held no patch to show"),
+        }
+    }
+
+    /// Record a finished `write` tool call; its new text is all that is left.
+    fn record_write(&mut self, path: &str, content: &str) {
+        let hunks = added_stretches(content);
+        if !hunks.is_empty() {
+            self.add_change(path, hunks);
+        }
+    }
+
+    /// Merge one file's hunks into the panel's list, newest file first.
+    fn add_change(&mut self, path: &str, hunks: Vec<Stretch>) {
+        let key = self.change_key(path);
+        let display = self.display_path(path);
+        let (added, removed) = stretches_stat(&hunks);
+        self.changes_seq += 1;
+        let touched = self.changes_seq;
+        if let Some(existing) = self.changes.iter_mut().find(|change| change.key == key) {
+            existing.added += added;
+            existing.removed += removed;
+            let mut all = (*existing.stretches).clone();
+            all.extend(hunks);
+            existing.stretches = std::rc::Rc::new(all);
+            existing.touched = touched;
+        } else {
+            self.changes.push(ChangeFile {
+                key,
+                path: display.into(),
+                added,
+                removed,
+                stretches: std::rc::Rc::new(hunks),
+                touched,
+            });
+        }
+        self.changes
+            .sort_by_key(|change| std::cmp::Reverse(change.touched));
+    }
+
+    /// A file's identity: absolute, `/`-separated, lowercased on Windows.
+    fn change_key(&self, path: &str) -> String {
+        let absolute = if Path::new(path).is_absolute() {
+            path.to_string()
+        } else if let Some(cwd) = &self.cwd {
+            cwd.join(path).to_string_lossy().into_owned()
+        } else {
+            path.to_string()
+        };
+        let key = normalize_path(&absolute);
+        if cfg!(windows) {
+            key.to_lowercase()
+        } else {
+            key
+        }
+    }
+
+    /// The path to show: relative to the project when the file lives inside
+    /// it, `/`-separated either way.
+    fn display_path(&self, path: &str) -> String {
+        let file = PathBuf::from(path);
+        if file.is_absolute() {
+            if let Some(cwd) = &self.cwd
+                && let Ok(rest) = file.strip_prefix(cwd)
+            {
+                return normalize_path(&rest.to_string_lossy());
+            }
+            // Outside the project, the tail is what tells files apart.
+            let normalized = normalize_path(path);
+            let mut parts = normalized.rsplit('/');
+            let name = parts.next().unwrap_or(&normalized);
+            return match parts.next() {
+                Some(dir) => format!("…/{dir}/{name}"),
+                None => normalized,
+            };
+        }
+        path.trim_start_matches("./").replace('\\', "/")
+    }
+
+    /// Forget the session's file changes as its transcript goes.
+    fn clear_changes(&mut self) {
+        self.changes.clear();
+        self.changes_seq = 0;
+        self.pending_writes.clear();
     }
 
     /// Start a fresh session in `project`: a new chat when pi is already there,
@@ -903,6 +1215,7 @@ impl AppState {
         }
         self.conn = Conn::Idle;
         self.transcript.clear();
+        self.clear_changes();
         self.streaming = false;
         self.stats = None;
         self.session_name = None;
@@ -1167,6 +1480,7 @@ impl AppState {
                             );
                         } else {
                             s.transcript.clear();
+                            s.clear_changes();
                             s.session_name = None;
                             s.stats = None;
                             s.session_epoch += 1;
@@ -1237,6 +1551,7 @@ impl AppState {
                             );
                         } else {
                             s.transcript.clear();
+                            s.clear_changes();
                             s.session_name = None;
                             s.stats = None;
                             s.session_epoch += 1;
@@ -1659,6 +1974,14 @@ impl AppState {
                     self.ensure_tool_card(tool_call_id.clone(), tool_name.clone(), args.as_ref());
                 card.running = true;
                 card.started = Instant::now();
+                // A write's content is only in its arguments; by the time its
+                // result arrives the old file is gone, so keep them here.
+                if tool_name == "write"
+                    && let Some((path, content)) = write_args(args.as_ref())
+                {
+                    self.pending_writes
+                        .insert(tool_call_id.clone(), PendingWrite { path, content });
+                }
             }
             Event::ToolExecutionUpdate {
                 tool_call_id,
@@ -1674,17 +1997,34 @@ impl AppState {
             }
             Event::ToolExecutionEnd {
                 tool_call_id,
+                tool_name,
                 is_error,
                 result,
-                ..
             } => {
                 if let Some(card) = self.tool_card_mut(&tool_call_id) {
                     card.running = false;
                     card.failed = is_error;
                     card.took = Some(card.started.elapsed());
-                    if let Some(result) = result {
+                    if let Some(result) = result.as_ref() {
                         card.result = Some(truncate_for_display(&result.text(), 2000).into());
                     }
+                }
+                if is_error {
+                    self.pending_writes.remove(&tool_call_id);
+                } else if tool_name == "edit" {
+                    let patch = result
+                        .as_ref()
+                        .and_then(|result| result.details.as_ref())
+                        .and_then(|details| details.get("patch"))
+                        .and_then(|patch| patch.as_str());
+                    match patch {
+                        Some(patch) => self.record_patch(patch),
+                        None => log::debug!("edit result without a patch"),
+                    }
+                } else if tool_name == "write"
+                    && let Some(write) = self.pending_writes.remove(&tool_call_id)
+                {
+                    self.record_write(&write.path, &write.content);
                 }
             }
             Event::CompactionStart { .. } => {}
@@ -1900,6 +2240,10 @@ impl AppState {
     /// Rebuild the transcript from `get_entries` payload.
     fn load_entries(&mut self, entries: &[SessionEntry], leaf_id: Option<&str>) {
         self.transcript.clear();
+        self.clear_changes();
+        // `write` calls carry their content in the call itself; the result
+        // that follows only confirms it.
+        let mut calls: HashMap<String, pi_rpc::protocol::ToolCall> = HashMap::new();
         for entry in active_branch(entries, leaf_id) {
             let Some(message) = &entry.message else {
                 if entry.entry_type == "compaction" {
@@ -1929,6 +2273,7 @@ impl AppState {
                                 call.name.clone(),
                                 Some(&call.arguments),
                             );
+                            calls.insert(call.id.clone(), call.clone());
                         }
                     }
                 }
@@ -1949,6 +2294,9 @@ impl AppState {
                             started: Instant::now(),
                             took: None,
                         }));
+                    }
+                    if !result.is_error {
+                        self.record_history_change(result, &calls);
                     }
                 }
                 AgentMessage::BashExecution(bash) => {
@@ -2139,7 +2487,8 @@ mod tests {
         let tool = AgentMessage::ToolResult(pi_rpc::protocol::ToolResultMessage {
             tool_call_id: "call-1".into(),
             tool_name: "bash".into(),
-            content: None,
+            content: Vec::new(),
+            details: None,
             usage: None,
             is_error: false,
             timestamp: 2.0,
@@ -2212,6 +2561,9 @@ mod tests {
             pending_steers: Vec::new(),
             queued_steers: Vec::new(),
             queued_follow_ups: Vec::new(),
+            changes: Vec::new(),
+            changes_seq: 0,
+            pending_writes: HashMap::new(),
             pending_composer_text: None,
             session_scan: Arc::new(Mutex::new(sessions::SessionScanner::default())),
             client: None,
@@ -2258,12 +2610,10 @@ mod tests {
         let result = AgentMessage::ToolResult(pi_rpc::protocol::ToolResultMessage {
             tool_call_id: "call-1".into(),
             tool_name: "bash".into(),
-            content: Some(pi_rpc::protocol::ToolResultContent {
-                content: vec![pi_rpc::protocol::ToolResultBlock::Text {
-                    text: "a.txt".into(),
-                }],
-                details: None,
-            }),
+            content: vec![pi_rpc::protocol::ToolResultBlock::Text {
+                text: "a.txt".into(),
+            }],
+            details: None,
             usage: None,
             is_error: false,
             timestamp: 3.0,
@@ -2318,6 +2668,158 @@ mod tests {
             ..response
         };
         assert!(!session_action_cancelled(&response));
+    }
+
+    const PATCH: &str = "--- src/a.rs
++++ src/a.rs
+@@ -1,3 +1,4 @@
+ let a = 1;
+-let b = 2;
++let b = 3;
++let c = 4;
+ let d = 5;
+";
+
+    #[test]
+    fn a_patch_becomes_hunks_with_both_sides_numbered() {
+        let (path, hunks) = parse_patch(PATCH).expect("a patch with hunks parses");
+        assert_eq!(path, "src/a.rs");
+        assert_eq!(hunks.len(), 1);
+        match &hunks[0] {
+            Stretch::Hunk { header, lines } => {
+                assert_eq!(header.as_ref(), "@@ -1,3 +1,4 @@");
+                let kinds: Vec<LineKind> = lines.iter().map(|line| line.kind).collect();
+                assert_eq!(
+                    kinds,
+                    [
+                        LineKind::Same,
+                        LineKind::Removed,
+                        LineKind::Added,
+                        LineKind::Added,
+                        LineKind::Same
+                    ]
+                );
+                assert_eq!(lines[0].old, Some(1));
+                assert_eq!(lines[0].new, Some(1));
+                assert_eq!(lines[2].new, Some(2), "the first added line lands at 2");
+                assert_eq!(lines[4].old, Some(3));
+                assert_eq!(lines[4].new, Some(4));
+            }
+            other => panic!("expected a hunk, got {other:?}"),
+        }
+        assert_eq!(stretches_stat(&hunks), (2, 1));
+    }
+
+    #[test]
+    fn git_style_prefixes_are_stripped_from_the_path() {
+        let patch = "--- a/src/x.rs
++++ b/src/x.rs
+@@ -1 +1 @@
+-a
++b
+";
+        let (path, _) = parse_patch(patch).expect("parses");
+        assert_eq!(path, "src/x.rs");
+    }
+
+    #[test]
+    fn a_patch_without_hunks_is_not_a_change() {
+        assert!(
+            parse_patch(
+                "--- a
++++ b
+"
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn a_write_shows_its_whole_file_as_added() {
+        let hunks = added_stretches(
+            "one
+two
+",
+        );
+        assert_eq!(stretches_stat(&hunks), (2, 0));
+        match &hunks[0] {
+            Stretch::Hunk { header, lines } => {
+                assert_eq!(header.as_ref(), "@@ -0,0 +1,2 @@");
+                assert_eq!(lines[1].text.as_ref(), "two");
+                assert_eq!(lines[1].new, Some(2));
+            }
+            other => panic!("expected a hunk, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn edits_to_one_file_merge_into_one_row() {
+        let mut state = empty_state();
+        state.record_patch(PATCH);
+        state.record_patch(PATCH);
+        assert_eq!(state.changes.len(), 1, "one file, one row");
+        let change = &state.changes[0];
+        assert_eq!(change.path.as_ref(), "src/a.rs");
+        assert_eq!((change.added, change.removed), (4, 2));
+        assert_eq!(change.stretches.len(), 2, "both edits stay viewable");
+    }
+
+    #[test]
+    fn a_restored_session_rebuilds_its_changes() {
+        let mut state = empty_state();
+        let call = pi_rpc::protocol::ToolCall {
+            id: "call-w".into(),
+            name: "write".into(),
+            arguments: serde_json::json!({"path": "notes.md", "content": "hello
+"}),
+        };
+        let assistant = AgentMessage::Assistant(pi_rpc::protocol::AssistantMessage {
+            content: vec![
+                pi_rpc::protocol::AssistantContent::Text {
+                    text: "writing".into(),
+                },
+                pi_rpc::protocol::AssistantContent::ToolCall(call),
+            ],
+            api: None,
+            provider: None,
+            model: None,
+            usage: None,
+            stop_reason: None,
+            error_message: None,
+            timestamp: 1.0,
+        });
+        let result = AgentMessage::ToolResult(pi_rpc::protocol::ToolResultMessage {
+            tool_call_id: "call-w".into(),
+            tool_name: "write".into(),
+            content: Vec::new(),
+            details: None,
+            usage: None,
+            is_error: false,
+            timestamp: 2.0,
+        });
+        let edit = AgentMessage::ToolResult(pi_rpc::protocol::ToolResultMessage {
+            tool_call_id: "call-e".into(),
+            tool_name: "edit".into(),
+            content: Vec::new(),
+            details: Some(serde_json::json!({ "patch": PATCH })),
+            usage: None,
+            is_error: false,
+            timestamp: 3.0,
+        });
+        let entries = vec![
+            message_entry("a1", None, assistant),
+            message_entry("t1", Some("a1"), result),
+            message_entry("t2", Some("t1"), edit),
+        ];
+        state.load_entries(&entries, Some("t2"));
+
+        let paths: Vec<&str> = state
+            .changes
+            .iter()
+            .map(|change| change.path.as_ref())
+            .collect();
+        assert_eq!(paths, ["src/a.rs", "notes.md"], "newest edit first");
+        assert_eq!(state.changes[1].added, 1);
     }
 }
 

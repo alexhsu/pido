@@ -67,6 +67,22 @@ pub fn render_header(
                     })
                 }),
         )
+        .when(!s.changes.is_empty(), |this| {
+            let view = view.clone();
+            let label = format!("{} {}", i18n::t(cx, "changes"), s.changes.len());
+            this.child(
+                ely_gpui_component::buttons::Button::new("open-changes", label)
+                    .variant(ely_gpui_component::buttons::ButtonVariant::Ghost)
+                    .on_click(move |_, _, cx| {
+                        view.update(cx, |this, cx| {
+                            this.diff_open = !this.diff_open;
+                            // Reopen on the newest file rather than a stale pick.
+                            this.diff_selected = None;
+                            cx.notify();
+                        });
+                    }),
+            )
+        })
         .child(
             ely_gpui_component::buttons::Button::new("theme", i18n::t(cx, "theme"))
                 .on_click(|_, _, cx| toggle_theme(cx)),

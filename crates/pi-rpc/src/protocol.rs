@@ -547,14 +547,21 @@ pub enum AssistantMessageEvent {
 
 /// A message in the conversation, discriminated by `role`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "role", rename_all = "snake_case")]
+#[serde(tag = "role")]
 pub enum AgentMessage {
+    #[serde(rename = "user")]
     User(UserMessage),
+    #[serde(rename = "assistant")]
     Assistant(AssistantMessage),
+    /// Pi spells this role in camel case; `rename_all = "snake_case"` would
+    /// have turned it into `tool_result`, silently dropping every result.
+    #[serde(rename = "toolResult")]
     ToolResult(ToolResultMessage),
+    #[serde(rename = "bashExecution")]
     BashExecution(BashExecutionMessage),
     /// A system-prompt snapshot (preamble/tools sections). Sessions record
     /// one; the UI skips it, but it must parse or the whole history fails.
+    #[serde(rename = "system")]
     System(SystemMessage),
     /// A role this crate does not know. Forward compatibility: an unknown
     /// role in restored history must not fail the entire entries payload.
@@ -700,8 +707,13 @@ pub struct ToolCall {
 pub struct ToolResultMessage {
     pub tool_call_id: String,
     pub tool_name: String,
+    /// The result's blocks. A message carries them directly; the execution
+    /// events group them with `details` in a [`ToolResultContent`] instead.
     #[serde(default)]
-    pub content: Option<ToolResultContent>,
+    pub content: Vec<ToolResultBlock>,
+    /// Tool-specific metadata: an edit's `patch`, a read's file list.
+    #[serde(default)]
+    pub details: Option<Value>,
     #[serde(default)]
     pub usage: Option<Usage>,
     #[serde(default)]
@@ -713,7 +725,14 @@ pub struct ToolResultMessage {
 impl ToolResultMessage {
     /// Plain-text view of the result content.
     pub fn text(&self) -> String {
-        self.content.as_ref().map(|c| c.text()).unwrap_or_default()
+        self.content
+            .iter()
+            .filter_map(|block| match block {
+                ToolResultBlock::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("")
     }
 }
 
@@ -1082,6 +1101,21 @@ pub struct ClearedQueue {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A stored `toolResult` message keeps its blocks in `content` and its
+    /// tool metadata in a sibling `details` — not the {content, details}
+    /// object the execution events use.
+    #[test]
+    fn a_session_tool_result_carries_its_details_flat() {
+        let line = r#"{"role":"toolResult","toolCallId":"call_1","toolName":"edit","content":[{"type":"text","text":"ok"}],"details":{"patch":"@@ -1 +1 @@"},"isError":false,"timestamp":1.0}"#;
+        match serde_json::from_str::<AgentMessage>(line).unwrap() {
+            AgentMessage::ToolResult(result) => {
+                assert_eq!(result.text(), "ok");
+                assert_eq!(result.details.unwrap()["patch"], "@@ -1 +1 @@");
+            }
+            other => panic!("expected a tool result, got {other:?}"),
+        }
+    }
 
     #[test]
     fn serialize_prompt_command() {

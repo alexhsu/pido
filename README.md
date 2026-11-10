@@ -12,12 +12,14 @@ A native desktop client for the [Pi coding agent](https://github.com/earendil-wo
 - **运行中转向** — agent 执行中继续输入即 steer(转向);排队中的消息以标签显示在输入框上方,可一键清空;Esc 或停止按钮 = 清空队列 + 中止
 - **模型与思考级别切换** — 输入框右下角的模型胶囊,两级菜单切换 provider 模型和 thinking level
 - **会话管理** — 侧栏按项目分组列出 `~/.pi/agent/sessions` 的历史会话,支持折叠、悬浮新建、拖拽调宽;点击恢复继续,可重命名当前会话
+- **改动审查** — agent 用 `edit`/`write` 改过的文件按项目路径汇总,点开看统一/并排 diff,打开的历史会话也能重建
 - **统计** — token 用量、成本、上下文占用,每轮结束后刷新
 - **亮暗主题 + 中英双语** — 一键切换,偏好持久化(含窗口尺寸、最近项目)
 - **A complete chat loop** — pick a project directory, stream replies, thinking, and tool-call cards live
 - **Steering** — typing while the agent runs steers it; queued messages show as chips over the composer and can be cleared in one click; Esc or the stop button clears the queue and aborts
 - **Model & thinking switching** — the model pill at the composer's right opens two levels: model and thinking level
 - **Sessions** — the sidebar lists past sessions grouped by project, with folding, a hover new-chat button and a draggable width; click to resume, rename the open session from the header
+- **Change review** — files the agent edited or wrote, with unified/split diffs, rebuilt for sessions loaded from history too
 - **Stats** — tokens, cost, and context usage refresh after every run
 - **Dark/light + 中文/English** — one-click toggle, persisted along with window size and last project
 
@@ -80,7 +82,7 @@ PI_SMOKE_PROMPT="hi" cargo run -p pi-rpc --example real_pi -- /tmp   # 完整流
 
 ## 状态与路线 / Status
 
-MVP(核心聊天客户端)已完成,扩展 UI 原生对话框(权限审批类扩展)、队列可视化、会话重命名均已支持。明确不在当前范围:bash 面板、内置终端、diff 审查、checkpoint 回溯、多 pi 进程并发。
+MVP(核心聊天客户端)已完成,扩展 UI 原生对话框(权限审批类扩展)、队列可视化、会话重命名、改动审查(diff 面板)均已支持。明确不在当前范围:bash 面板、内置终端、checkpoint 回溯、多 pi 进程并发。
 
 依赖固定:`ely-gpui-component` 锁定 rev `e0f355a`,`gpui-pre =0.3.11`;升级视为显式变更。
 

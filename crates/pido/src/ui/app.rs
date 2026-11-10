@@ -38,6 +38,10 @@ pub struct PidoApp {
     /// The session-rename dialog: open, with its own field.
     rename_open: bool,
     rename_field: Option<gpui::Entity<TextInput>>,
+    /// The changes panel: open, which file is picked, and its diff layout.
+    pub diff_open: bool,
+    pub diff_selected: Option<String>,
+    pub diff_layout: ely_gpui_component::git::DiffLayout,
 }
 
 impl PidoApp {
@@ -77,6 +81,9 @@ impl PidoApp {
             dialog_field_for: None,
             rename_open: false,
             rename_field: None,
+            diff_open: false,
+            diff_selected: None,
+            diff_layout: ely_gpui_component::git::DiffLayout::Unified,
         };
         app.observe_window_for_quit(cx);
         app
@@ -217,6 +224,20 @@ impl Render for PidoApp {
         let overlay = self
             .extension_dialog_overlay(&state, window, cx)
             .or_else(|| self.rename_dialog(&state, cx));
+        // The changes panel slides over the chat; it closes itself when a new
+        // session empties the list.
+        let changes_open = self.diff_open && !state.read(cx).changes.is_empty();
+        self.diff_open = changes_open;
+        let changes = changes_open.then(|| {
+            crate::ui::changes::render(
+                &state,
+                &cx.entity(),
+                self.diff_selected.clone(),
+                self.diff_layout,
+                cx,
+            )
+            .into_any_element()
+        });
 
         // The FocusScope must carry the window size itself: a percentage
         // height inside an unsized root resolves against auto, so the whole
@@ -233,6 +254,7 @@ impl Render for PidoApp {
                     .size_full()
                     .min_w_0()
                     .min_h_0()
+                    .relative()
                     .flex()
                     .flex_row()
                     .bg(bg)
@@ -254,12 +276,21 @@ impl Render for PidoApp {
                                 }
                             }),
                     )
+                    // Dialogs sit above the review panel: an extension asking
+                    // for permission must not hide behind it.
+                    .children(changes)
                     .children(overlay)
                     // Esc stops a running agent (clear queue + abort, the
                     // protocol's recommended Esc semantics). TextInput does not
                     // consume Escape, so this also works while the composer is
                     // focused.
                     .on_action(cx.listener(|this, _: &Stop, _window, cx| {
+                        // Esc backs out of the review before it stops a run.
+                        if this.diff_open {
+                            this.diff_open = false;
+                            cx.notify();
+                            return;
+                        }
                         if this.state.read(cx).streaming {
                             this.state.update(cx, |s, cx| s.stop(cx));
                         }
