@@ -240,6 +240,18 @@ fn flatten_groups(
     rows
 }
 
+/// Retitle the sidebar row that points at `file`, if the list holds it. Lets
+/// a rename show immediately instead of waiting for the next disk scan.
+fn patch_session_title(rows: &mut [SidebarRow], file: &str, name: &str) {
+    for row in rows {
+        if let SidebarRow::Session { path, title, .. } = row
+            && path.as_ref() == file
+        {
+            *title = name.to_string().into();
+        }
+    }
+}
+
 /// `D:\develop\code\pido` → `code / pido`, so a project header stays short.
 pub fn shorten_project(path: &str) -> String {
     let normalized = path.replace('\\', "/");
@@ -347,6 +359,9 @@ pub struct AppState {
     pub session_epoch: u64,
     /// Steer messages queued by the UI that pi has not delivered yet.
     pending_steers: Vec<String>,
+    /// Messages waiting in pi's queues, as `queue_update` reports them.
+    pub queued_steers: Vec<gpui::SharedString>,
+    pub queued_follow_ups: Vec<gpui::SharedString>,
     /// Text Esc or a failed send wants put back into the composer. The root
     /// view drains this into the draft field.
     pub pending_composer_text: Option<String>,
@@ -385,6 +400,8 @@ impl AppState {
                 pending_dialog: None,
                 session_epoch: 0,
                 pending_steers: Vec::new(),
+                queued_steers: Vec::new(),
+                queued_follow_ups: Vec::new(),
                 pending_composer_text: None,
                 session_scan: Arc::new(Mutex::new(sessions::SessionScanner::default())),
                 client: None,
@@ -476,6 +493,8 @@ impl AppState {
         self.session_name = None;
         self.session_epoch += 1;
         self.pending_steers.clear();
+        self.queued_steers.clear();
+        self.queued_follow_ups.clear();
         self.pending_composer_text = None;
         self.last_project = Some(cwd.to_string_lossy().into_owned());
         crate::settings::save_setting(|s| {
@@ -627,6 +646,33 @@ impl AppState {
     pub fn toggle_project(&mut self, cwd: &str, cx: &mut Context<Self>) {
         toggle_fold(&mut self.collapsed_projects, cwd);
         self.sidebar_rows = flatten_groups(&self.session_groups, &self.collapsed_projects);
+        cx.notify();
+    }
+
+    /// Ask pi to drop the queued steering and follow-up messages, leaving the
+    /// run itself alone.
+    pub fn clear_queue(&mut self, cx: &mut Context<Self>) {
+        self.check_command(Command::ClearQueue, "clear_queue", cx);
+        self.queued_steers.clear();
+        self.queued_follow_ups.clear();
+        cx.notify();
+    }
+
+    /// Rename the session. Pi keeps the name in the session file and reports
+    /// it in `get_state`, so the header and the sidebar both follow.
+    pub fn rename_session(&mut self, name: String, cx: &mut Context<Self>) {
+        let name = name.trim().to_string();
+        if name.is_empty() {
+            return;
+        }
+        self.session_name = Some(name.clone());
+        // The sidebar is rebuilt from disk later; patch the open session's row
+        // now so the rename shows up without waiting for pi to write it.
+        if let Some(file) = self.session_file.as_deref() {
+            patch_session_title(&mut self.sidebar_rows, file, &name);
+        }
+        self.check_command(Command::SetSessionName { name }, "set_session_name", cx);
+        self.refresh_sessions(cx);
         cx.notify();
     }
 
@@ -861,6 +907,8 @@ impl AppState {
         self.stats = None;
         self.session_name = None;
         self.pending_steers.clear();
+        self.queued_steers.clear();
+        self.queued_follow_ups.clear();
         self.pending_composer_text = None;
         cx.notify();
     }
@@ -1540,6 +1588,8 @@ impl AppState {
             Event::AgentSettled { aborted } => {
                 self.streaming = false;
                 self.pending_steers.clear();
+                self.queued_steers.clear();
+                self.queued_follow_ups.clear();
                 // Any assistant view still live is finished now.
                 self.finalize_open_views();
                 if aborted {
@@ -1684,8 +1734,13 @@ impl AppState {
                     self.push_notice(NoticeKind::Error, error);
                 }
             }
-            Event::QueueUpdate { steering, .. } => {
-                self.pending_steers = steering;
+            Event::QueueUpdate {
+                steering,
+                follow_up,
+            } => {
+                self.pending_steers = steering.clone();
+                self.queued_steers = steering.into_iter().map(Into::into).collect();
+                self.queued_follow_ups = follow_up.into_iter().map(Into::into).collect();
             }
             Event::BashExecutionUpdate { .. } => {}
             other => {
@@ -2155,6 +2210,8 @@ mod tests {
             next_image_key: 1,
             session_epoch: 0,
             pending_steers: Vec::new(),
+            queued_steers: Vec::new(),
+            queued_follow_ups: Vec::new(),
             pending_composer_text: None,
             session_scan: Arc::new(Mutex::new(sessions::SessionScanner::default())),
             client: None,
@@ -2431,5 +2488,38 @@ mod sidebar_tests {
         assert!(collapsed.contains("D:/a"));
         toggle_fold(&mut collapsed, "D:/a");
         assert!(!collapsed.contains("D:/a"));
+    }
+
+    #[test]
+    fn renaming_retitles_only_the_matching_row() {
+        let mut rows = vec![
+            SidebarRow::Group {
+                label: "a".into(),
+                cwd: "D:/a".into(),
+                folded: false,
+                sessions: 2,
+            },
+            SidebarRow::Session {
+                path: "D:/a/one.jsonl".into(),
+                title: "old".into(),
+                updated: Some(1),
+            },
+            SidebarRow::Session {
+                path: "D:/a/two.jsonl".into(),
+                title: "keep".into(),
+                updated: Some(2),
+            },
+        ];
+        patch_session_title(&mut rows, "D:/a/one.jsonl", "renamed");
+        match (&rows[1], &rows[2]) {
+            (
+                SidebarRow::Session { title: renamed, .. },
+                SidebarRow::Session { title: kept, .. },
+            ) => {
+                assert_eq!(renamed.as_ref(), "renamed");
+                assert_eq!(kept.as_ref(), "keep");
+            }
+            _ => panic!("expected two session rows"),
+        }
     }
 }

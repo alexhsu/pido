@@ -87,6 +87,12 @@ pub fn init(cx: &mut App, default: &str) {
                     ("retry_failed", "重试失败:{e}"),
                     ("retry_failed_unknown", "未知错误"),
                     ("extension_dialog_cancelled", "扩展请求确认,当前版本已自动取消"),
+                    ("rename", "重命名会话"),
+                    ("rename_hint", "会话名称"),
+                    ("save", "保存"),
+                    ("clear_queue", "清空队列"),
+                    ("queued_steer", "转向"),
+                    ("queued_follow_up", "追加"),
                 ],
             )
             .catalog(
@@ -160,6 +166,12 @@ pub fn init(cx: &mut App, default: &str) {
                     ("retry_failed", "Retry failed: {e}"),
                     ("retry_failed_unknown", "unknown error"),
                     ("extension_dialog_cancelled", "Extension asked for input; this build auto-cancelled it"),
+                    ("rename", "Rename session"),
+                    ("rename_hint", "Session name"),
+                    ("save", "Save"),
+                    ("clear_queue", "Clear queue"),
+                    ("queued_steer", "Steer"),
+                    ("queued_follow_up", "Follow-up"),
                 ],
             ),
     );

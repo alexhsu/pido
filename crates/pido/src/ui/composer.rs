@@ -11,8 +11,8 @@ use ely_gpui_component::menus::{DropdownMenu, Menu, MenuItem};
 use ely_gpui_component::primitives::IconName;
 use ely_gpui_component::theme::ActiveTheme;
 use gpui::{
-    App, ClipboardEntry, Entity, InteractiveElement, IntoElement, ParentElement, SharedString,
-    Styled, div, prelude::FluentBuilder, px,
+    AnyElement, App, ClipboardEntry, Entity, InteractiveElement, IntoElement, ParentElement,
+    SharedString, Styled, div, prelude::FluentBuilder, px,
 };
 
 use crate::i18n;
@@ -111,6 +111,49 @@ pub fn render(state: &Entity<AppState>, app: &mut PidoApp, cx: &App) -> impl Int
     // staging area.
     let pick_state = state.clone();
     let drop_state = state.clone();
+    let queued = {
+        let mut rows: Vec<AnyElement> = Vec::new();
+        for (ix, text) in s.queued_steers.iter().enumerate() {
+            rows.push(queued_chip(
+                cx,
+                ("queued-steer", ix),
+                "queued_steer",
+                text.clone(),
+            ));
+        }
+        for (ix, text) in s.queued_follow_ups.iter().enumerate() {
+            rows.push(queued_chip(
+                cx,
+                ("queued-follow", ix),
+                "queued_follow_up",
+                text.clone(),
+            ));
+        }
+        div().flex().flex_col().gap_1().children(rows)
+    };
+    let has_queued = !s.queued_steers.is_empty() || !s.queued_follow_ups.is_empty();
+    let queued_row = {
+        let clear_state = state.clone();
+        div()
+            .flex()
+            .items_end()
+            .gap_2()
+            .child(div().flex_1().min_w_0().child(queued))
+            .child(
+                ely_gpui_component::buttons::Button::new("clear-queue", i18n::t(cx, "clear_queue"))
+                    .variant(ButtonVariant::Ghost)
+                    .on_click(move |_, _, cx| {
+                        clear_state.update(cx, |s, cx| s.clear_queue(cx));
+                    }),
+            )
+    };
+
+    // The queue banner only exists while something is queued: an empty row
+    // would still cost the card's vertical gap.
+    let mut input = input;
+    if has_queued {
+        input = input.above(queued_row);
+    }
     let input = input
         .above(chip_row)
         .tool(AttachmentButton::new(
@@ -344,6 +387,42 @@ fn cache_hit_percent(input: u64, cache_read: u64) -> Option<String> {
     (cache_read * 100)
         .checked_div(input + cache_read)
         .map(|p| p.to_string())
+}
+
+/// One message waiting in pi's queue, labelled by which queue it is in.
+fn queued_chip(
+    cx: &App,
+    id: (&'static str, usize),
+    label_key: &'static str,
+    text: gpui::SharedString,
+) -> AnyElement {
+    let theme = cx.theme();
+    let colors = &theme.colors;
+    div()
+        .flex()
+        .items_center()
+        .gap_1p5()
+        .px_2()
+        .py_1()
+        .rounded(theme.radius(ely_gpui_component::theme::Radius::Sm))
+        .bg(colors.info_subtle)
+        .text_size(theme.text_size(ely_gpui_component::theme::TextSize::Xs))
+        .child(
+            div()
+                .flex_none()
+                .text_color(colors.info)
+                .child(i18n::t(cx, label_key)),
+        )
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .truncate()
+                .text_color(colors.fg_muted)
+                .child(text),
+        )
+        .id(id)
+        .into_any_element()
 }
 
 /// gpui's clipboard image format, as the mime string pi expects.

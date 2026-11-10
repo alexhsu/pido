@@ -35,6 +35,9 @@ pub struct PidoApp {
     dialog_field: Option<gpui::Entity<TextInput>>,
     /// The request id `dialog_field` was built for.
     dialog_field_for: Option<String>,
+    /// The session-rename dialog: open, with its own field.
+    rename_open: bool,
+    rename_field: Option<gpui::Entity<TextInput>>,
 }
 
 impl PidoApp {
@@ -72,6 +75,8 @@ impl PidoApp {
             composer_focused: false,
             dialog_field: None,
             dialog_field_for: None,
+            rename_open: false,
+            rename_field: None,
         };
         app.observe_window_for_quit(cx);
         app
@@ -166,7 +171,11 @@ impl Render for PidoApp {
                 .min_h_0()
                 .flex()
                 .flex_col()
-                .child(div().flex_none().child(chat::render_header(&state, cx)))
+                .child(
+                    div()
+                        .flex_none()
+                        .child(chat::render_header(&state, &cx.entity(), cx)),
+                )
                 .child(
                     div()
                         .flex_1()
@@ -204,8 +213,10 @@ impl Render for PidoApp {
                 .into_any_element()
         };
 
-        // The extension dialog rides at the root, above every pane.
-        let overlay = self.extension_dialog_overlay(&state, window, cx);
+        // Extension and rename dialogs ride at the root, above every pane.
+        let overlay = self
+            .extension_dialog_overlay(&state, window, cx)
+            .or_else(|| self.rename_dialog(&state, cx));
 
         // The FocusScope must carry the window size itself: a percentage
         // height inside an unsized root resolves against auto, so the whole
@@ -258,6 +269,102 @@ impl Render for PidoApp {
 }
 
 impl PidoApp {
+    /// Open the rename dialog over the current session's name.
+    pub fn open_rename(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let current = self.state.read(cx).session_name.clone().unwrap_or_default();
+        let field = cx.new(|cx| {
+            let mut input = TextInput::new(window, cx);
+            if !current.is_empty() {
+                input.set_text(current, cx);
+            }
+            input
+        });
+        self.rename_field = Some(field.clone());
+        self.rename_open = true;
+        // Enter in the field saves, the same path the Save button takes.
+        cx.subscribe(&field, move |this, field, event: &InputEvent, cx| {
+            if *event != InputEvent::Submit {
+                return;
+            }
+            let name = field.read(cx).text().to_string();
+            this.state.update(cx, |s, cx| s.rename_session(name, cx));
+            this.rename_open = false;
+            this.rename_field = None;
+            cx.notify();
+        })
+        .detach();
+        cx.notify();
+    }
+
+    /// The rename dialog, while open.
+    fn rename_dialog(
+        &mut self,
+        state: &gpui::Entity<AppState>,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui::AnyElement> {
+        use ely_gpui_component::buttons::{Button, ButtonVariant};
+        use ely_gpui_component::overlays::Dialog;
+
+        if !self.rename_open {
+            return None;
+        }
+        let field = self.rename_field.clone()?;
+        let close_me = cx.entity();
+        let shut = move |_: &mut Window, cx: &mut App| {
+            close_me.update(cx, |this, cx| {
+                this.rename_open = false;
+                this.rename_field = None;
+                cx.notify();
+            });
+        };
+        let save_state = state.clone();
+        let save_field = field.clone();
+        let save_me = cx.entity();
+        // The dialog is rebuilt every frame, so focus goes back to the field
+        // each time — otherwise the composer would keep the keystrokes.
+        let focus = field.read(cx).focus().clone();
+        // Labels resolve here: the action closures must be 'static, so they
+        // cannot borrow `cx` to look a string up when they run.
+        let title = crate::i18n::t(cx, "rename");
+        let cancel_label = crate::i18n::t(cx, "ext_cancel");
+        let save_label = crate::i18n::t(cx, "save");
+        Some(
+            Dialog::new("rename-dialog", title, shut)
+                .focus_first(focus)
+                .child(field)
+                .action({
+                    let me = cx.entity();
+                    move |close| {
+                        Button::new("rename-cancel", cancel_label.clone())
+                            .variant(ButtonVariant::Ghost)
+                            .on_click(move |_, window, cx| {
+                                me.update(cx, |this, cx| {
+                                    this.rename_open = false;
+                                    this.rename_field = None;
+                                    cx.notify();
+                                });
+                                close(window, cx);
+                            })
+                    }
+                })
+                .action(move |close| {
+                    Button::new("rename-save", save_label.clone())
+                        .primary()
+                        .on_click(move |_, window, cx| {
+                            let name = save_field.read(cx).text().to_string();
+                            save_state.update(cx, |s, cx| s.rename_session(name, cx));
+                            save_me.update(cx, |this, cx| {
+                                this.rename_open = false;
+                                this.rename_field = None;
+                                cx.notify();
+                            });
+                            close(window, cx);
+                        })
+                })
+                .into_any_element(),
+        )
+    }
+
     /// The native dialog for a pending extension request, if any. The text
     /// field for input/editor is created here, where a Window is available,
     /// and rebuilt only when the request changes.

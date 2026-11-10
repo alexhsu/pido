@@ -20,7 +20,11 @@ use crate::ui::app::toggle_theme;
 /// The header row above the transcript: session title, theme and language
 /// toggles, compaction. Model and thinking picks live in the composer's
 /// tool row; run stats sit under the composer.
-pub fn render_header(state: &Entity<AppState>, cx: &App) -> impl IntoElement + use<> {
+pub fn render_header(
+    state: &Entity<AppState>,
+    view: &Entity<crate::ui::app::PidoApp>,
+    cx: &App,
+) -> impl IntoElement + use<> {
     let theme = cx.theme();
     let s = state.read(cx);
     let app = state.clone();
@@ -39,14 +43,29 @@ pub fn render_header(state: &Entity<AppState>, cx: &App) -> impl IntoElement + u
             div()
                 .flex_1()
                 .min_w_0()
-                .child(div().truncate().child(Paragraph::new(
+                .flex()
+                .items_center()
+                .gap_2()
+                .child(div().min_w_0().truncate().child(Paragraph::new(
                     s.session_name.clone().unwrap_or_else(|| {
                         s.cwd
                             .as_ref()
                             .map(|p| p.to_string_lossy().into_owned())
                             .unwrap_or_default()
                     }),
-                ))),
+                )))
+                .child({
+                    let view = view.clone();
+                    ely_gpui_component::buttons::IconButton::new(
+                        "rename-session",
+                        ely_gpui_component::primitives::IconName::Pencil,
+                    )
+                    .variant(ely_gpui_component::buttons::ButtonVariant::Ghost)
+                    .tooltip(i18n::t(cx, "rename"))
+                    .on_click(move |_, window, cx| {
+                        view.update(cx, |this, cx| this.open_rename(window, cx));
+                    })
+                }),
         )
         .child(
             ely_gpui_component::buttons::Button::new("theme", i18n::t(cx, "theme"))
