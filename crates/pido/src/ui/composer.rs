@@ -5,13 +5,14 @@
 //! Spacing and the centered column width come from Ely's `ChatContainer`.
 
 use ely_gpui_component::buttons::{ButtonVariant, IconButton};
-use ely_gpui_component::chat::PromptInput;
-use ely_gpui_component::forms::Choice;
+use ely_gpui_component::chat::{Attachment, AttachmentButton, AttachmentChip, PromptInput};
+use ely_gpui_component::forms::{Choice, Paste};
 use ely_gpui_component::menus::{DropdownMenu, Menu, MenuItem};
 use ely_gpui_component::primitives::IconName;
 use ely_gpui_component::theme::ActiveTheme;
 use gpui::{
-    App, Entity, IntoElement, ParentElement, SharedString, Styled, div, prelude::FluentBuilder, px,
+    App, ClipboardEntry, Entity, InteractiveElement, IntoElement, ParentElement, SharedString,
+    Styled, div, prelude::FluentBuilder, px,
 };
 
 use crate::i18n;
@@ -31,10 +32,13 @@ pub fn render(state: &Entity<AppState>, app: &mut PidoApp, cx: &App) -> impl Int
     };
 
     let send_state = state.clone();
+    let paste_state = state.clone();
     let owned_draft = draft.clone();
     let input = PromptInput::new("composer", &draft, move |_, cx| {
         let text = owned_draft.read(cx).text().to_string();
-        if !text.trim().is_empty() {
+        // A message may be image-only: the field may be empty while images
+        // are staged.
+        if !text.trim().is_empty() || !send_state.read(cx).pending_images.is_empty() {
             owned_draft.update(cx, |input, cx| input.set_text("", cx));
             send_state.update(cx, |s, cx| s.send_text(text, cx));
         }
@@ -83,6 +87,42 @@ pub fn render(state: &Entity<AppState>, app: &mut PidoApp, cx: &App) -> impl Int
         mention_draft.update(cx, |field, cx| field.insert(&path, cx));
     });
 
+    // Staged images above the field, each removable.
+    let chips = s.pending_images.iter().map(|image| {
+        let attachment = Attachment {
+            key: image.key.clone().into(),
+            name: image.name.clone().into(),
+            bytes: image.data.len() as u64,
+            preview: None,
+            progress: None,
+        };
+        let remove_state = state.clone();
+        let key = image.key.clone();
+        AttachmentChip::new("composer-image", attachment).on_remove(move |_, cx| {
+            remove_state.update(cx, |s, cx| {
+                s.remove_image(&key);
+                cx.notify();
+            });
+        })
+    });
+    let chip_row = div().flex().flex_wrap().gap_2().children(chips);
+
+    // Paperclip opens the file dialog; dropped image files join the same
+    // staging area.
+    let pick_state = state.clone();
+    let drop_state = state.clone();
+    let input = input
+        .above(chip_row)
+        .tool(AttachmentButton::new(
+            "composer-attach",
+            move |paths, _, cx| {
+                crate::state::stage_image_files(&pick_state, &paths, cx);
+            },
+        ))
+        .on_drop(move |paths, _, cx| {
+            crate::state::stage_image_files(&drop_state, &paths, cx);
+        });
+
     // The model pill sits at the right of the tool row, beside send; a
     // separate stop button appears while the agent runs.
     let pill = model_pill(s, state.clone(), cx);
@@ -101,9 +141,35 @@ pub fn render(state: &Entity<AppState>, app: &mut PidoApp, cx: &App) -> impl Int
     let stats_line = stats_caption(s, cx);
 
     div()
+        .id("composer-wrap")
         .flex()
         .flex_col()
         .gap_2()
+        // Capture Ctrl+V before the text field: when the clipboard holds an
+        // image it becomes an attachment; text pastes fall through to the
+        // field's own handler.
+        .capture_action(move |_: &Paste, _window, cx| {
+            let Some(item) = cx.read_from_clipboard() else {
+                return;
+            };
+            for entry in item.entries() {
+                if let ClipboardEntry::Image(image) = entry {
+                    let (mime, _) = mime_of_format(image.format);
+                    let bytes = image.bytes.clone();
+                    let mime = mime.to_string();
+                    paste_state.update(cx, |s, cx| {
+                        if s.stage_image(None, bytes) {
+                            if let Some(last) = s.pending_images.last_mut() {
+                                last.mime = mime;
+                            }
+                            cx.notify();
+                        }
+                    });
+                    cx.stop_propagation();
+                    return;
+                }
+            }
+        })
         .child(
             input.tool(
                 // A growable spacer with the controls pinned to its right edge:
@@ -278,4 +344,18 @@ fn cache_hit_percent(input: u64, cache_read: u64) -> Option<String> {
     (cache_read * 100)
         .checked_div(input + cache_read)
         .map(|p| p.to_string())
+}
+
+/// gpui's clipboard image format, as the mime string pi expects.
+fn mime_of_format(format: gpui::ImageFormat) -> (&'static str, &'static str) {
+    match format {
+        gpui::ImageFormat::Png => ("image/png", "png"),
+        gpui::ImageFormat::Jpeg => ("image/jpeg", "jpg"),
+        gpui::ImageFormat::Webp => ("image/webp", "webp"),
+        gpui::ImageFormat::Gif => ("image/gif", "gif"),
+        gpui::ImageFormat::Svg => ("image/svg+xml", "svg"),
+        gpui::ImageFormat::Bmp => ("image/bmp", "bmp"),
+        // pi accepts png/jpeg/webp/gif/bmp; the rest are refused at staging.
+        _ => ("application/octet-stream", "bin"),
+    }
 }

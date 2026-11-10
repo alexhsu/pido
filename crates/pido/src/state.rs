@@ -6,6 +6,7 @@
 //! `WeakEntity::update`, so the UI never blocks. The event pump subscribes to
 //! the client and folds every record into the transcript.
 
+use base64::Engine as _;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -167,10 +168,14 @@ pub struct AppState {
     pub notice: Option<(NoticeKind, String)>,
     /// The last-used project directory, to prefill the welcome picker.
     pub last_project: Option<String>,
+    /// Counter for staging image keys.
+    next_image_key: u64,
     /// Extension commands, prompt templates and skills pi offers at `/`.
     pub commands: Vec<pi_rpc::protocol::CommandInfo>,
     /// Workspace files offered at `@`, as project-relative paths.
     pub workspace_files: Vec<String>,
+    /// Images staged for the next prompt/steer (paste, picker or drop).
+    pub pending_images: Vec<PendingImage>,
     /// Bumped whenever the conversation is replaced, so the message list gets
     /// a fresh scroll/away state instead of reusing the old session's.
     pub session_epoch: u64,
@@ -205,8 +210,10 @@ impl AppState {
                 stats: None,
                 notice: None,
                 last_project,
+                next_image_key: 1,
                 commands: Vec::new(),
                 workspace_files: Vec::new(),
+                pending_images: Vec::new(),
                 session_epoch: 0,
                 pending_steers: Vec::new(),
                 pending_composer_text: None,
@@ -445,6 +452,37 @@ impl AppState {
         });
     }
 
+    /// Stage an image for the next prompt. Returns false when the bytes are
+    /// not a format pi accepts or the file is unreasonably large.
+    pub fn stage_image(&mut self, name: Option<String>, bytes: Vec<u8>) -> bool {
+        const MAX_BYTES: usize = 10 * 1024 * 1024;
+        let Some((mime, ext)) = sniff_image(&bytes) else {
+            self.push_notice(NoticeKind::Error, "unsupported image format".into());
+            return false;
+        };
+        if bytes.len() > MAX_BYTES {
+            self.push_notice(
+                NoticeKind::Error,
+                format!("image too large ({} MB > 10 MB)", bytes.len() / 1024 / 1024),
+            );
+            return false;
+        }
+        let key = format!("img-{}", self.next_image_key);
+        self.next_image_key += 1;
+        let name = name.unwrap_or_else(|| format!("{key}.{ext}"));
+        self.pending_images.push(PendingImage {
+            key,
+            name,
+            mime: mime.into(),
+            data: bytes,
+        });
+        true
+    }
+
+    pub fn remove_image(&mut self, key: &str) {
+        self.pending_images.retain(|image| image.key != key);
+    }
+
     /// Fetch the `/` command list pi offers (extensions, templates, skills).
     fn load_commands(&self, cx: &Context<Self>) {
         let Some(client) = self.client() else { return };
@@ -616,10 +654,21 @@ impl AppState {
     /// appears immediately; on rejection it is removed and its text restored
     /// to the composer.
     pub fn send_text(&mut self, text: String, cx: &mut Context<Self>) {
-        if text.trim().is_empty() || self.conn != Conn::Live {
+        if (text.trim().is_empty() && self.pending_images.is_empty()) || self.conn != Conn::Live {
             return;
         }
         let Some(client) = self.client() else { return };
+        // Every staged image rides along; pi wants base64 in the JSON.
+        let images = (!self.pending_images.is_empty()).then(|| {
+            self.pending_images
+                .iter()
+                .map(|image| pi_rpc::protocol::ImageInput {
+                    content_type: "image",
+                    data: base64::engine::general_purpose::STANDARD.encode(&image.data),
+                    mime_type: image.mime.clone(),
+                })
+                .collect::<Vec<_>>()
+        });
         let steering = self.streaming;
         let command = if steering {
             // Extension/prompt-template commands are not allowed through
@@ -627,22 +676,24 @@ impl AppState {
             if text.trim_start().starts_with('/') {
                 Command::Prompt {
                     message: text.clone(),
-                    images: None,
+                    images,
                     streaming_behavior: Some(StreamingBehavior::Steer),
                 }
             } else {
                 Command::Steer {
                     message: text.clone(),
-                    images: None,
+                    images,
                 }
             }
         } else {
             Command::Prompt {
                 message: text.clone(),
-                images: None,
+                images,
                 streaming_behavior: None,
             }
         };
+        // The staged images leave with the message, whatever its fate.
+        self.pending_images.clear();
         if steering {
             self.pending_steers.push(text.clone());
         }
@@ -1779,7 +1830,7 @@ mod tests {
         assert_eq!(active_branch(&entries, None).len(), 2);
     }
 
-    fn empty_state() -> AppState {
+    pub(super) fn empty_state() -> AppState {
         AppState {
             conn: Conn::Idle,
             environment: Environment::default(),
@@ -1799,6 +1850,8 @@ mod tests {
             last_project: None,
             commands: Vec::new(),
             workspace_files: Vec::new(),
+            pending_images: Vec::new(),
+            next_image_key: 1,
             session_epoch: 0,
             pending_steers: Vec::new(),
             pending_composer_text: None,
@@ -1907,5 +1960,95 @@ mod tests {
             ..response
         };
         assert!(!session_action_cancelled(&response));
+    }
+}
+
+/// An image staged for the next message: raw bytes plus the mime pi needs.
+#[derive(Debug, Clone)]
+pub struct PendingImage {
+    pub key: String,
+    pub name: String,
+    pub mime: String,
+    pub data: Vec<u8>,
+}
+
+/// Sniff an image's format from its magic bytes: `(mime, extension)`.
+fn sniff_image(bytes: &[u8]) -> Option<(&'static str, &'static str)> {
+    const MIME_PNG: &str = "image/png";
+    const MIME_JPEG: &str = "image/jpeg";
+    const MIME_GIF: &str = "image/gif";
+    const MIME_WEBP: &str = "image/webp";
+    const MIME_BMP: &str = "image/bmp";
+    let png = [0x89u8, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+    let jpeg = [0xffu8, 0xd8, 0xff];
+    let riff = b"RIFF";
+    let webp = b"WEBP";
+    if bytes.starts_with(&png) {
+        Some((MIME_PNG, "png"))
+    } else if bytes.starts_with(&jpeg) {
+        Some((MIME_JPEG, "jpg"))
+    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        Some((MIME_GIF, "gif"))
+    } else if bytes.len() >= 12 && bytes.starts_with(riff) && bytes[8..12] == *webp {
+        Some((MIME_WEBP, "webp"))
+    } else if bytes.starts_with(b"BM") {
+        Some((MIME_BMP, "bmp"))
+    } else {
+        None
+    }
+}
+
+/// Read the image files at `paths` into staged attachments; non-image files
+/// are skipped with a notice.
+pub fn stage_image_files(state: &Entity<AppState>, paths: &[std::path::PathBuf], cx: &mut App) {
+    for path in paths {
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let Ok(bytes) = std::fs::read(path) else {
+            continue;
+        };
+        state.update(cx, |s, cx| {
+            if s.stage_image(Some(name), bytes) {
+                cx.notify();
+            }
+        });
+    }
+}
+
+#[cfg(test)]
+mod image_tests {
+    use super::tests::empty_state;
+
+    #[test]
+    fn stage_sniffs_formats_and_rejects_junk() {
+        let mut state = empty_state();
+        let png = [0x89u8, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 3];
+        assert!(state.stage_image(None, png.to_vec()));
+        assert_eq!(state.pending_images.len(), 1);
+        assert_eq!(state.pending_images[0].mime, "image/png");
+        assert_eq!(state.pending_images[0].name, "img-1.png");
+
+        assert!(state.stage_image(Some("photo.jpg".into()), vec![0xff, 0xd8, 0xff, 0xaa]));
+        assert_eq!(state.pending_images[1].mime, "image/jpeg");
+
+        assert!(!state.stage_image(None, b"just text".to_vec()));
+        assert_eq!(state.pending_images.len(), 2, "junk must not stage");
+
+        state.remove_image("img-1");
+        assert_eq!(state.pending_images.len(), 1);
+        assert_eq!(state.pending_images[0].name, "photo.jpg");
+    }
+
+    #[test]
+    fn oversized_images_are_refused() {
+        let mut state = empty_state();
+        let big = vec![0x89u8, b'P', b'N', b'G', 0, 0, 0, 0]
+            .into_iter()
+            .chain(std::iter::repeat_n(0u8, 11 * 1024 * 1024))
+            .collect::<Vec<_>>();
+        assert!(!state.stage_image(None, big));
+        assert!(state.pending_images.is_empty());
     }
 }
