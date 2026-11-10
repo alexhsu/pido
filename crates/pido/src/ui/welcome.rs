@@ -125,7 +125,7 @@ pub fn render(
                         .child(
                             ely_gpui_component::primitives::Image::new(
                                 "pido-wordmark",
-                                crate::brand::wordmark(2),
+                                crate::brand::wordmark(theme.is_dark(), 2),
                             )
                             .fit(gpui::ObjectFit::Contain)
                             .w(gpui::px(220.))

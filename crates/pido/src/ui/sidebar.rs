@@ -79,23 +79,15 @@ pub fn render(state: &Entity<AppState>, cx: &App) -> impl IntoElement + use<> {
                 .items_center()
                 .justify_between()
                 .child(
-                    // The mark stands for the app; the name is in the
-                    // window title already.
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap_2()
-                        .min_w_0()
-                        .child(
-                            ely_gpui_component::primitives::Image::new(
-                                "pido-mark",
-                                crate::brand::mark(1),
-                            )
-                            .fit(gpui::ObjectFit::Contain)
-                            .w(px(22.))
-                            .h(px(22.)),
-                        )
-                        .child(Caption::new(pi_status_line(state, cx))),
+                    // The wordmark carries the brand; connection and model
+                    // details live in the session header instead.
+                    ely_gpui_component::primitives::Image::new(
+                        "pido-wordmark",
+                        crate::brand::wordmark(theme.is_dark(), 1),
+                    )
+                    .fit(gpui::ObjectFit::Contain)
+                    .w(px(96.))
+                    .h(px(45.)),
                 )
                 .child(
                     Button::new("new-chat", i18n::t(cx, "new_chat"))
@@ -212,22 +204,6 @@ struct SessionRow {
     title: String,
     age: SharedString,
     active: bool,
-}
-
-/// One-line connection status for the sidebar header.
-fn pi_status_line(state: &Entity<AppState>, cx: &App) -> SharedString {
-    let s = state.read(cx);
-    match &s.conn {
-        Conn::Idle => i18n::t(cx, "disconnected"),
-        Conn::Connecting => i18n::t(cx, "connecting"),
-        Conn::Live => match (&s.current_model, &s.session_name) {
-            (Some(model), Some(name)) => format!("{name} · {}", model.name).into(),
-            (Some(model), None) => model.name.clone().into(),
-            (None, Some(name)) => name.clone().into(),
-            (None, None) => "pi".into(),
-        },
-        Conn::Dead(_) => i18n::t(cx, "connection_failed"),
-    }
 }
 
 /// `D:\develop\code\pido` → `code / pido`, to keep group headers short.
