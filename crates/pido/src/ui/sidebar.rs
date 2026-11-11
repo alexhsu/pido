@@ -66,13 +66,13 @@ pub fn render(
         .bg(colors.surface)
         // No horizontal padding: rows carry it, so their backgrounds reach
         // the pane's edges.
-        .py_3()
+        .py_4()
         .gap_3()
         .child(
             div()
                 .flex()
                 .flex_none()
-                .px_3()
+                .px_4()
                 .items_center()
                 .justify_between()
                 .child(
@@ -96,78 +96,6 @@ pub fn render(
                 ),
         )
         .child(
-            // The section header: the static 项目 title, with all the
-            // actions on the right. The fold button flips between collapse
-            // and expand as the groups go.
-            div()
-                .flex_none()
-                .flex()
-                .items_center()
-                .gap_1p5()
-                .px_2()
-                .pb_1()
-                .child(
-                    div()
-                        .text_size(theme.text_size(ely_gpui_component::theme::TextSize::Md))
-                        .font_weight(FontWeight::BOLD)
-                        .child(Label::new(i18n::t(cx, "projects"))),
-                )
-                .child(div().flex_1())
-                .child({
-                    let state = state.clone();
-                    let folded = state.read(cx).all_projects_folded();
-                    IconButton::new(
-                        "projects-fold",
-                        if folded {
-                            IconName::ChevronsUpDown
-                        } else {
-                            IconName::List
-                        },
-                    )
-                    .variant(ButtonVariant::Ghost)
-                    .size(ely_gpui_component::theme::ControlSize::Sm)
-                    .tooltip(i18n::t(
-                        cx,
-                        if folded { "expand_all" } else { "collapse_all" },
-                    ))
-                    .on_click(move |_, _, cx| {
-                        state.update(cx, |s, cx| {
-                            let folded = s.all_projects_folded();
-                            s.set_all_projects_folded(!folded, cx);
-                        });
-                    })
-                })
-                .child({
-                    let state = state.clone();
-                    IconButton::new("projects-add", IconName::FolderPlus)
-                        .variant(ButtonVariant::Ghost)
-                        .size(ely_gpui_component::theme::ControlSize::Sm)
-                        .tooltip(i18n::t(cx, "add_project"))
-                        .on_click(move |_, window, cx| {
-                            let state = state.clone();
-                            let what = SharedString::from("add-project");
-                            forms_util::choose(
-                                what,
-                                gpui::PathPromptOptions {
-                                    files: false,
-                                    directories: true,
-                                    multiple: false,
-                                    prompt: Some(i18n::t(cx, "add_project")),
-                                },
-                                window,
-                                cx,
-                                move |paths, _, cx| {
-                                    state.update(cx, |s, cx| {
-                                        for path in paths {
-                                            s.add_project(path, cx);
-                                        }
-                                    });
-                                },
-                            );
-                        })
-                }),
-        )
-        .child(
             // The list must be the only growing part and stay inside the
             // window; without a bound its content stretches the whole row and
             // the session pane's composer lands below the window.
@@ -175,8 +103,82 @@ pub fn render(
                 .flex_1()
                 .min_h_0()
                 .min_w_0()
+                .flex()
+                .flex_col()
+                .child(
+                    // The section header: the static 项目 title, with all the
+                    // actions on the right. The fold button flips between collapse
+                    // and expand as the groups go.
+                    div()
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .gap_1p5()
+                        .px_3()
+                        .pb_1()
+                        .child(
+                            div()
+                                .text_size(theme.text_size(ely_gpui_component::theme::TextSize::Lg))
+                                .font_weight(FontWeight::BOLD)
+                                .child(Label::new(i18n::t(cx, "projects"))),
+                        )
+                        .child(div().flex_1())
+                        .child({
+                            let state = state.clone();
+                            let folded = state.read(cx).all_projects_folded();
+                            IconButton::new(
+                                "projects-fold",
+                                if folded {
+                                    IconName::ChevronsUpDown
+                                } else {
+                                    IconName::List
+                                },
+                            )
+                            .variant(ButtonVariant::Ghost)
+                            .size(ely_gpui_component::theme::ControlSize::Sm)
+                            .tooltip(i18n::t(
+                                cx,
+                                if folded { "expand_all" } else { "collapse_all" },
+                            ))
+                            .on_click(move |_, _, cx| {
+                                state.update(cx, |s, cx| {
+                                    let folded = s.all_projects_folded();
+                                    s.set_all_projects_folded(!folded, cx);
+                                });
+                            })
+                        })
+                        .child({
+                            let state = state.clone();
+                            IconButton::new("projects-add", IconName::FolderPlus)
+                                .variant(ButtonVariant::Ghost)
+                                .size(ely_gpui_component::theme::ControlSize::Sm)
+                                .tooltip(i18n::t(cx, "add_project"))
+                                .on_click(move |_, window, cx| {
+                                    let state = state.clone();
+                                    let what = SharedString::from("add-project");
+                                    forms_util::choose(
+                                        what,
+                                        gpui::PathPromptOptions {
+                                            files: false,
+                                            directories: true,
+                                            multiple: false,
+                                            prompt: Some(i18n::t(cx, "add_project")),
+                                        },
+                                        window,
+                                        cx,
+                                        move |paths, _, cx| {
+                                            state.update(cx, |s, cx| {
+                                                for path in paths {
+                                                    s.add_project(path, cx);
+                                                }
+                                            });
+                                        },
+                                    );
+                                })
+                        }),
+                )
                 .when(empty, |this| {
-                    this.child(div().px_3().child(Caption::new(i18n::t(cx, "no_sessions"))))
+                    this.child(div().px_4().child(Caption::new(i18n::t(cx, "no_sessions"))))
                 })
                 .when(!empty, |this| {
                     // Only the rows in view are built: a project's whole
@@ -278,8 +280,8 @@ fn group_row(
         .flex()
         .items_center()
         .gap_1p5()
-        .px_2()
-        .pt_2()
+        .px_3()
+        .pt_1()
         .pb_1()
         .cursor_pointer()
         .hover(|style| style.bg(colors.hover))
@@ -354,7 +356,7 @@ fn session_row(
         .items_center()
         .gap_1()
         .h(control_h)
-        .pl(px(8.) + label_lead)
+        .pl(px(12.) + label_lead)
         .pr_0p5()
         .rounded(radius_md)
         .text_size(text_sm)
