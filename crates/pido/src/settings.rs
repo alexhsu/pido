@@ -28,6 +28,10 @@ pub struct Settings {
     pub archived_sessions: Vec<String>,
     /// The sidebar's width in logical pixels, as last dragged.
     pub sidebar_width: Option<f32>,
+    /// The right panel's width in logical pixels, as last dragged.
+    pub right_width: Option<f32>,
+    /// Whether the right panel is open.
+    pub right_open: Option<bool>,
     pub window: Option<WindowState>,
 }
 

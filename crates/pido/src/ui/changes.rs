@@ -1,19 +1,17 @@
-//! The changes panel: the files the agent edited this session, and their
-//! hunks, beside the chat rather than over it.
+//! The changes review: the files the agent edited this session, and their
+//! hunks, living in the right panel's diff tab.
 //!
 //! The state side parses each finished `edit` patch (and each `write`'s new
 //! text) into stretches, so this view only lays out what it is given: a
-//! virtualised file list on the left, Ely's diff viewer on the right.
+//! file list on the left, Ely's diff viewer on the right.
 
-use ely_gpui_component::buttons::{ButtonVariant, IconButton};
 use ely_gpui_component::git::{DiffLayout, DiffStat, DiffViewer};
-use ely_gpui_component::primitives::{Icon, IconName, file_icon};
-use ely_gpui_component::theme::{ActiveTheme, ControlSize, Elevation, IconSize, TextSize};
+use ely_gpui_component::primitives::{Icon, file_icon};
+use ely_gpui_component::theme::{ActiveTheme, ControlSize, IconSize, TextSize};
 use ely_gpui_component::typography::MiddleEllipsis;
 use gpui::{
-    AnyElement, App, ClickEvent, ElementId, Entity, FontWeight, InteractiveElement, IntoElement,
-    ParentElement, StatefulInteractiveElement, Styled, Window, div, prelude::FluentBuilder, px,
-    relative,
+    AnyElement, App, ElementId, Entity, InteractiveElement, IntoElement, ParentElement,
+    StatefulInteractiveElement, Styled, div, prelude::FluentBuilder, px,
 };
 
 use crate::i18n;
@@ -31,7 +29,6 @@ pub fn render(
     let theme = cx.theme();
     let colors = theme.colors.clone();
     let files = state.read(cx).changes.clone();
-    let count = files.len();
 
     // The picked file, or the newest one when nothing is picked yet; the row
     // highlight and the diff must agree on which it is.
@@ -84,59 +81,12 @@ pub fn render(
             .into_any_element(),
     };
 
-    let close = {
-        let view = view.clone();
-        move |_: &ClickEvent, _: &mut Window, cx: &mut App| {
-            view.update(cx, |this, cx| {
-                this.diff_open = false;
-                cx.notify();
-            });
-        }
-    };
-
     div()
         .id("changes-panel")
-        .absolute()
-        .top_0()
-        .right_0()
-        .h_full()
-        .w(px(880.))
-        .max_w(relative(0.94))
+        .flex_1()
+        .min_h_0()
         .flex()
         .flex_col()
-        .bg(colors.overlay)
-        .border_l_1()
-        .border_color(colors.border)
-        .shadow(theme.elevation(Elevation::Modal))
-        .child(
-            div()
-                .flex_none()
-                .flex()
-                .items_center()
-                .gap_3()
-                .px_4()
-                .h(px(crate::ui::app::HEADER_HEIGHT))
-                .border_b_1()
-                .border_color(colors.border)
-                .child(
-                    div()
-                        .font_weight(FontWeight::MEDIUM)
-                        .child(i18n::t(cx, "changes")),
-                )
-                .child(
-                    div()
-                        .text_size(theme.text_size(TextSize::Sm))
-                        .text_color(colors.fg_subtle)
-                        .child(i18n::t_arg(cx, "changes_files", "n", &count.to_string())),
-                )
-                .child(div().flex_1())
-                .child(
-                    IconButton::new("changes-close", IconName::X)
-                        .variant(ButtonVariant::Ghost)
-                        .tooltip(i18n::t(cx, "changes_close"))
-                        .on_click(close),
-                ),
-        )
         .child(
             div()
                 .flex_1()

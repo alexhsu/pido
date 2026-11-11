@@ -14,7 +14,8 @@ A native desktop client for the [Pi coding agent](https://github.com/earendil-wo
 - **会话管理** — 侧栏按项目分组列出 `~/.pi/agent/sessions` 的历史会话,支持折叠、悬浮新建、拖拽调宽;点击恢复继续。右键菜单可置顶、重命名、分叉、复制 Session ID、在文件夹显示、归档(归档项收进侧栏底部的「已归档」折叠)
 - **消息操作** — 悬停用户消息显示提交时间和复制;悬停回答显示复制、从这轮分叉、token 用量和时间
 - **回合状态** — 提交后回答上方计时(「已工作 1分4秒」),结束定格为「已完成,用时 X」;完成后默认折叠工具调用和思考过程,点状态行可展开
-- **改动审查** — agent 用 `edit`/`write` 改过的文件按项目路径汇总,点开看统一/并排 diff,打开的历史会话也能重建
+- **改动审查** — agent 用 `edit`/`write` 改过的文件按项目路径汇总,在可调宽、可隐藏的右侧栏里看统一/并排 diff,打开的历史会话也能重建
+- **内置终端** — 右侧栏终端页运行真实 shell(Windows 为 PowerShell,Linux/macOS 为 `$SHELL`,ConPTY/PTY 驱动),可新建、随会话目录启动
 - **统计** — token 用量、成本、上下文占用,每轮结束后刷新
 - **亮暗主题 + 中英双语** — 一键切换,偏好持久化(含窗口尺寸、最近项目)
 - **A complete chat loop** — pick a project directory, stream replies, thinking, and tool-call cards live
@@ -23,7 +24,8 @@ A native desktop client for the [Pi coding agent](https://github.com/earendil-wo
 - **Sessions** — the sidebar lists past sessions grouped by project, with folding, a hover new-chat button and a draggable width; click to resume. The right-click menu pins, renames, forks, copies the session ID, reveals the file, and archives (archived sessions collect under an "Archived" fold at the bottom)
 - **Message actions** — hover a prompt for its time and a copy button; hover a reply for copy, fork-from-here, token usage and time
 - **Turn status** — a clock above the reply while it works ("Working · 1m 4s"), frozen to "Done in X" on completion; tool calls and thinking fold away, click the line to re-open
-- **Change review** — files the agent edited or wrote, with unified/split diffs, rebuilt for sessions loaded from history too
+- **Change review** — files the agent edited or wrote, in a resizable, hideable right panel with unified/split diffs; restored sessions too
+- **Built-in terminal** — the right panel's terminal tab runs a real shell (PowerShell on Windows, `$SHELL` on Linux/macOS) via ConPTY/PTY; spawn a fresh one any time
 - **Stats** — tokens, cost, and context usage refresh after every run
 - **Dark/light + 中文/English** — one-click toggle, persisted along with window size and last project
 
@@ -86,7 +88,7 @@ PI_SMOKE_PROMPT="hi" cargo run -p pi-rpc --example real_pi -- /tmp   # 完整流
 
 ## 状态与路线 / Status
 
-MVP(核心聊天客户端)已完成,扩展 UI 原生对话框(权限审批类扩展)、队列可视化、会话重命名、改动审查(diff 面板)均已支持。明确不在当前范围:bash 面板、内置终端、checkpoint 回溯、多 pi 进程并发。
+MVP(核心聊天客户端)已完成,扩展 UI 原生对话框(权限审批类扩展)、队列可视化、会话重命名、改动审查(右侧栏 diff)、内置终端均已支持。明确不在当前范围:checkpoint 回溯、多 pi 进程并发。
 
 依赖固定:`ely-gpui-component` 锁定 rev `e0f355a`,`gpui-pre =0.3.11`;升级视为显式变更。
 

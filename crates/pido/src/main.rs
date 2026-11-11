@@ -27,6 +27,9 @@ fn main() {
                 gpui::KeyBinding::new("ctrl-alt-f", ui::app::ForkSession, None),
                 gpui::KeyBinding::new("ctrl-shift-a", ui::app::ArchiveSession, None),
             ]);
+            // The terminal's own chords (copy/paste/clear/find) are scoped to
+            // the terminal's focus, so they sit alongside the app's.
+            ely_gpui_component::terminal::bind_keys(cx);
             match settings.theme.as_deref() {
                 Some("light") => Theme::set_mode_now(Mode::Light, cx),
                 _ => Theme::set_mode_now(Mode::Dark, cx),

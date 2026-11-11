@@ -43,10 +43,26 @@ pub struct PidoApp {
     rename_open: bool,
     rename_field: Option<gpui::Entity<TextInput>>,
     rename_target: Option<String>,
-    /// The changes panel: open, which file is picked, and its diff layout.
-    pub diff_open: bool,
+    /// The right panel: open, which file is picked, and its diff layout.
     pub diff_selected: Option<String>,
     pub diff_layout: ely_gpui_component::git::DiffLayout,
+    /// Which right-panel tab shows, and whether the panel is open at all.
+    pub right_tab: RightTab,
+    right_open: bool,
+    /// The right panel's share of the window, seeded from settings so a drag
+    /// stays put across frames.
+    right_seed: Vec<f32>,
+    /// The panel's terminal, spawned on first use and kept while the app runs.
+    pub terminal: Option<gpui::Entity<ely_gpui_component::terminal::Terminal>>,
+}
+
+/// The right panel's two tabs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RightTab {
+    /// Reviewing the session's file changes.
+    Diff,
+    /// A live shell next to the chat.
+    Terminal,
 }
 
 impl PidoApp {
@@ -74,6 +90,9 @@ impl PidoApp {
             .clamp(200.0, 480.0);
         let window_width = 1280.0;
         let share = (sidebar / window_width).clamp(0.1, 0.5);
+        let persisted = crate::settings::Settings::load();
+        let right_open = persisted.right_open.unwrap_or(false);
+        let right_share = (persisted.right_width.unwrap_or(560.0) / window_width).clamp(0.12, 0.6);
         let app = Self {
             split_seed: vec![share, 1.0 - share],
             focus,
@@ -87,9 +106,12 @@ impl PidoApp {
             rename_open: false,
             rename_field: None,
             rename_target: None,
-            diff_open: false,
             diff_selected: None,
             diff_layout: ely_gpui_component::git::DiffLayout::Unified,
+            right_tab: RightTab::Diff,
+            right_open,
+            right_seed: vec![1.0 - right_share, right_share],
+            terminal: None,
         };
         app.observe_window_for_quit(cx);
         app
@@ -117,6 +139,10 @@ impl PidoApp {
                 .multi_line(1, 8)
                 .placeholder_key("idle_hint")
         }));
+        // A session restored with the terminal tab out gets its shell back.
+        if self.right_open && self.right_tab == RightTab::Terminal {
+            self.ensure_terminal(cx);
+        }
         cx.notify();
     }
 
@@ -230,20 +256,11 @@ impl Render for PidoApp {
         let overlay = self
             .extension_dialog_overlay(&state, window, cx)
             .or_else(|| self.rename_dialog(cx));
-        // The changes panel slides over the chat; it closes itself when a new
-        // session empties the list.
-        let changes_open = self.diff_open && !state.read(cx).changes.is_empty();
-        self.diff_open = changes_open;
-        let changes = changes_open.then(|| {
-            crate::ui::changes::render(
-                &state,
-                &cx.entity(),
-                self.diff_selected.clone(),
-                self.diff_layout,
-                cx,
-            )
-            .into_any_element()
-        });
+        // The right panel mounts into the split when open; closing drops the
+        // pane, so the two-pane layout gets the full width back.
+        let right = self
+            .right_open
+            .then(|| crate::ui::panel::render(self, &cx.entity(), &state, cx).into_any_element());
 
         // The FocusScope must carry the window size itself: a percentage
         // height inside an unsized root resolves against auto, so the whole
@@ -265,36 +282,45 @@ impl Render for PidoApp {
                     .flex_row()
                     .bg(bg)
                     .text_color(fg)
-                    .child(
+                    // Three panes when the right panel is out, two when it
+                    // is tucked in; the seed re-seeds the drag state, so the
+                    // widths survive toggling.
+                    .child({
+                        let sizes = if self.right_open {
+                            self.split_seed_all()
+                        } else {
+                            self.split_seed.clone()
+                        };
+                        let width = f32::from(window.bounds().size.width);
                         SplitPane::new("shell", gpui::Axis::Horizontal, gpui::px(200.))
-                            .sizes(&self.split_seed)
+                            .sizes(&sizes)
                             .pane(sidebar::render(&state, &cx.entity(), window, cx))
                             .pane(main)
-                            .on_resize({
-                                let width = f32::from(window.bounds().size.width);
-                                move |shares, _, _| {
-                                    // Shares are fractions of the window; the
-                                    // sidebar's own width is what to keep.
-                                    let sidebar = shares[0] * width;
-                                    crate::settings::save_setting(|s| {
-                                        s.sidebar_width = Some(sidebar);
-                                    });
-                                }
-                            }),
-                    )
-                    // Dialogs sit above the review panel: an extension asking
-                    // for permission must not hide behind it.
-                    .children(changes)
+                            .children(right)
+                            .on_resize(move |shares, _, _| {
+                                // Shares are fractions of the window; each
+                                // pane's own width is what to keep. With two
+                                // panes the right width is not in play, so it
+                                // stays as it was.
+                                let sidebar = shares[0] * width;
+                                crate::settings::save_setting(|s| {
+                                    s.sidebar_width = Some(sidebar);
+                                    if let Some(right) = shares.get(2) {
+                                        s.right_width = Some(right * width);
+                                    }
+                                });
+                            })
+                    })
                     .children(overlay)
                     // Esc stops a running agent (clear queue + abort, the
                     // protocol's recommended Esc semantics). TextInput does not
                     // consume Escape, so this also works while the composer is
                     // focused.
                     .on_action(cx.listener(|this, _: &Stop, _window, cx| {
-                        // Esc backs out of the review before it stops a run.
-                        if this.diff_open {
-                            this.diff_open = false;
-                            cx.notify();
+                        // Esc backs out of the right panel before it stops a
+                        // run.
+                        if this.right_open {
+                            this.close_right(cx);
                             return;
                         }
                         if this.state.read(cx).streaming {
@@ -326,6 +352,86 @@ impl Render for PidoApp {
 }
 
 impl PidoApp {
+    /// The split's sizes with all three panes, from the persisted seeds.
+    fn split_seed_all(&self) -> Vec<f32> {
+        let left = self.split_seed[0] / (self.split_seed[0] + self.split_seed[1]);
+        let right = self.right_seed[1] / (self.right_seed[0] + self.right_seed[1]);
+        vec![left, 1.0 - left - right, right]
+    }
+
+    /// Open the right panel on `tab`; pressing the active tab's entry again
+    /// closes the panel, so the buttons double as toggles.
+    pub fn open_right(&mut self, tab: RightTab, cx: &mut Context<Self>) {
+        if self.right_open && self.right_tab == tab {
+            self.close_right(cx);
+            return;
+        }
+        self.right_open = true;
+        self.right_tab = tab;
+        if tab == RightTab::Diff {
+            // Reopen on the newest file rather than a stale pick.
+            self.diff_selected = None;
+        } else {
+            self.ensure_terminal(cx);
+        }
+        crate::settings::save_setting(|s| {
+            s.right_open = Some(true);
+        });
+        cx.notify();
+    }
+
+    /// Close the right panel; the terminal keeps running in the background.
+    pub fn close_right(&mut self, cx: &mut Context<Self>) {
+        self.right_open = false;
+        crate::settings::save_setting(|s| {
+            s.right_open = Some(false);
+        });
+        cx.notify();
+    }
+
+    /// The panel's shell, spawned on first use; a dead one spawns again.
+    fn ensure_terminal(&mut self, cx: &mut Context<Self>) {
+        use ely_gpui_component::terminal::{Launch, Terminal};
+        if self.terminal.is_some() {
+            return;
+        }
+        // PowerShell on Windows; the user's login shell elsewhere.
+        let program = if cfg!(windows) {
+            Some(("powershell.exe".to_string(), Vec::new()))
+        } else {
+            Some((
+                std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string()),
+                Vec::new(),
+            ))
+        };
+        let cwd = self.state.read(cx).cwd.clone().or_else(dirs::home_dir);
+        let launch = Launch {
+            program,
+            cwd,
+            env: Vec::new(),
+        };
+        let spawned = cx.new(|cx| Terminal::spawn(launch, cx).expect("terminal starts"));
+        cx.subscribe(
+            &spawned,
+            |this, _, event: &ely_gpui_component::terminal::TerminalEvent, cx| {
+                if let ely_gpui_component::terminal::TerminalEvent::Exited(_) = event {
+                    // The shell is gone; the next open spawns a fresh one.
+                    this.terminal = None;
+                    cx.notify();
+                }
+            },
+        )
+        .detach();
+        self.terminal = Some(spawned);
+    }
+
+    /// Spawn a fresh shell in the session's directory, dropping the old one.
+    pub fn restart_terminal(&mut self, cx: &mut Context<Self>) {
+        self.terminal = None;
+        self.ensure_terminal(cx);
+        cx.notify();
+    }
+
     /// Open the rename dialog over the current session's name.
     pub fn open_rename(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let (target, current) = {

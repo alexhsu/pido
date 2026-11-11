@@ -16,7 +16,7 @@ use pi_rpc::protocol::ThinkingLevel;
 
 use crate::i18n;
 use crate::state::{AppState, AssistantView, NoticeKind, TranscriptItem};
-use crate::ui::app::toggle_theme;
+use crate::ui::app::{RightTab, toggle_theme};
 
 /// The header row above the transcript: session title, theme and language
 /// toggles, compaction. Model and thinking picks live in the composer's
@@ -75,14 +75,17 @@ pub fn render_header(
                 ely_gpui_component::buttons::Button::new("open-changes", label)
                     .variant(ely_gpui_component::buttons::ButtonVariant::Ghost)
                     .on_click(move |_, _, cx| {
-                        view.update(cx, |this, cx| {
-                            this.diff_open = !this.diff_open;
-                            // Reopen on the newest file rather than a stale pick.
-                            this.diff_selected = None;
-                            cx.notify();
-                        });
+                        view.update(cx, |this, cx| this.open_right(RightTab::Diff, cx));
                     }),
             )
+        })
+        .child({
+            let view = view.clone();
+            ely_gpui_component::buttons::Button::new("open-terminal", i18n::t(cx, "terminal"))
+                .variant(ely_gpui_component::buttons::ButtonVariant::Ghost)
+                .on_click(move |_, _, cx| {
+                    view.update(cx, |this, cx| this.open_right(RightTab::Terminal, cx));
+                })
         })
         .child(
             ely_gpui_component::buttons::Button::new("theme", i18n::t(cx, "theme"))
