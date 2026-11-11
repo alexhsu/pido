@@ -43,12 +43,10 @@ pub fn render(
         theme.text_size(TextSize::Sm),
         theme.text_size(TextSize::Xs),
     );
-    // Sessions indent to where a project's label starts: past the
-    // disclosure and the folder mark that sit in front of it.
-    // gap_1p5 is 0.375rem at the theme's base size.
+    // Sessions indent to where a project's label starts: past the folder
+    // mark in front of it. gap_1p5 is 0.375rem at the theme's base size.
     let gap = gpui::Rems(0.375);
-    let label_lead = (theme.icon_size(IconSize::Xs) + gap + theme.icon_size(IconSize::Sm) + gap)
-        .to_pixels(window.rem_size());
+    let label_lead = (theme.icon_size(IconSize::Sm) + gap).to_pixels(window.rem_size());
     let app = state.clone();
     let s = state.read(cx);
     let can_start = s.conn == Conn::Live && !s.streaming;
