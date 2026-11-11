@@ -83,15 +83,16 @@ pub fn render(
                     .fit(gpui::ObjectFit::Contain)
                     .w(px(72.))
                     .h(px(34.)),
-                )
-                .child(
-                    Button::new("new-chat", i18n::t(cx, "new_chat"))
-                        .disabled(!can_start)
-                        .on_click({
-                            let app = app.clone();
-                            move |_, _, cx| app.update(cx, |s, cx| s.new_chat(cx))
-                        }),
                 ),
+        )
+        .child(
+            Button::new("new-chat", i18n::t(cx, "new_chat"))
+                .icon(IconName::SquarePen)
+                .disabled(!can_start)
+                .on_click({
+                    let app = app.clone();
+                    move |_, _, cx| app.update(cx, |s, cx| s.new_chat(cx))
+                }),
         )
         .child(
             // The list must be the only growing part and stay inside the

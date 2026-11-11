@@ -19,8 +19,11 @@ actions!(
 
 pub const HEADER_HEIGHT: f32 = 52.;
 
-/// The sidebar's width range, in logical pixels.
-const SIDEBAR_RANGE: std::ops::RangeInclusive<f32> = 200.0..=480.0;
+/// The sidebar's default width, in logical pixels.
+const SIDEBAR_DEFAULT: f32 = 264.0;
+/// The sidebar may drag to 0.8x–1.5x of that default.
+const SIDEBAR_RANGE: std::ops::RangeInclusive<f32> =
+    (SIDEBAR_DEFAULT * 0.8)..=(SIDEBAR_DEFAULT * 1.5);
 /// The right panel's width range, in logical pixels.
 const RIGHT_RANGE: std::ops::RangeInclusive<f32> = 200.0..=900.0;
 
@@ -103,7 +106,7 @@ impl PidoApp {
         let left_px = std::rc::Rc::new(std::cell::Cell::new(
             persisted
                 .sidebar_width
-                .unwrap_or(264.0)
+                .unwrap_or(SIDEBAR_DEFAULT)
                 .clamp(*SIDEBAR_RANGE.start(), *SIDEBAR_RANGE.end()),
         ));
         let right_px = std::rc::Rc::new(std::cell::Cell::new(
