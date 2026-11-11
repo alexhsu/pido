@@ -14,7 +14,7 @@ use ely_gpui_component::buttons::{Button, ButtonVariant, IconButton};
 use ely_gpui_component::forms as forms_util;
 use ely_gpui_component::lists::VirtualList;
 use ely_gpui_component::menus::{ContextMenu, Menu, MenuItem};
-use ely_gpui_component::primitives::{Disclosure, Icon, IconName};
+use ely_gpui_component::primitives::{Icon, IconName};
 use ely_gpui_component::theme::{ActiveTheme, ControlSize, IconSize, Radius, TextSize};
 use ely_gpui_component::typography::{Caption, Ellipsis, Label};
 use gpui::{
@@ -279,14 +279,13 @@ fn group_row(
         .items_center()
         .gap_1p5()
         .px_2()
-        .pt_3()
+        .pt_2()
         .pb_1()
         .cursor_pointer()
         .hover(|style| style.bg(colors.hover))
         .on_click(move |_, _, cx| {
             fold_state.update(cx, |s, cx| s.toggle_project(&fold_cwd, cx));
         })
-        .child(Disclosure::new(("fold", ix as u64), !folded))
         .child(Icon::new(mark).size(IconSize::Sm).color(colors.fg_subtle))
         .child(div().flex_1().min_w_0().child(Label::new(shown)))
         .when(folded, |this| {
