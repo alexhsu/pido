@@ -56,6 +56,11 @@ pub struct PidoApp {
     rename_open: bool,
     rename_field: Option<gpui::Entity<TextInput>>,
     rename_target: Option<String>,
+    /// The project-rename dialog: the project path being named. When set it
+    /// takes over the same dialog slot as the session rename.
+    rename_project: Option<String>,
+    /// The remove-project confirmation: which path it is about.
+    confirm_remove: Option<String>,
     /// The right panel: open, which file is picked, and its diff layout.
     pub diff_selected: Option<String>,
     pub diff_layout: ely_gpui_component::git::DiffLayout,
@@ -122,6 +127,8 @@ impl PidoApp {
             rename_open: false,
             rename_field: None,
             rename_target: None,
+            rename_project: None,
+            confirm_remove: None,
             diff_selected: None,
             diff_layout: ely_gpui_component::git::DiffLayout::Unified,
             right_tab: RightTab::Diff,
@@ -267,10 +274,12 @@ impl Render for PidoApp {
                 .into_any_element()
         };
 
-        // Extension and rename dialogs ride at the root, above every pane.
+        // Extension and rename dialogs ride at the root, above every pane;
+        // the remove-project confirmation joins them.
         let overlay = self
             .extension_dialog_overlay(&state, window, cx)
-            .or_else(|| self.rename_dialog(cx));
+            .or_else(|| self.rename_dialog(cx))
+            .or_else(|| self.remove_project_dialog(cx));
         // The right panel mounts into the split when open; closing drops the
         // pane, so the two-pane layout gets the full width back.
         let right = self
@@ -453,6 +462,67 @@ impl PidoApp {
         cx.notify();
     }
 
+    /// Open the rename dialog over a project's sidebar label.
+    pub fn open_project_rename(
+        &mut self,
+        cwd: String,
+        label: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.rename_project = Some(cwd);
+        self.open_rename_with(None, label, window, cx);
+    }
+
+    /// Ask before dropping a project from the sidebar; its sessions stay on
+    /// disk either way.
+    pub fn confirm_remove_project(&mut self, cwd: String, cx: &mut Context<Self>) {
+        self.confirm_remove = Some(cwd);
+        cx.notify();
+    }
+
+    /// The remove-project confirmation, while one is pending.
+    fn remove_project_dialog(&mut self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        use ely_gpui_component::overlays::ConfirmDialog;
+
+        let cwd = self.confirm_remove.clone()?;
+        let me = cx.entity();
+        let label = self
+            .state
+            .read(cx)
+            .project_labels
+            .get(&crate::state::session_key(&cwd))
+            .cloned()
+            .unwrap_or_else(|| crate::state::shorten_project_display(&cwd));
+        let message = crate::i18n::t_arg(cx, "remove_project_desc", "name", &label).to_string();
+        let shut_me = me.clone();
+        let confirm_me = me.clone();
+        let shut = move |_: &mut Window, cx: &mut App| {
+            shut_me.update(cx, |this, cx| {
+                this.confirm_remove = None;
+                cx.notify();
+            });
+        };
+        Some(
+            ConfirmDialog::new(
+                "remove-project-dialog",
+                crate::i18n::t(cx, "remove_project"),
+                message,
+                shut,
+            )
+            .confirm(crate::i18n::t(cx, "remove_confirm"))
+            .destructive()
+            .on_confirm(move |_, cx| {
+                confirm_me.update(cx, |this, cx| {
+                    let cwd = this.confirm_remove.take().unwrap_or_default();
+                    this.state.update(cx, |s, cx| s.remove_project(&cwd, cx));
+                    cx.notify();
+                });
+            })
+            .into_any_element(),
+        )
+    }
+
     /// Open the rename dialog over the current session's name.
     pub fn open_rename(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let (target, current) = {
@@ -517,20 +587,27 @@ impl PidoApp {
         cx.notify();
     }
 
-    /// Commit the rename dialog's field, then close it.
+    /// Commit the rename dialog's field, then close it. A project rename is
+    /// a sidebar label; a session rename goes through pi or the file.
     fn finish_rename(&mut self, field: &gpui::Entity<TextInput>, cx: &mut Context<Self>) {
         let name = field.read(cx).text().to_string();
-        match self.rename_target.clone() {
-            Some(path) => self
-                .state
-                .update(cx, |state, cx| state.rename_session_at(&path, name, cx)),
-            None => self
-                .state
-                .update(cx, |state, cx| state.rename_session(name, cx)),
+        if let Some(cwd) = self.rename_project.clone() {
+            self.state
+                .update(cx, |state, cx| state.rename_project(&cwd, &name, cx));
+        } else {
+            match self.rename_target.clone() {
+                Some(path) => self
+                    .state
+                    .update(cx, |state, cx| state.rename_session_at(&path, name, cx)),
+                None => self
+                    .state
+                    .update(cx, |state, cx| state.rename_session(name, cx)),
+            }
         }
         self.rename_open = false;
         self.rename_field = None;
         self.rename_target = None;
+        self.rename_project = None;
         cx.notify();
     }
 
@@ -549,6 +626,7 @@ impl PidoApp {
                 this.rename_open = false;
                 this.rename_field = None;
                 this.rename_target = None;
+                this.rename_project = None;
                 cx.notify();
             });
         };
@@ -559,11 +637,18 @@ impl PidoApp {
         let focus = field.read(cx).focus().clone();
         // Labels resolve here: the action closures must be 'static, so they
         // cannot borrow `cx` to look a string up when they run.
-        let title = crate::i18n::t(cx, "rename");
+        let (title, dialog_id) = if self.rename_project.is_some() {
+            (
+                crate::i18n::t(cx, "rename_project"),
+                "project-rename-dialog",
+            )
+        } else {
+            (crate::i18n::t(cx, "rename"), "rename-dialog")
+        };
         let cancel_label = crate::i18n::t(cx, "ext_cancel");
         let save_label = crate::i18n::t(cx, "save");
         Some(
-            Dialog::new("rename-dialog", title, shut)
+            Dialog::new(dialog_id, title, shut)
                 .focus_first(focus)
                 .child(field)
                 .action({

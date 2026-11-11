@@ -320,6 +320,7 @@ fn session_row(session: &sessions::SessionSummary, pinned: bool, archived: bool)
 fn flatten_groups(
     groups: &[SessionGroup],
     collapsed: &std::collections::HashSet<String>,
+    labels: &HashMap<String, String>,
     pinned: &HashSet<String>,
     archived: &HashSet<String>,
 ) -> Vec<SidebarRow> {
@@ -334,6 +335,11 @@ fn flatten_groups(
         let is_archived = |session: &sessions::SessionSummary| {
             archived.contains(&session_key(&session.path.to_string_lossy()))
         };
+        // The user's label wins over the folder's tail.
+        let label = labels
+            .get(&session_key(&group.cwd))
+            .cloned()
+            .unwrap_or_else(|| shorten_project(&group.cwd));
         let active: Vec<&sessions::SessionSummary> = group
             .sessions
             .iter()
@@ -342,7 +348,7 @@ fn flatten_groups(
         archived_sessions.extend(group.sessions.iter().filter(|session| is_archived(session)));
         let folded = collapsed.contains(&group.cwd);
         rows.push(SidebarRow::Group {
-            label: shorten_project(&group.cwd).into(),
+            label: label.into(),
             cwd: group.cwd.clone().into(),
             folded,
             sessions: active.len(),
@@ -548,6 +554,10 @@ fn stretches_stat(stretches: &[Stretch]) -> (usize, usize) {
 }
 
 /// `D:\develop\code\pido` → `code / pido`, so a project header stays short.
+/// The dialog messages reuse it under a display-oriented alias.
+pub fn shorten_project_display(path: &str) -> String {
+    shorten_project(path)
+}
 pub fn shorten_project(path: &str) -> String {
     let normalized = path.replace('\\', "/");
     let parts: Vec<&str> = normalized.split('/').filter(|p| !p.is_empty()).collect();
@@ -650,6 +660,8 @@ pub struct AppState {
     pub collapsed_projects: std::collections::HashSet<String>,
     /// Project folders the user added; they list even without sessions.
     pub user_projects: Vec<String>,
+    /// Sidebar labels the user gave projects, keyed like pin/archive sets.
+    pub project_labels: HashMap<String, String>,
     /// Sessions the user pinned, as normalized keys.
     pub pinned_sessions: HashSet<String>,
     /// Sessions the user archived, as normalized keys.
@@ -740,6 +752,7 @@ impl AppState {
                 sidebar_rows: Vec::new(),
                 collapsed_projects: collapsed,
                 user_projects,
+                project_labels: persisted.project_labels.iter().cloned().collect(),
                 pinned_sessions,
                 archived_sessions,
                 session_name: None,
@@ -1010,6 +1023,7 @@ impl AppState {
         flatten_groups(
             &self.session_groups,
             &self.collapsed_projects,
+            &self.project_labels,
             &self.pinned_sessions,
             &self.archived_sessions,
         )
@@ -1082,6 +1096,38 @@ impl AppState {
         // to it.
         self.collapsed_projects.remove(&cwd);
         self.refresh_sessions(cx);
+        self.sidebar_rows = self.sidebar_rows_now();
+        cx.notify();
+    }
+
+    /// Drop a project from the sidebar: forget the user-added entry, and
+    /// fold bookkeeping for it. The sessions stay on disk; only the added
+    /// project row goes away.
+    pub fn remove_project(&mut self, cwd: &str, cx: &mut Context<Self>) {
+        self.user_projects
+            .retain(|project| session_key(project) != session_key(cwd));
+        crate::settings::save_setting(|s| s.projects = self.user_projects.clone());
+        self.collapsed_projects.remove(cwd);
+        self.refresh_sessions(cx);
+        self.sidebar_rows = self.sidebar_rows_now();
+        cx.notify();
+    }
+
+    /// Rename a project's sidebar label. Projects take their name from the
+    /// folder, so this is an alias: stored per project, shown instead of the
+    /// folder's tail.
+    pub fn rename_project(&mut self, cwd: &str, name: &str, cx: &mut Context<Self>) {
+        let name = name.trim().to_string();
+        if name.is_empty() {
+            return;
+        }
+        self.project_labels.insert(session_key(cwd), name.clone());
+        let labels: Vec<(String, String)> = self
+            .project_labels
+            .iter()
+            .map(|(key, label)| (key.clone(), label.clone()))
+            .collect();
+        crate::settings::save_setting(|s| s.project_labels = labels);
         self.sidebar_rows = self.sidebar_rows_now();
         cx.notify();
     }
@@ -3135,6 +3181,7 @@ mod tests {
             sidebar_rows: Vec::new(),
             collapsed_projects: std::collections::HashSet::new(),
             user_projects: Vec::new(),
+            project_labels: HashMap::new(),
             pinned_sessions: HashSet::new(),
             archived_sessions: HashSet::new(),
             session_name: None,
@@ -3618,12 +3665,19 @@ mod sidebar_tests {
             &Default::default(),
             &Default::default(),
             &Default::default(),
+            &Default::default(),
         );
         assert_eq!(open.len(), 2 + 3 + 2, "two headers and five sessions");
 
         let mut folded = std::collections::HashSet::new();
         folded.insert("D:/a".to_string());
-        let rows = flatten_groups(&groups, &folded, &Default::default(), &Default::default());
+        let rows = flatten_groups(
+            &groups,
+            &folded,
+            &Default::default(),
+            &Default::default(),
+            &Default::default(),
+        );
         assert_eq!(
             rows.len(),
             2 + 2,
@@ -3654,7 +3708,13 @@ mod sidebar_tests {
         let mut pinned = HashSet::new();
         pinned.insert(session_key("D:/a/s2.jsonl"));
 
-        let rows = flatten_groups(&groups, &Default::default(), &pinned, &Default::default());
+        let rows = flatten_groups(
+            &groups,
+            &Default::default(),
+            &Default::default(),
+            &pinned,
+            &Default::default(),
+        );
         match &rows[1] {
             SidebarRow::Session { path, pinned, .. } => {
                 assert!(path.ends_with("s2.jsonl"), "the pinned session leads");
@@ -3666,7 +3726,13 @@ mod sidebar_tests {
 
         let mut archived = HashSet::new();
         archived.insert(session_key("D:/a/s1.jsonl"));
-        let rows = flatten_groups(&groups, &Default::default(), &HashSet::new(), &archived);
+        let rows = flatten_groups(
+            &groups,
+            &Default::default(),
+            &Default::default(),
+            &HashSet::new(),
+            &archived,
+        );
         let group_a = match &rows[0] {
             SidebarRow::Group { sessions, .. } => *sessions,
             other => panic!("expected a group, got {other:?}"),

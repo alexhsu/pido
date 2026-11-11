@@ -35,6 +35,9 @@ pub struct Settings {
     /// Project folders the user added; they list even without sessions.
     #[serde(default)]
     pub projects: Vec<String>,
+    /// Sidebar labels the user gave projects, as (key, label) pairs.
+    #[serde(default)]
+    pub project_labels: Vec<(String, String)>,
     pub window: Option<WindowState>,
 }
 

@@ -205,6 +205,7 @@ pub fn render(
                                         cx,
                                         ix,
                                         &state,
+                                        &view,
                                         label.clone(),
                                         cwd.clone(),
                                         *folded,
@@ -251,6 +252,7 @@ fn group_row(
     cx: &App,
     ix: usize,
     state: &Entity<AppState>,
+    view: &Entity<PidoApp>,
     label: SharedString,
     cwd: SharedString,
     folded: bool,
@@ -266,14 +268,14 @@ fn group_row(
     let shown = if archived {
         i18n::t(cx, "archived")
     } else {
-        label
+        label.clone()
     };
     let mark = if archived {
         IconName::Archive
     } else {
         IconName::Folder
     };
-    div()
+    let row = div()
         .id(("project", ix as u64))
         .group(group.clone())
         .w_full()
@@ -314,8 +316,69 @@ fn group_row(
                             .color(colors.fg_subtle),
                     ),
             )
-        })
-        .into_any_element()
+        });
+
+    // Projects carry the rename / reveal / remove menu; the archive fold
+    // does not.
+    if archived {
+        return row.into_any_element();
+    }
+    let menu = project_menu(cx, state, view, &cwd, label);
+    let host = ContextMenu::new(("project-menu", ix as u64), menu)
+        .w_full()
+        .child(row);
+    host.into_any_element()
+}
+
+/// The project's right-click menu: rename the label, show the folder, or
+/// remove the project from the sidebar (its sessions stay on disk).
+fn project_menu(
+    cx: &App,
+    _state: &Entity<AppState>,
+    view: &Entity<PidoApp>,
+    cwd: &SharedString,
+    label: SharedString,
+) -> Menu {
+    let rename = MenuItem::new(i18n::t(cx, "rename_action"))
+        .icon(IconName::Pencil)
+        .on_click({
+            let view = view.clone();
+            let cwd = cwd.to_string();
+            let label = label.clone();
+            move |window, cx| {
+                view.update(cx, |this, cx| {
+                    this.open_project_rename(cwd.clone(), label.to_string(), window, cx);
+                });
+            }
+        });
+
+    let reveal = MenuItem::new(i18n::t(cx, "reveal_in_folder"))
+        .icon(IconName::FolderOpen)
+        .on_click({
+            let cwd = cwd.to_string();
+            move |_, _| {
+                crate::state::reveal_in_folder(std::path::Path::new(&cwd));
+            }
+        });
+
+    let remove = MenuItem::new(i18n::t(cx, "remove_project"))
+        .icon(IconName::Trash2)
+        .on_click({
+            let view = view.clone();
+            let cwd = cwd.to_string();
+            move |_, cx| {
+                view.update(cx, |this, cx| {
+                    this.confirm_remove_project(cwd.clone(), cx);
+                });
+            }
+        });
+
+    Menu::new()
+        .item(rename)
+        .separator()
+        .item(reveal)
+        .separator()
+        .item(remove)
 }
 
 /// One session row, wrapped in its right-click menu.
