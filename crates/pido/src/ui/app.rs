@@ -17,13 +17,26 @@ actions!(
     [Stop, PinSession, RenameSession, ForkSession, ArchiveSession]
 );
 
-/// Height of the session header above the chat pane.
 pub const HEADER_HEIGHT: f32 = 52.;
 
+/// The sidebar's width range, in logical pixels.
+const SIDEBAR_RANGE: std::ops::RangeInclusive<f32> = 200.0..=480.0;
+/// The right panel's width range, in logical pixels.
+const RIGHT_RANGE: std::ops::RangeInclusive<f32> = 200.0..=900.0;
+
+/// Keep a pane's width inside its range; dragging past a bound holds the
+/// value there, and the next render reseeds the split back into range.
+fn clamp_width(width: f32, range: &std::ops::RangeInclusive<f32>) -> f32 {
+    width.clamp(*range.start(), *range.end())
+}
+
 pub struct PidoApp {
-    /// Sidebar share of the window, seeded once from settings so a drag stays
-    /// put across frames (SplitPane replaces its state when the seed changes).
-    split_seed: Vec<f32>,
+    /// The panes' widths in logical pixels, always clamped to their ranges.
+    /// Shared with the resize handler, which cannot reach the view: dragging
+    /// past a limit holds the value at the limit, and the next render reseeds
+    /// the split back into range.
+    left_px: std::rc::Rc<std::cell::Cell<f32>>,
+    right_px: std::rc::Rc<std::cell::Cell<f32>>,
     pub focus: FocusHandle,
     pub state: gpui::Entity<AppState>,
     /// The composer's multi-line field, owned here so it survives re-renders.
@@ -49,9 +62,6 @@ pub struct PidoApp {
     /// Which right-panel tab shows, and whether the panel is open at all.
     pub right_tab: RightTab,
     right_open: bool,
-    /// The right panel's share of the window, seeded from settings so a drag
-    /// stays put across frames.
-    right_seed: Vec<f32>,
     /// The panel's terminal, spawned on first use and kept while the app runs.
     pub terminal: Option<gpui::Entity<ely_gpui_component::terminal::Terminal>>,
 }
@@ -84,17 +94,23 @@ impl PidoApp {
             cx.notify();
         })
         .detach();
-        let sidebar = crate::settings::Settings::load()
-            .sidebar_width
-            .unwrap_or(264.0)
-            .clamp(200.0, 480.0);
-        let window_width = 1280.0;
-        let share = (sidebar / window_width).clamp(0.1, 0.5);
         let persisted = crate::settings::Settings::load();
+        let left_px = std::rc::Rc::new(std::cell::Cell::new(
+            persisted
+                .sidebar_width
+                .unwrap_or(264.0)
+                .clamp(*SIDEBAR_RANGE.start(), *SIDEBAR_RANGE.end()),
+        ));
+        let right_px = std::rc::Rc::new(std::cell::Cell::new(
+            persisted
+                .right_width
+                .unwrap_or(560.0)
+                .clamp(*RIGHT_RANGE.start(), *RIGHT_RANGE.end()),
+        ));
         let right_open = persisted.right_open.unwrap_or(false);
-        let right_share = (persisted.right_width.unwrap_or(560.0) / window_width).clamp(0.12, 0.6);
         let app = Self {
-            split_seed: vec![share, 1.0 - share],
+            left_px,
+            right_px,
             focus,
             state,
             draft: None,
@@ -110,7 +126,6 @@ impl PidoApp {
             diff_layout: ely_gpui_component::git::DiffLayout::Unified,
             right_tab: RightTab::Diff,
             right_open,
-            right_seed: vec![1.0 - right_share, right_share],
             terminal: None,
         };
         app.observe_window_for_quit(cx);
@@ -283,30 +298,32 @@ impl Render for PidoApp {
                     .bg(bg)
                     .text_color(fg)
                     // Three panes when the right panel is out, two when it
-                    // is tucked in; the seed re-seeds the drag state, so the
-                    // widths survive toggling.
+                    // is tucked in; the sizes come from the clamped widths.
                     .child({
-                        let sizes = if self.right_open {
-                            self.split_seed_all()
-                        } else {
-                            self.split_seed.clone()
-                        };
                         let width = f32::from(window.bounds().size.width);
+                        let sizes = self.pane_sizes(width);
+                        let left_cell = self.left_px.clone();
+                        let right_cell = self.right_px.clone();
                         SplitPane::new("shell", gpui::Axis::Horizontal, gpui::px(200.))
                             .sizes(&sizes)
                             .pane(sidebar::render(&state, &cx.entity(), window, cx))
                             .pane(main)
                             .children(right)
                             .on_resize(move |shares, _, _| {
-                                // Shares are fractions of the window; each
-                                // pane's own width is what to keep. With two
-                                // panes the right width is not in play, so it
-                                // stays as it was.
-                                let sidebar = shares[0] * width;
+                                // Shares are fractions of the window; each pane
+                                // keeps its clamped width, so dragging past a
+                                // limit holds there and snaps back on release.
+                                let left = clamp_width(shares[0] * width, &SIDEBAR_RANGE);
+                                left_cell.set(left);
+                                if let Some(share) = shares.get(2) {
+                                    let right = clamp_width(share * width, &RIGHT_RANGE);
+                                    right_cell.set(right);
+                                }
+                                let (left, right) = (left_cell.get(), right_cell.get());
                                 crate::settings::save_setting(|s| {
-                                    s.sidebar_width = Some(sidebar);
-                                    if let Some(right) = shares.get(2) {
-                                        s.right_width = Some(right * width);
+                                    s.sidebar_width = Some(left);
+                                    if shares.len() > 2 {
+                                        s.right_width = Some(right);
                                     }
                                 });
                             })
@@ -352,11 +369,15 @@ impl Render for PidoApp {
 }
 
 impl PidoApp {
-    /// The split's sizes with all three panes, from the persisted seeds.
-    fn split_seed_all(&self) -> Vec<f32> {
-        let left = self.split_seed[0] / (self.split_seed[0] + self.split_seed[1]);
-        let right = self.right_seed[1] / (self.right_seed[0] + self.right_seed[1]);
-        vec![left, 1.0 - left - right, right]
+    /// The split's sizes, in shares of the window, from the clamped widths.
+    fn pane_sizes(&self, window_width: f32) -> Vec<f32> {
+        let left = self.left_px.get() / window_width;
+        if self.right_open {
+            let right = self.right_px.get() / window_width;
+            vec![left, 1.0 - left - right, right]
+        } else {
+            vec![left, 1.0 - left]
+        }
     }
 
     /// Open the right panel on `tab`; pressing the active tab's entry again

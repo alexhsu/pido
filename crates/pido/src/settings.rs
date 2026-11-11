@@ -32,6 +32,9 @@ pub struct Settings {
     pub right_width: Option<f32>,
     /// Whether the right panel is open.
     pub right_open: Option<bool>,
+    /// Project folders the user added; they list even without sessions.
+    #[serde(default)]
+    pub projects: Vec<String>,
     pub window: Option<WindowState>,
 }
 

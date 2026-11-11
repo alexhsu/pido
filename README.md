@@ -11,7 +11,7 @@ A native desktop client for the [Pi coding agent](https://github.com/earendil-wo
 - **完整聊天闭环** — 选择项目目录启动会话,流式输出、思考过程、工具调用卡片实时呈现
 - **运行中转向** — agent 执行中继续输入即 steer(转向);排队中的消息以标签显示在输入框上方,可一键清空;Esc 或停止按钮 = 清空队列 + 中止
 - **模型与思考级别切换** — 输入框右下角的模型胶囊,两级菜单切换 provider 模型和 thinking level
-- **会话管理** — 侧栏按项目分组列出 `~/.pi/agent/sessions` 的历史会话,支持折叠、悬浮新建、拖拽调宽;点击恢复继续。右键菜单可置顶、重命名、分叉、复制 Session ID、在文件夹显示、归档(归档项收进侧栏底部的「已归档」折叠)
+- **会话管理** — 侧栏按项目分组列出 `~/.pi/agent/sessions` 的历史会话:「项目」标题栏可一键全部折叠、"+" 添加任意文件夹为项目(无会话也常驻列表),拖拽调宽且限定 200–480px;右键菜单可置顶、重命名、分叉、复制 Session ID、在文件夹显示、归档(归档项收进底部「已归档」折叠)
 - **消息操作** — 悬停用户消息显示提交时间和复制;悬停回答显示复制、从这轮分叉、token 用量和时间
 - **回合状态** — 提交后回答上方计时(「已工作 1分4秒」),结束定格为「已完成,用时 X」;完成后默认折叠工具调用和思考过程,点状态行可展开
 - **改动审查** — agent 用 `edit`/`write` 改过的文件按项目路径汇总,在可调宽、可隐藏的右侧栏里看统一/并排 diff,打开的历史会话也能重建
@@ -21,7 +21,7 @@ A native desktop client for the [Pi coding agent](https://github.com/earendil-wo
 - **A complete chat loop** — pick a project directory, stream replies, thinking, and tool-call cards live
 - **Steering** — typing while the agent runs steers it; queued messages show as chips over the composer and can be cleared in one click; Esc or the stop button clears the queue and aborts
 - **Model & thinking switching** — the model pill at the composer's right opens two levels: model and thinking level
-- **Sessions** — the sidebar lists past sessions grouped by project, with folding, a hover new-chat button and a draggable width; click to resume. The right-click menu pins, renames, forks, copies the session ID, reveals the file, and archives (archived sessions collect under an "Archived" fold at the bottom)
+- **Sessions** — the sidebar lists past sessions grouped by project: the "Projects" header folds everything at once and a "+" button adds any folder as a project (it stays listed even with no sessions); the width drags between 200–480px. The right-click menu pins, renames, forks, copies the session ID, reveals the file, and archives (archived sessions collect under an "Archived" fold at the bottom)
 - **Message actions** — hover a prompt for its time and a copy button; hover a reply for copy, fork-from-here, token usage and time
 - **Turn status** — a clock above the reply while it works ("Working · 1m 4s"), frozen to "Done in X" on completion; tool calls and thinking fold away, click the line to re-open
 - **Change review** — files the agent edited or wrote, in a resizable, hideable right panel with unified/split diffs; restored sessions too

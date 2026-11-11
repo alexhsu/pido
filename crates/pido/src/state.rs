@@ -648,6 +648,8 @@ pub struct AppState {
     /// Projects the user folded shut, keyed by working directory. The
     /// archive fold uses the empty string.
     pub collapsed_projects: std::collections::HashSet<String>,
+    /// Project folders the user added; they list even without sessions.
+    pub user_projects: Vec<String>,
     /// Sessions the user pinned, as normalized keys.
     pub pinned_sessions: HashSet<String>,
     /// Sessions the user archived, as normalized keys.
@@ -709,6 +711,7 @@ impl AppState {
     pub fn new(cx: &mut App) -> Entity<Self> {
         let persisted = crate::settings::Settings::load();
         let last_project = persisted.last_project;
+        let user_projects = persisted.projects.clone();
         let pinned_sessions = persisted
             .pinned_sessions
             .iter()
@@ -736,6 +739,7 @@ impl AppState {
                 session_groups: Vec::new(),
                 sidebar_rows: Vec::new(),
                 collapsed_projects: collapsed,
+                user_projects,
                 pinned_sessions,
                 archived_sessions,
                 session_name: None,
@@ -1054,6 +1058,56 @@ impl AppState {
         toggle_fold(&mut self.collapsed_projects, cwd);
         self.sidebar_rows = self.sidebar_rows_now();
         cx.notify();
+    }
+
+    /// Add a project folder to the sidebar. It keeps its place across
+    /// restarts and shows even before it has any sessions; the folder's own
+    /// name is its label, as `shorten_project` renders it.
+    pub fn add_project(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        let cwd = match path.canonicalize() {
+            Ok(cwd) => cwd.to_string_lossy().into_owned(),
+            Err(error) => {
+                self.push_notice(NoticeKind::Error, format!("add project: {error}"));
+                cx.notify();
+                return;
+            }
+        };
+        let known = self.user_projects.iter().any(|project| project == &cwd)
+            || self.session_groups.iter().any(|group| group.cwd == cwd);
+        if !known {
+            self.user_projects.push(cwd.clone());
+            crate::settings::save_setting(|s| s.projects = self.user_projects.clone());
+        }
+        // The scan merges it in; if it is already there the list just unfolds
+        // to it.
+        self.collapsed_projects.remove(&cwd);
+        self.refresh_sessions(cx);
+        self.sidebar_rows = self.sidebar_rows_now();
+        cx.notify();
+    }
+
+    /// Fold or unfold every project group at once (the header's chevron).
+    pub fn set_all_projects_folded(&mut self, folded: bool, cx: &mut Context<Self>) {
+        self.collapsed_projects.clear();
+        if folded {
+            for group in &self.session_groups {
+                if group.cwd.is_empty() {
+                    continue; // the archive fold keeps its own state
+                }
+                self.collapsed_projects.insert(group.cwd.clone());
+            }
+            self.collapsed_projects.insert(String::new());
+        }
+        self.sidebar_rows = self.sidebar_rows_now();
+        cx.notify();
+    }
+
+    /// Whether every project group is currently folded (drives the header's
+    /// chevron).
+    pub fn all_projects_folded(&self) -> bool {
+        self.session_groups
+            .iter()
+            .all(|group| group.cwd.is_empty() || self.collapsed_projects.contains(&group.cwd))
     }
 
     /// Pin or unpin a session; pinned sessions lead their project group.
@@ -1752,7 +1806,7 @@ impl AppState {
                 })
                 .await;
             this.update(cx, |s, cx| {
-                s.session_groups = groups;
+                s.session_groups = merge_user_projects(groups, &s.user_projects);
                 s.sidebar_rows = s.sidebar_rows_now();
                 cx.notify();
             })
@@ -2818,6 +2872,20 @@ pub(crate) fn fork_point_for(items: &[TranscriptItem], ix: usize) -> Option<(Str
     Some((text, occurrence))
 }
 
+/// Fold the user's added projects into the scan: a project without sessions
+/// still gets its group, in the order the user added them.
+fn merge_user_projects(mut groups: Vec<SessionGroup>, projects: &[String]) -> Vec<SessionGroup> {
+    for project in projects {
+        if !groups.iter().any(|group| group.cwd == *project) {
+            groups.push(SessionGroup {
+                cwd: project.clone(),
+                sessions: Vec::new(),
+            });
+        }
+    }
+    groups
+}
+
 /// Whether the row at `ix` sits in a finished, still-folded turn: its tool
 /// calls, notices and thinking are hidden until the turn is re-opened.
 pub(crate) fn turn_folded_for(
@@ -3066,6 +3134,7 @@ mod tests {
             session_groups: Vec::new(),
             sidebar_rows: Vec::new(),
             collapsed_projects: std::collections::HashSet::new(),
+            user_projects: Vec::new(),
             pinned_sessions: HashSet::new(),
             archived_sessions: HashSet::new(),
             session_name: None,

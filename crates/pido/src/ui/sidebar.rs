@@ -10,16 +10,17 @@
 //! and captions, not on the list, so the hover and active backgrounds span
 //! the full sidebar width. A right click opens the session menu.
 
-use ely_gpui_component::buttons::Button;
+use ely_gpui_component::buttons::{Button, ButtonVariant, IconButton};
+use ely_gpui_component::forms as forms_util;
 use ely_gpui_component::lists::VirtualList;
 use ely_gpui_component::menus::{ContextMenu, Menu, MenuItem};
 use ely_gpui_component::primitives::{Disclosure, Icon, IconName};
 use ely_gpui_component::theme::{ActiveTheme, ControlSize, IconSize, Radius, TextSize};
 use ely_gpui_component::typography::{Caption, Ellipsis, Label};
 use gpui::{
-    AnyElement, App, ClipboardItem, Entity, InteractiveElement, IntoElement, MouseButton,
-    ParentElement, Pixels, SharedString, StatefulInteractiveElement, Styled, Window, div,
-    prelude::FluentBuilder, px,
+    AnyElement, App, ClipboardItem, Entity, FontWeight, InteractiveElement, IntoElement,
+    MouseButton, ParentElement, Pixels, SharedString, StatefulInteractiveElement, Styled, Window,
+    div, prelude::FluentBuilder, px,
 };
 
 use crate::i18n;
@@ -93,6 +94,84 @@ pub fn render(
                             move |_, _, cx| app.update(cx, |s, cx| s.new_chat(cx))
                         }),
                 ),
+        )
+        .child(
+            // The section header: 项目 with a fold-all chevron, and on the
+            // right, collapse-all and add-project buttons.
+            div()
+                .flex_none()
+                .flex()
+                .items_center()
+                .gap_1p5()
+                .px_2()
+                .pb_1()
+                .child({
+                    let state = state.clone();
+                    let folded = state.read(cx).all_projects_folded();
+                    div()
+                        .id("projects-header")
+                        .flex()
+                        .items_center()
+                        .gap_1p5()
+                        .cursor_pointer()
+                        .hover(|style| style.bg(colors.hover))
+                        .rounded(radius_md)
+                        .py_0p5()
+                        .pr_1()
+                        .on_click(move |_, _, cx| {
+                            state.update(cx, |s, cx| {
+                                let folded = s.all_projects_folded();
+                                s.set_all_projects_folded(!folded, cx);
+                            });
+                        })
+                        .child(Disclosure::new("projects-fold", !folded))
+                        .child(
+                            div()
+                                .text_size(text_sm)
+                                .font_weight(FontWeight::MEDIUM)
+                                .child(Label::new(i18n::t(cx, "projects"))),
+                        )
+                })
+                .child(div().flex_1())
+                .child({
+                    let state = state.clone();
+                    IconButton::new("projects-collapse", IconName::List)
+                        .variant(ButtonVariant::Ghost)
+                        .size(ely_gpui_component::theme::ControlSize::Sm)
+                        .tooltip(i18n::t(cx, "collapse_all"))
+                        .on_click(move |_, _, cx| {
+                            state.update(cx, |s, cx| s.set_all_projects_folded(true, cx));
+                        })
+                })
+                .child({
+                    let state = state.clone();
+                    IconButton::new("projects-add", IconName::FolderPlus)
+                        .variant(ButtonVariant::Ghost)
+                        .size(ely_gpui_component::theme::ControlSize::Sm)
+                        .tooltip(i18n::t(cx, "add_project"))
+                        .on_click(move |_, window, cx| {
+                            let state = state.clone();
+                            let what = SharedString::from("add-project");
+                            forms_util::choose(
+                                what,
+                                gpui::PathPromptOptions {
+                                    files: false,
+                                    directories: true,
+                                    multiple: false,
+                                    prompt: Some(i18n::t(cx, "add_project")),
+                                },
+                                window,
+                                cx,
+                                move |paths, _, cx| {
+                                    state.update(cx, |s, cx| {
+                                        for path in paths {
+                                            s.add_project(path, cx);
+                                        }
+                                    });
+                                },
+                            );
+                        })
+                }),
         )
         .child(
             // The list must be the only growing part and stay inside the

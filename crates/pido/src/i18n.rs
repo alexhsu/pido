@@ -21,6 +21,9 @@ pub fn init(cx: &mut App, default: &str) {
                 &[
                     ("app_name", "pido"),
                     ("new_chat", "新会话"),
+                    ("projects", "项目"),
+                    ("collapse_all", "全部折叠"),
+                    ("add_project", "添加项目"),
                     ("sessions", "历史会话"),
                     ("no_sessions", "还没有会话记录"),
                     ("send", "发送"),
@@ -127,6 +130,9 @@ pub fn init(cx: &mut App, default: &str) {
                 &[
                     ("app_name", "pido"),
                     ("new_chat", "New chat"),
+                    ("projects", "Projects"),
+                    ("collapse_all", "Collapse all"),
+                    ("add_project", "Add project"),
                     ("sessions", "Sessions"),
                     ("no_sessions", "No sessions yet"),
                     ("send", "Send"),
