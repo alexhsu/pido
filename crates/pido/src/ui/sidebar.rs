@@ -96,8 +96,9 @@ pub fn render(
                 ),
         )
         .child(
-            // The section header: 项目 with a fold-all chevron, and on the
-            // right, collapse-all and add-project buttons.
+            // The section header: the static 项目 title, with all the
+            // actions on the right. The fold button flips between collapse
+            // and expand as the groups go.
             div()
                 .flex_none()
                 .flex()
@@ -105,43 +106,36 @@ pub fn render(
                 .gap_1p5()
                 .px_2()
                 .pb_1()
-                .child({
-                    let state = state.clone();
-                    let folded = state.read(cx).all_projects_folded();
+                .child(
                     div()
-                        .id("projects-header")
-                        .flex()
-                        .items_center()
-                        .gap_1p5()
-                        .cursor_pointer()
-                        .hover(|style| style.bg(colors.hover))
-                        .rounded(radius_md)
-                        .py_0p5()
-                        .pr_1()
-                        .on_click(move |_, _, cx| {
-                            state.update(cx, |s, cx| {
-                                let folded = s.all_projects_folded();
-                                s.set_all_projects_folded(!folded, cx);
-                            });
-                        })
-                        .child(Disclosure::new("projects-fold", !folded))
-                        .child(
-                            div()
-                                .text_size(text_sm)
-                                .font_weight(FontWeight::MEDIUM)
-                                .child(Label::new(i18n::t(cx, "projects"))),
-                        )
-                })
+                        .text_size(theme.text_size(ely_gpui_component::theme::TextSize::Md))
+                        .font_weight(FontWeight::BOLD)
+                        .child(Label::new(i18n::t(cx, "projects"))),
+                )
                 .child(div().flex_1())
                 .child({
                     let state = state.clone();
-                    IconButton::new("projects-collapse", IconName::List)
-                        .variant(ButtonVariant::Ghost)
-                        .size(ely_gpui_component::theme::ControlSize::Sm)
-                        .tooltip(i18n::t(cx, "collapse_all"))
-                        .on_click(move |_, _, cx| {
-                            state.update(cx, |s, cx| s.set_all_projects_folded(true, cx));
-                        })
+                    let folded = state.read(cx).all_projects_folded();
+                    IconButton::new(
+                        "projects-fold",
+                        if folded {
+                            IconName::ChevronsUpDown
+                        } else {
+                            IconName::List
+                        },
+                    )
+                    .variant(ButtonVariant::Ghost)
+                    .size(ely_gpui_component::theme::ControlSize::Sm)
+                    .tooltip(i18n::t(
+                        cx,
+                        if folded { "expand_all" } else { "collapse_all" },
+                    ))
+                    .on_click(move |_, _, cx| {
+                        state.update(cx, |s, cx| {
+                            let folded = s.all_projects_folded();
+                            s.set_all_projects_folded(!folded, cx);
+                        });
+                    })
                 })
                 .child({
                     let state = state.clone();
