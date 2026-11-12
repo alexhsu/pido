@@ -1257,28 +1257,14 @@ impl AppState {
     /// Move a session into or out of the archive fold.
     pub fn toggle_archive(&mut self, path: &str, cx: &mut Context<Self>) {
         let key = session_key(path);
-        let archived = if self.archived_sessions.remove(&key) {
-            false
-        } else {
+        // Remove returns whether it was there; absent means it now archives.
+        if !self.archived_sessions.remove(&key) {
             self.archived_sessions.insert(key);
-            true
-        };
+        }
         let mut list: Vec<String> = self.archived_sessions.iter().cloned().collect();
         list.sort();
         crate::settings::save_setting(|s| s.archived_sessions = list);
         self.sidebar_rows = self.sidebar_rows_now();
-        self.push_notice(
-            NoticeKind::Info,
-            i18n::t(
-                cx,
-                if archived {
-                    "session_archived"
-                } else {
-                    "session_unarchived"
-                },
-            )
-            .to_string(),
-        );
         cx.notify();
     }
 
@@ -1744,10 +1730,6 @@ impl AppState {
                             s.load_history(cx);
                             s.refresh_stats(cx);
                             s.refresh_sessions(cx);
-                            s.push_notice(
-                                NoticeKind::Info,
-                                i18n::t(cx, "session_forked").to_string(),
-                            );
                         }
                     }
                     Err(error) => s.push_notice(NoticeKind::Error, error.to_string()),
@@ -1838,7 +1820,6 @@ impl AppState {
                             s.refresh_stats(cx);
                         }
                         s.refresh_sessions(cx);
-                        s.push_notice(NoticeKind::Info, i18n::t(cx, "session_forked").to_string());
                     }
                     Ok(None) => s.push_notice(
                         NoticeKind::Warn,
@@ -2172,10 +2153,6 @@ impl AppState {
                                 s.collapsed_projects.remove(&cwd);
                             }
                             s.sidebar_rows = s.sidebar_rows_now();
-                            s.push_notice(
-                                NoticeKind::Info,
-                                i18n::t(cx, "new_session_started").to_string(),
-                            );
                             s.query_state(cx);
                             s.refresh_stats(cx);
                             s.refresh_sessions(cx);
@@ -2251,10 +2228,6 @@ impl AppState {
                             s.remember_session_file(Some(&session_file));
                             s.apply_session_cwd(cwd, cx);
                             s.sidebar_rows = s.sidebar_rows_now();
-                            s.push_notice(
-                                NoticeKind::Info,
-                                i18n::t(cx, "session_restored").to_string(),
-                            );
                             // Refresh name/model/session-file, then rebuild
                             // the transcript from the switched session.
                             s.query_state(cx);

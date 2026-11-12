@@ -290,7 +290,10 @@ fn render_item(
                 .child(
                     MessageBubble::new(Role::User)
                         .header(MessageHeader::new(("header", ix), i18n::t(cx, "you")))
-                        .child(Paragraph::new(text.clone())),
+                        .child(ely_gpui_component::typography::SelectableText::new(
+                            ("user-text", ix),
+                            text.clone(),
+                        )),
                 )
                 .child(footer)
                 .into_any_element()
@@ -332,6 +335,14 @@ fn render_item(
                         ("text", ix),
                         cached.blocks.clone(),
                     )
+                    // Finished text picks up pointer selection: drag to
+                    // select, Ctrl-C copies, A selects all. A right press
+                    // copies the selection straight away when there is one.
+                    .selectable(|press, _, cx| {
+                        if let Some(selected) = press.selected {
+                            cx.write_to_clipboard(gpui::ClipboardItem::new_string(selected));
+                        }
+                    })
                     .into_any_element(),
                     None => ely_gpui_component::chat::StreamingMarkdown::new(
                         ("text", ix),

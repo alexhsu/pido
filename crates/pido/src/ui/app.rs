@@ -40,6 +40,11 @@ pub struct PidoApp {
     /// the split back into range.
     left_px: std::rc::Rc<std::cell::Cell<f32>>,
     right_px: std::rc::Rc<std::cell::Cell<f32>>,
+    /// Set by the resize handler when a drag leaves the range, cleared by the
+    /// render that has reseeded the split back in: while it is fresh, the
+    /// seed alternates by a hair so the split keeps pulling the pane back.
+    snap_since: std::rc::Rc<std::cell::Cell<Option<std::time::Instant>>>,
+    snap_flip: std::rc::Rc<std::cell::Cell<u64>>,
     pub focus: FocusHandle,
     pub state: gpui::Entity<AppState>,
     /// The composer's multi-line field, owned here so it survives re-renders.
@@ -115,10 +120,14 @@ impl PidoApp {
                 .unwrap_or(560.0)
                 .clamp(*RIGHT_RANGE.start(), *RIGHT_RANGE.end()),
         ));
+        let snap_since = std::rc::Rc::new(std::cell::Cell::new(None));
+        let snap_flip = std::rc::Rc::new(std::cell::Cell::new(0u64));
         let right_open = persisted.right_open.unwrap_or(false);
         let app = Self {
             left_px,
             right_px,
+            snap_since,
+            snap_flip,
             focus,
             state,
             draft: None,
@@ -313,9 +322,24 @@ impl Render for PidoApp {
                     // is tucked in; the sizes come from the clamped widths.
                     .child({
                         let width = f32::from(window.bounds().size.width);
-                        let sizes = self.pane_sizes(width);
+                        let mut sizes = self.pane_sizes(width);
+                        // While a drag is out of range, alternate the seed by
+                        // a hair each render: use_seeded only replants when
+                        // the seed differs from its stored one, and the drag
+                        // overwrites the shares after every event — without
+                        // the alternation the first clamp would be the last.
+                        if let Some(since) = self.snap_since.get()
+                            && since.elapsed() < std::time::Duration::from_millis(300)
+                        {
+                            let flip = self.snap_flip.get();
+                            let last = sizes.len() - 1;
+                            sizes[last] += if flip.is_multiple_of(2) { 1e-4 } else { -1e-4 };
+                        }
+
                         let left_cell = self.left_px.clone();
                         let right_cell = self.right_px.clone();
+                        let snap_since = self.snap_since.clone();
+                        let snap_flip = self.snap_flip.clone();
                         // Dragging past a limit clamps the stored width, but
                         // the split only reseeds from it on the next render —
                         // so the handler nudges one when a drag left the range.
@@ -337,6 +361,10 @@ impl Render for PidoApp {
                                     let right = clamp_width(raw_right, &RIGHT_RANGE);
                                     drifted |= (raw_right - right).abs() > 0.5;
                                     right_cell.set(right);
+                                }
+                                if drifted {
+                                    snap_since.set(Some(std::time::Instant::now()));
+                                    snap_flip.set(snap_flip.get().wrapping_add(1));
                                 }
                                 let (left, right) = (left_cell.get(), right_cell.get());
                                 crate::settings::save_setting(|s| {
