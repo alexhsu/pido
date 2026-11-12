@@ -68,43 +68,76 @@ pub fn render_header(
                     })
                 }),
         )
+        // The header's actions are icon buttons; what they do shows on hover.
         .when(!s.changes.is_empty(), |this| {
             let view = view.clone();
-            let label = format!("{} {}", i18n::t(cx, "changes"), s.changes.len());
+            let count = s.changes.len();
+            let tooltip = format!(
+                "{} ({})",
+                i18n::t(cx, "changes"),
+                i18n::t_arg(cx, "changes_files", "n", &count.to_string())
+            );
             this.child(
-                ely_gpui_component::buttons::Button::new("open-changes", label)
-                    .variant(ely_gpui_component::buttons::ButtonVariant::Ghost)
-                    .on_click(move |_, _, cx| {
-                        view.update(cx, |this, cx| this.open_right(RightTab::Diff, cx));
-                    }),
+                ely_gpui_component::buttons::IconButton::new(
+                    "open-changes",
+                    ely_gpui_component::primitives::IconName::MessageSquareDiff,
+                )
+                .variant(ely_gpui_component::buttons::ButtonVariant::Ghost)
+                .tooltip(tooltip)
+                .on_click(move |_, _, cx| {
+                    view.update(cx, |this, cx| this.open_right(RightTab::Diff, cx));
+                }),
             )
         })
         .child({
             let view = view.clone();
-            ely_gpui_component::buttons::Button::new("open-terminal", i18n::t(cx, "terminal"))
-                .variant(ely_gpui_component::buttons::ButtonVariant::Ghost)
-                .on_click(move |_, _, cx| {
-                    view.update(cx, |this, cx| this.open_right(RightTab::Terminal, cx));
-                })
+            ely_gpui_component::buttons::IconButton::new(
+                "open-terminal",
+                ely_gpui_component::primitives::IconName::Terminal,
+            )
+            .variant(ely_gpui_component::buttons::ButtonVariant::Ghost)
+            .tooltip(i18n::t(cx, "terminal"))
+            .on_click(move |_, _, cx| {
+                view.update(cx, |this, cx| this.open_right(RightTab::Terminal, cx));
+            })
+        })
+        .child({
+            let dark = theme.is_dark();
+            ely_gpui_component::buttons::IconButton::new(
+                "theme",
+                if dark {
+                    ely_gpui_component::primitives::IconName::Sun
+                } else {
+                    ely_gpui_component::primitives::IconName::Moon
+                },
+            )
+            .variant(ely_gpui_component::buttons::ButtonVariant::Ghost)
+            .tooltip(i18n::t(cx, "theme"))
+            .on_click(|_, _, cx| toggle_theme(cx))
         })
         .child(
-            ely_gpui_component::buttons::Button::new("theme", i18n::t(cx, "theme"))
-                .on_click(|_, _, cx| toggle_theme(cx)),
-        )
-        .child(
-            ely_gpui_component::buttons::Button::new("locale", next_locale).on_click(
-                move |_, _, cx| {
-                    crate::settings::save_setting(|s| {
-                        s.locale = Some(next_locale.to_string());
-                    });
-                    ely_gpui_component::i18n::I18n::set_locale(next_locale, cx);
-                },
-            ),
+            ely_gpui_component::buttons::IconButton::new(
+                "locale",
+                ely_gpui_component::primitives::IconName::Languages,
+            )
+            .variant(ely_gpui_component::buttons::ButtonVariant::Ghost)
+            .tooltip(next_locale)
+            .on_click(move |_, _, cx| {
+                crate::settings::save_setting(|s| {
+                    s.locale = Some(next_locale.to_string());
+                });
+                ely_gpui_component::i18n::I18n::set_locale(next_locale, cx);
+            }),
         )
         .child({
             let app = app.clone();
-            ely_gpui_component::buttons::Button::new("compact", i18n::t(cx, "compact_now"))
-                .on_click(move |_, _, cx| app.update(cx, |s, cx| s.compact_now(cx)))
+            ely_gpui_component::buttons::IconButton::new(
+                "compact",
+                ely_gpui_component::primitives::IconName::Minimize2,
+            )
+            .variant(ely_gpui_component::buttons::ButtonVariant::Ghost)
+            .tooltip(i18n::t(cx, "compact_now"))
+            .on_click(move |_, _, cx| app.update(cx, |s, cx| s.compact_now(cx)))
         })
 }
 

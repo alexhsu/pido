@@ -351,7 +351,7 @@ fn group_row(
                         new_state.update(cx, |s, cx| s.new_session_in(cwd, cx));
                     })
                     .child(
-                        Icon::new(IconName::SquarePen)
+                        Icon::new(IconName::FilePlus)
                             .size(IconSize::Xs)
                             .color(colors.fg_subtle),
                     ),
