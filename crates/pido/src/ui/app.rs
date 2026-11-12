@@ -224,7 +224,7 @@ impl Render for PidoApp {
         let bounds = window.bounds();
         self.window_size = Some((f32::from(bounds.size.width), f32::from(bounds.size.height)));
         let state = self.state.clone();
-        let live = state.read(cx).conn == Conn::Live;
+        let live = matches!(state.read(cx).conn, Conn::Live | Conn::Reconnecting { .. });
 
         if live && !self.composer_focused {
             if let Some(draft) = &self.draft {

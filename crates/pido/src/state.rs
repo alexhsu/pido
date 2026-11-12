@@ -36,9 +36,24 @@ pub enum Conn {
     Connecting,
     /// A live session.
     Live,
+    /// pi died on its own; pido is relaunching it for the same session.
+    /// `attempt` is the number of the spawn that is next.
+    Reconnecting { attempt: u32 },
     /// The connection died; `String` explains why.
     Dead(String),
 }
+
+/// What a crash recovery needs to relaunch pi for the same session.
+#[derive(Clone)]
+struct Recovery {
+    cwd: PathBuf,
+    session: Option<String>,
+    args: Vec<String>,
+    attempt: u32,
+}
+
+/// Seconds to wait before each recovery spawn; the last entry repeats.
+const RECOVERY_DELAYS: [u64; 8] = [1, 2, 4, 8, 15, 30, 30, 30];
 
 /// Environment probe results for the welcome screen.
 #[derive(Debug, Clone, Default)]
@@ -662,6 +677,13 @@ pub struct AppState {
     pub user_projects: Vec<String>,
     /// Sidebar labels the user gave projects, keyed like pin/archive sets.
     pub project_labels: HashMap<String, String>,
+    /// True while closing the client on purpose: the Disconnected event
+    /// must not trigger crash recovery.
+    stopping: bool,
+    /// Why the client last died, for the give-up banner.
+    last_error: String,
+    /// Active crash recovery: what to relaunch and how many times already.
+    recovering: Option<Recovery>,
     /// Sessions the user pinned, as normalized keys.
     pub pinned_sessions: HashSet<String>,
     /// Sessions the user archived, as normalized keys.
@@ -766,6 +788,9 @@ impl AppState {
                 archived_sessions,
                 session_name: None,
                 session_file: None,
+                stopping: false,
+                last_error: String::new(),
+                recovering: None,
                 session_id: None,
                 draft_session_file: None,
                 awaiting_new_session_file: false,
@@ -869,25 +894,36 @@ impl AppState {
             cx.notify();
             return;
         }
-        self.conn = Conn::Connecting;
+        // A recovery spawn keeps the frozen transcript on screen, keeps the
+        // Reconnecting state, and leaves the recovery bookkeeping alone; a
+        // fresh connect wipes everything and cancels any recovery in flight.
+        let recovery = self.recovering.clone();
+        if recovery.is_none() {
+            self.conn = Conn::Connecting;
+            self.transcript.clear();
+            self.expanded_turns.clear();
+            self.turn_running = false;
+            self.clear_changes();
+            self.notice = None;
+        }
         self.cwd = Some(cwd.clone());
-        self.transcript.clear();
-        self.expanded_turns.clear();
-        self.turn_running = false;
-        self.clear_changes();
-        self.notice = None;
         self.streaming = false;
         self.stats = None;
         self.session_name = None;
-        self.session_epoch += 1;
-        self.pending_steers.clear();
-        self.queued_steers.clear();
-        self.queued_follow_ups.clear();
-        self.pending_composer_text = None;
-        self.last_project = Some(cwd.to_string_lossy().into_owned());
-        crate::settings::save_setting(|s| {
-            s.last_project = self.last_project.clone();
-        });
+        if recovery.is_none() {
+            self.session_epoch += 1;
+            self.pending_steers.clear();
+            self.queued_steers.clear();
+            self.queued_follow_ups.clear();
+            self.pending_composer_text = None;
+            self.last_project = Some(cwd.to_string_lossy().into_owned());
+            if recovery.is_none() {
+                self.last_project = Some(cwd.to_string_lossy().into_owned());
+                crate::settings::save_setting(|s| {
+                    s.last_project = self.last_project.clone();
+                });
+            }
+        }
         cx.notify();
 
         // A stale session file must not break the spawn; fall back to fresh.
@@ -957,15 +993,21 @@ impl AppState {
                         s.client = Some(client.clone());
                         match failed {
                             Some(error) => {
-                                let stderr = client.last_stderr();
-                                s.conn = Conn::Dead(if stderr.is_empty() {
-                                    error
+                                if recovery.is_some() {
+                                    s.schedule_reconnect(cx);
                                 } else {
-                                    format!("{error}\n{stderr}")
-                                });
+                                    let stderr = client.last_stderr();
+                                    s.conn = Conn::Dead(if stderr.is_empty() {
+                                        error
+                                    } else {
+                                        format!("{error}\n{stderr}")
+                                    });
+                                }
                             }
                             None => {
                                 s.conn = Conn::Live;
+                                s.recovering = None;
+                                s.notice = None;
                                 if let Ok(Ok(Some(payload))) =
                                     state_result.map(|r| r.data_as::<SessionState>())
                                 {
@@ -1011,12 +1053,67 @@ impl AppState {
                 }
                 Err(error) => {
                     this.update(cx, |s, cx| {
-                        s.conn = Conn::Dead(error.to_string());
+                        if recovery.is_some() {
+                            s.schedule_reconnect(cx);
+                        } else {
+                            s.conn = Conn::Dead(error.to_string());
+                        }
                         cx.notify();
                     })
                     .ok();
                 }
             }
+        })
+        .detach();
+    }
+
+    /// Wait out the backoff for the next recovery spawn, then retry. Bails
+    /// when the attempt is stale (the user did something else) or when the
+    /// attempts ran out, falling back to the welcome screen with the reason.
+    fn schedule_reconnect(&mut self, cx: &mut Context<Self>) {
+        let Some(info) = self.recovering.clone() else {
+            return;
+        };
+        let attempt = info.attempt;
+        if attempt as usize >= RECOVERY_DELAYS.len() {
+            let reason = std::mem::take(&mut self.last_error);
+            self.conn = if reason.is_empty() {
+                Conn::Dead("pi kept dying".to_string())
+            } else {
+                Conn::Dead(reason)
+            };
+            self.recovering = None;
+            self.notice = None;
+            cx.notify();
+            return;
+        }
+        let delay = RECOVERY_DELAYS[(attempt as usize).min(RECOVERY_DELAYS.len() - 1)];
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(std::time::Duration::from_secs(delay))
+                .await;
+            this.update(cx, |s, cx| {
+                let Some(info) = s.recovering.clone() else {
+                    return;
+                };
+                if info.attempt != attempt {
+                    return; // a newer attempt or a fresh connect superseded it
+                }
+                s.conn = Conn::Reconnecting {
+                    attempt: attempt + 1,
+                };
+                if let Some(info) = s.recovering.as_mut() {
+                    info.attempt = attempt + 1;
+                }
+                let notice = i18n::t_arg(cx, "reconnecting", "n", &(attempt + 1).to_string());
+                s.push_notice(NoticeKind::Warn, notice.to_string());
+                cx.notify();
+                let Recovery {
+                    cwd, session, args, ..
+                } = info;
+                s.connect(cwd, session, args, cx);
+            })
+            .ok();
         })
         .detach();
     }
@@ -2475,20 +2572,46 @@ impl AppState {
                     "state: client disconnected ({reason:?}), conn was {:?}",
                     self.conn
                 );
-                if self.conn == Conn::Live {
-                    let mut message = format!("{reason:?}");
-                    if let Some(tail) = self.client.as_ref().map(PiClient::last_stderr)
-                        && !tail.is_empty()
-                    {
-                        message.push('\n');
-                        message.push_str(&tail);
-                    }
-                    self.conn = Conn::Dead(message);
-                    self.streaming = false;
-                }
                 // No AgentSettled will ever arrive: freeze any half-streamed
                 // view so its timer and live indicators stop.
                 self.finalize_open_views();
+                if self.stopping {
+                    // The user closed the session; disconnect() already put
+                    // the state where it belongs.
+                    self.stopping = false;
+                    return;
+                }
+                if self.conn != Conn::Live {
+                    // A crash during startup or teardown: nothing to recover.
+                    return;
+                }
+                // pi died on its own: hold the transcript on screen and
+                // relaunch it for the same session, backing off per attempt.
+                let mut message = format!("{reason:?}");
+                if let Some(tail) = self.client.as_ref().map(PiClient::last_stderr)
+                    && !tail.is_empty()
+                {
+                    message.push('\n');
+                    message.push_str(&tail);
+                }
+                self.last_error = message.clone();
+                self.conn = Conn::Reconnecting { attempt: 0 };
+                self.streaming = false;
+                let cwd = self.cwd.clone().unwrap_or_default();
+                if !cwd.is_dir() {
+                    self.conn = Conn::Dead(message);
+                    cx.notify();
+                    return;
+                }
+                self.recovering = Some(Recovery {
+                    cwd,
+                    session: self.session_file.clone(),
+                    args: extra_args(),
+                    attempt: 0,
+                });
+                let notice = i18n::t_arg(cx, "reconnecting", "n", "1").to_string();
+                self.push_notice(NoticeKind::Warn, notice);
+                self.schedule_reconnect(cx);
             }
         }
     }
@@ -3279,6 +3402,9 @@ mod tests {
             session_groups: Vec::new(),
             sidebar_rows: Vec::new(),
             collapsed_projects: std::collections::HashSet::new(),
+            stopping: false,
+            last_error: String::new(),
+            recovering: None,
             user_projects: Vec::new(),
             project_labels: HashMap::new(),
             pinned_sessions: HashSet::new(),
