@@ -10,7 +10,7 @@
 //! and captions, not on the list, so the hover and active backgrounds span
 //! the full sidebar width. A right click opens the session menu.
 
-use ely_gpui_component::buttons::{Button, ButtonVariant, IconButton};
+use ely_gpui_component::buttons::{ButtonVariant, IconButton};
 use ely_gpui_component::forms as forms_util;
 use ely_gpui_component::lists::VirtualList;
 use ely_gpui_component::menus::{ContextMenu, Menu, MenuItem};
@@ -51,6 +51,10 @@ pub fn render(
     let s = state.read(cx);
     let can_start = s.conn == Conn::Live && !s.streaming;
     let empty = s.sidebar_rows.is_empty();
+    // The new-chat action is the sidebar's lead button, so it stands half a
+    // control taller than a standard button and keeps clear of the edges.
+    let new_chat_h = control_h.to_pixels(window.rem_size()) * 1.5;
+    let base_text = theme.text_size(TextSize::Base);
 
     div()
         // Width comes from the split pane the sidebar sits in.
@@ -85,15 +89,52 @@ pub fn render(
                     .h(px(34.)),
                 ),
         )
-        .child(
-            Button::new("new-chat", i18n::t(cx, "new_chat"))
-                .icon(IconName::SquarePen)
-                .disabled(!can_start)
-                .on_click({
-                    let app = app.clone();
-                    move |_, _, cx| app.update(cx, |s, cx| s.new_chat(cx))
-                }),
-        )
+        .child({
+            let app = app.clone();
+            // Ely's `Button` fixes its height to the theme's control size, so
+            // this lead action is drawn here with the same surface to sit at
+            // 1.5x that height.
+            div().flex_none().px_4().child(
+                div()
+                    .id("new-chat")
+                    .role(gpui::Role::Button)
+                    .aria_label(i18n::t(cx, "new_chat"))
+                    .tab_index(if can_start { 0 } else { -1 })
+                    .w_full()
+                    .h(new_chat_h)
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .gap_1p5()
+                    .rounded(radius_md)
+                    .border_1()
+                    .border_color(colors.border)
+                    .bg(colors.surface)
+                    .text_size(base_text)
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(colors.fg)
+                    .when(can_start, |el| {
+                        el.cursor_pointer()
+                            .hover(|style| style.bg(colors.hover))
+                            .active(|style| style.bg(colors.active))
+                            .on_mouse_down(MouseButton::Left, |_, window, _| {
+                                window.prevent_default()
+                            })
+                            .on_click(move |_, _, cx| app.update(cx, |s, cx| s.new_chat(cx)))
+                    })
+                    .when(!can_start, |el| el.opacity(0.45).cursor_not_allowed())
+                    .child(
+                        Icon::new(IconName::SquarePen)
+                            .size(IconSize::Sm)
+                            .color(colors.fg),
+                    )
+                    .child(
+                        div()
+                            .min_w_0()
+                            .child(Ellipsis::new(i18n::t(cx, "new_chat"))),
+                    ),
+            )
+        })
         .child(
             // The list must be the only growing part and stay inside the
             // window; without a bound its content stretches the whole row and
@@ -405,6 +446,19 @@ fn session_row(
         .session_file
         .as_deref()
         .is_some_and(|open| same_file(open, &path));
+    // A draft session has no file yet, so it reads as a new chat rather than
+    // as its session id, and its menu only offers what the file cannot.
+    let draft = state.read(cx).is_draft_session(&path);
+    let title = if draft {
+        state
+            .read(cx)
+            .session_name
+            .clone()
+            .map(SharedString::from)
+            .unwrap_or_else(|| i18n::t(cx, "new_chat"))
+    } else {
+        title
+    };
     let age = i18n::relative_time(cx, updated);
     let app = state.clone();
     let click_path = path.clone();
@@ -458,6 +512,7 @@ fn session_row(
         pinned,
         archived,
         active,
+        draft,
     );
     ContextMenu::new(("session-menu", ix as u64), menu)
         .w_full()
@@ -478,7 +533,29 @@ fn session_menu(
     pinned: bool,
     archived: bool,
     active: bool,
+    draft: bool,
 ) -> Menu {
+    let copy = MenuItem::new(i18n::t(cx, "copy_session_id"))
+        .icon(IconName::Copy)
+        .on_click({
+            let state = state.clone();
+            let id = session_id.to_string();
+            move |_, cx| {
+                cx.write_to_clipboard(ClipboardItem::new_string(id.clone()));
+                state.update(cx, |s, cx| {
+                    s.push_notice(
+                        NoticeKind::Info,
+                        i18n::t(cx, "session_id_copied").to_string(),
+                    );
+                    cx.notify();
+                });
+            }
+        });
+    // A draft session has no file to rename, fork, reveal or archive yet.
+    if draft {
+        return Menu::new().item(copy);
+    }
+
     let mut pin = MenuItem::new(i18n::t(
         cx,
         if pinned {
@@ -517,23 +594,6 @@ fn session_menu(
             let state = state.clone();
             let path = path.to_string();
             move |_, cx| state.update(cx, |s, cx| s.fork_session(&path, cx))
-        });
-
-    let copy = MenuItem::new(i18n::t(cx, "copy_session_id"))
-        .icon(IconName::Copy)
-        .on_click({
-            let state = state.clone();
-            let id = session_id.to_string();
-            move |_, cx| {
-                cx.write_to_clipboard(ClipboardItem::new_string(id.clone()));
-                state.update(cx, |s, cx| {
-                    s.push_notice(
-                        NoticeKind::Info,
-                        i18n::t(cx, "session_id_copied").to_string(),
-                    );
-                    cx.notify();
-                });
-            }
         });
 
     let reveal = MenuItem::new(i18n::t(cx, "reveal_in_folder"))

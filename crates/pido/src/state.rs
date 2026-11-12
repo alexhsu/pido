@@ -673,6 +673,15 @@ pub struct AppState {
     pub session_name: Option<String>,
     /// The active session's file path, as reported by `get_state`.
     pub session_file: Option<String>,
+    /// The active session's id, as reported by `get_state`.
+    pub session_id: Option<String>,
+    /// The session `new_chat` just started. Pi assigns the file path in
+    /// `new_session` but only writes the file with the first assistant
+    /// reply, so until a scan finds it the sidebar draws a draft row for it
+    /// instead of dropping the new session from the list.
+    draft_session_file: Option<String>,
+    /// Set by `new_chat` until `get_state` reports the new session's file.
+    awaiting_new_session_file: bool,
     /// Set while a startup resume is in flight: once live, load its history.
     last_session_loaded: bool,
     pub stats: Option<SessionStats>,
@@ -757,6 +766,9 @@ impl AppState {
                 archived_sessions,
                 session_name: None,
                 session_file: None,
+                session_id: None,
+                draft_session_file: None,
+                awaiting_new_session_file: false,
                 last_session_loaded: false,
                 stats: None,
                 notice: None,
@@ -960,9 +972,14 @@ impl AppState {
                                     s.current_model = payload.model;
                                     s.thinking_level = payload.thinking_level;
                                     s.session_name = payload.session_name;
+                                    s.session_id = payload.session_id;
                                     s.streaming = payload.is_streaming;
                                     s.remember_session_file(payload.session_file.as_deref());
                                 }
+                                // A fresh pi process owns no draft session;
+                                // the previous one died with its file.
+                                s.draft_session_file = None;
+                                s.awaiting_new_session_file = false;
                                 if let Ok(Ok(Some(payload))) = models_result
                                     .map(|r| r.data_as::<pi_rpc::protocol::AvailableModels>())
                                 {
@@ -1019,14 +1036,82 @@ impl AppState {
     }
 
     /// The sidebar's rows from the last scan and the current pin/archive sets.
+    /// The unsaved session `new_chat` just opened is merged in as a draft so
+    /// it shows before pi writes its file.
     fn sidebar_rows_now(&self) -> Vec<SidebarRow> {
+        let Some(draft) = self.draft_summary() else {
+            return flatten_groups(
+                &self.session_groups,
+                &self.collapsed_projects,
+                &self.project_labels,
+                &self.pinned_sessions,
+                &self.archived_sessions,
+            );
+        };
+        // New activity leads its project, and that project leads the list;
+        // the scanner orders things the same way once the file exists.
+        let project = session_key(&draft.cwd);
+        let mut groups = self.session_groups.clone();
+        match groups
+            .iter()
+            .position(|group| session_key(&group.cwd) == project)
+        {
+            Some(ix) => {
+                let mut group = groups.remove(ix);
+                group.sessions.insert(0, draft);
+                groups.insert(0, group);
+            }
+            None => groups.insert(
+                0,
+                SessionGroup {
+                    cwd: draft.cwd.clone(),
+                    sessions: vec![draft],
+                },
+            ),
+        }
         flatten_groups(
-            &self.session_groups,
+            &groups,
             &self.collapsed_projects,
             &self.project_labels,
             &self.pinned_sessions,
             &self.archived_sessions,
         )
+    }
+
+    /// The draft row for the session `new_chat` just opened: pi already knows
+    /// the file path but has not written the file, so a scan cannot list it.
+    /// None once the scan holds that path.
+    fn draft_summary(&self) -> Option<sessions::SessionSummary> {
+        let path = self.draft_session_file.as_deref()?;
+        let cwd = self.cwd.as_ref()?.to_string_lossy().into_owned();
+        let key = session_key(path);
+        let listed = self.session_groups.iter().any(|group| {
+            group
+                .sessions
+                .iter()
+                .any(|session| session_key(&session.path.to_string_lossy()) == key)
+        });
+        if listed {
+            return None;
+        }
+        Some(sessions::SessionSummary {
+            path: PathBuf::from(path),
+            session_id: self.session_id.clone().unwrap_or_default(),
+            cwd,
+            timestamp: None,
+            updated_secs: Some(now_secs()),
+            name: self.session_name.clone(),
+            preview: None,
+            message_count: 0,
+        })
+    }
+
+    /// Whether `path` is the unsaved session `new_chat` just opened: its row
+    /// keeps a draft title until pi writes the file.
+    pub fn is_draft_session(&self, path: &str) -> bool {
+        self.draft_session_file
+            .as_deref()
+            .is_some_and(|draft| session_key(draft) == session_key(path))
     }
 
     /// One clock per second while a turn runs, so the working time advances
@@ -1781,6 +1866,9 @@ impl AppState {
         self.streaming = false;
         self.stats = None;
         self.session_name = None;
+        self.draft_session_file = None;
+        self.awaiting_new_session_file = false;
+        self.sidebar_rows = self.sidebar_rows_now();
         self.pending_steers.clear();
         self.queued_steers.clear();
         self.queued_follow_ups.clear();
@@ -1853,6 +1941,19 @@ impl AppState {
                 .await;
             this.update(cx, |s, cx| {
                 s.session_groups = merge_user_projects(groups, &s.user_projects);
+                // The file exists now, so the scan took the draft row over.
+                let draft_listed = s.draft_session_file.as_deref().is_some_and(|draft| {
+                    let key = session_key(draft);
+                    s.session_groups.iter().any(|group| {
+                        group
+                            .sessions
+                            .iter()
+                            .any(|session| session_key(&session.path.to_string_lossy()) == key)
+                    })
+                });
+                if draft_listed {
+                    s.draft_session_file = None;
+                }
                 s.sidebar_rows = s.sidebar_rows_now();
                 cx.notify();
             })
@@ -2059,6 +2160,18 @@ impl AppState {
                             s.stats = None;
                             s.session_epoch += 1;
                             s.pending_steers.clear();
+                            // The new session starts unsaved: pi assigns its
+                            // file path now and writes the file on the first
+                            // reply. Follow the path so the sidebar can show
+                            // the row before that happens.
+                            s.draft_session_file = None;
+                            s.awaiting_new_session_file = true;
+                            if let Some(cwd) =
+                                s.cwd.as_ref().map(|cwd| cwd.to_string_lossy().into_owned())
+                            {
+                                s.collapsed_projects.remove(&cwd);
+                            }
+                            s.sidebar_rows = s.sidebar_rows_now();
                             s.push_notice(
                                 NoticeKind::Info,
                                 i18n::t(cx, "new_session_started").to_string(),
@@ -2132,8 +2245,12 @@ impl AppState {
                             s.stats = None;
                             s.session_epoch += 1;
                             s.pending_steers.clear();
+                            // Any draft belonged to the session being left.
+                            s.draft_session_file = None;
+                            s.awaiting_new_session_file = false;
                             s.remember_session_file(Some(&session_file));
                             s.apply_session_cwd(cwd, cx);
+                            s.sidebar_rows = s.sidebar_rows_now();
                             s.push_notice(
                                 NoticeKind::Info,
                                 i18n::t(cx, "session_restored").to_string(),
@@ -2302,7 +2419,16 @@ impl AppState {
                     s.current_model = payload.model;
                     s.thinking_level = payload.thinking_level;
                     s.session_name = payload.session_name;
-                    s.remember_session_file(payload.session_file.as_deref());
+                    s.session_id = payload.session_id;
+                    let file = payload.session_file;
+                    s.remember_session_file(file.as_deref());
+                    // `new_chat` waits for this round trip to learn the file
+                    // path pi allocated for the fresh session.
+                    if s.awaiting_new_session_file {
+                        s.awaiting_new_session_file = false;
+                        s.draft_session_file = file;
+                    }
+                    s.sidebar_rows = s.sidebar_rows_now();
                     cx.notify();
                 }
             })
@@ -3186,6 +3312,9 @@ mod tests {
             archived_sessions: HashSet::new(),
             session_name: None,
             session_file: None,
+            session_id: None,
+            draft_session_file: None,
+            awaiting_new_session_file: false,
             last_session_loaded: false,
             stats: None,
             notice: None,
@@ -3207,6 +3336,20 @@ mod tests {
             pending_composer_text: None,
             session_scan: Arc::new(Mutex::new(sessions::SessionScanner::default())),
             client: None,
+        }
+    }
+
+    /// One scanned session summary for sidebar-row tests.
+    pub(super) fn summary(cwd: &str, id: &str, path: &str) -> sessions::SessionSummary {
+        sessions::SessionSummary {
+            path: std::path::PathBuf::from(path),
+            session_id: id.to_string(),
+            cwd: cwd.to_string(),
+            timestamp: None,
+            updated_secs: Some(100),
+            name: Some(format!("session {id}")),
+            preview: None,
+            message_count: 1,
         }
     }
 
@@ -3761,6 +3904,78 @@ mod sidebar_tests {
         assert!(collapsed.contains("D:/a"));
         toggle_fold(&mut collapsed, "D:/a");
         assert!(!collapsed.contains("D:/a"));
+    }
+
+    #[test]
+    fn an_unsaved_new_session_leads_its_project() {
+        let mut state = super::tests::empty_state();
+        state.session_groups = vec![group("D:/a", 2), group("D:/b", 1)];
+        state.cwd = Some(std::path::PathBuf::from("D:/b"));
+        state.session_file = Some("D:/b/new.jsonl".into());
+        state.draft_session_file = Some("D:/b/new.jsonl".into());
+        state.session_id = Some("fresh".into());
+
+        let rows = state.sidebar_rows_now();
+        match &rows[0] {
+            SidebarRow::Group { cwd, sessions, .. } => {
+                assert_eq!(cwd.as_ref(), "D:/b", "the draft's project leads the list");
+                assert_eq!(*sessions, 2, "the draft counts as one of its sessions");
+            }
+            other => panic!("expected the draft's project first, got {other:?}"),
+        }
+        match &rows[1] {
+            SidebarRow::Session { path, .. } => {
+                assert!(path.ends_with("new.jsonl"), "the draft row sits under it");
+                assert!(state.is_draft_session(path));
+            }
+            other => panic!("expected the draft row, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_draft_opens_a_project_with_no_sessions_on_disk() {
+        let mut state = super::tests::empty_state();
+        state.session_groups = vec![group("D:/a", 1)];
+        state.cwd = Some(std::path::PathBuf::from("D:/fresh"));
+        state.session_file = Some("D:/fresh/new.jsonl".into());
+        state.draft_session_file = Some("D:/fresh/new.jsonl".into());
+
+        let rows = state.sidebar_rows_now();
+        assert_eq!(
+            rows.len(),
+            4,
+            "a fresh header and row, then the old project"
+        );
+        match &rows[0] {
+            SidebarRow::Group { cwd, sessions, .. } => {
+                assert_eq!(cwd.as_ref(), "D:/fresh");
+                assert_eq!(*sessions, 1);
+            }
+            other => panic!("expected the draft's project first, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_scanned_session_replaces_its_draft_row() {
+        let mut state = super::tests::empty_state();
+        state.session_groups = vec![group("D:/a", 1)];
+        state.cwd = Some(std::path::PathBuf::from("D:/a"));
+        state.session_file = Some("D:/a/new.jsonl".into());
+        state.draft_session_file = Some("D:/a/new.jsonl".into());
+
+        assert_eq!(state.sidebar_rows_now().len(), 3);
+
+        // The first reply writes the file; the scan now lists it under the
+        // same path, so the draft must not double the row.
+        state.session_groups[0]
+            .sessions
+            .insert(0, super::tests::summary("D:/a", "new", "D:/a/new.jsonl"));
+        let rows = state.sidebar_rows_now();
+        assert_eq!(rows.len(), 3, "the scanned row takes the draft's place");
+        match &rows[1] {
+            SidebarRow::Session { path, .. } => assert!(path.ends_with("new.jsonl")),
+            other => panic!("expected the scanned session, got {other:?}"),
+        }
     }
 
     #[test]

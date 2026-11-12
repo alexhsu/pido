@@ -316,19 +316,26 @@ impl Render for PidoApp {
                         let sizes = self.pane_sizes(width);
                         let left_cell = self.left_px.clone();
                         let right_cell = self.right_px.clone();
+                        // Dragging past a limit clamps the stored width, but
+                        // the split only reseeds from it on the next render —
+                        // so the handler nudges one when a drag left the range.
+                        let me = cx.entity().downgrade();
                         SplitPane::new("shell", gpui::Axis::Horizontal, gpui::px(200.))
                             .sizes(&sizes)
                             .pane(sidebar::render(&state, &cx.entity(), window, cx))
                             .pane(main)
                             .children(right)
-                            .on_resize(move |shares, _, _| {
+                            .on_resize(move |shares, _, cx| {
                                 // Shares are fractions of the window; each pane
-                                // keeps its clamped width, so dragging past a
-                                // limit holds there and snaps back on release.
-                                let left = clamp_width(shares[0] * width, &SIDEBAR_RANGE);
+                                // keeps its clamped width.
+                                let raw_left = shares[0] * width;
+                                let left = clamp_width(raw_left, &SIDEBAR_RANGE);
                                 left_cell.set(left);
+                                let mut drifted = (raw_left - left).abs() > 0.5;
                                 if let Some(share) = shares.get(2) {
-                                    let right = clamp_width(share * width, &RIGHT_RANGE);
+                                    let raw_right = share * width;
+                                    let right = clamp_width(raw_right, &RIGHT_RANGE);
+                                    drifted |= (raw_right - right).abs() > 0.5;
                                     right_cell.set(right);
                                 }
                                 let (left, right) = (left_cell.get(), right_cell.get());
@@ -338,6 +345,9 @@ impl Render for PidoApp {
                                         s.right_width = Some(right);
                                     }
                                 });
+                                if drifted && let Err(error) = me.update(cx, |_, cx| cx.notify()) {
+                                    log::debug!("split snap-back lost: {error}");
+                                }
                             })
                     })
                     .children(overlay)
