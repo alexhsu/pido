@@ -244,11 +244,12 @@ impl Render for PidoApp {
                 .min_h_0()
                 .flex()
                 .flex_col()
-                .child(
-                    div()
-                        .flex_none()
-                        .child(chat::render_header(&state, &cx.entity(), window, cx)),
-                )
+                .child(div().flex_none().child(chat::render_header(
+                    &state,
+                    &cx.entity(),
+                    window,
+                    cx,
+                )))
                 .child(
                     div()
                         .flex_1()
@@ -767,12 +768,7 @@ impl PidoApp {
             .flex_col()
             .gap_0p5();
         if rows.is_empty() {
-            list = list.child(
-                div()
-                    .py_3()
-                    .text_color(colors.fg_subtle)
-                    .child(empty_label),
-            );
+            list = list.child(div().py_3().text_color(colors.fg_subtle).child(empty_label));
         }
         for (ix, row) in rows.iter().enumerate() {
             let row_state = pick_state.clone();

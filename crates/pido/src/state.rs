@@ -3456,10 +3456,9 @@ impl AppState {
                 // shows the seam.
                 if entry.entry_type == "compaction" {
                     let text = match entry.summary.as_deref() {
-                        Some(summary) => format!(
-                            "{compacted_label} — {}",
-                            truncate_for_display(summary, 160)
-                        ),
+                        Some(summary) => {
+                            format!("{compacted_label} — {}", truncate_for_display(summary, 160))
+                        }
                         None => compacted_label.to_string(),
                     };
                     self.transcript.push(TranscriptItem::Notice {
@@ -3960,7 +3959,12 @@ mod tests {
                     "a",
                     Some("root"),
                     Some("second"),
-                    vec![tree_node("b", Some("a"), Some("third\nfourth line"), vec![])],
+                    vec![tree_node(
+                        "b",
+                        Some("a"),
+                        Some("third\nfourth line"),
+                        vec![],
+                    )],
                 ),
                 tree_node("side", Some("root"), Some("abandoned"), vec![]),
             ],
