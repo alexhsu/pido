@@ -3458,7 +3458,8 @@ impl AppState {
         // `write` calls carry their content in the call itself; the result
         // that follows only confirms it.
         let mut calls: HashMap<String, pi_rpc::protocol::ToolCall> = HashMap::new();
-        for entry in active_branch(entries, leaf_id) {
+        let branch = active_branch(entries, leaf_id);
+        for (i, entry) in branch.iter().enumerate() {
             let Some(message) = &entry.message else {
                 // Compaction and branch-summary entries mark where older
                 // context was folded away; keep the markers so the restored
@@ -3486,6 +3487,35 @@ impl AppState {
                 AgentMessage::User(user) => {
                     let text = user.text();
                     if !text.is_empty() {
+                        // Every turn gets its status line, live ones included:
+                        // the duration comes from pi's entry timestamps, so a
+                        // restored turn folds and reads like a finished run.
+                        let started = unix_secs(user.timestamp);
+                        let end = branch[i + 1..]
+                            .iter()
+                            .take_while(|later| {
+                                !matches!(&later.message, Some(AgentMessage::User(_)))
+                            })
+                            .filter_map(|later| {
+                                later
+                                    .message
+                                    .as_ref()
+                                    .and_then(|m| m.timestamp())
+                                    .and_then(unix_secs)
+                            })
+                            .last();
+                        let took = match (started, end) {
+                            (Some(from), Some(to)) if to >= from => {
+                                Some(Duration::from_secs((to - from) as u64))
+                            }
+                            // Timestamps missing: a finished turn of unknown
+                            // length, foldable all the same.
+                            _ => Some(Duration::ZERO),
+                        };
+                        self.transcript.push(TranscriptItem::Turn {
+                            started: Instant::now(),
+                            took,
+                        });
                         self.transcript.push(TranscriptItem::User {
                             text: text.into(),
                             time: unix_secs(user.timestamp),
@@ -4023,8 +4053,13 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(
             kinds,
-            ["user:hi", "assistant:hello", "tool:bash:Some(\"a.txt\")"],
-            "only the active branch is rendered and the card follows the message"
+            [
+                "turn",
+                "user:hi",
+                "assistant:hello",
+                "tool:bash:Some(\"a.txt\")"
+            ],
+            "only the active branch is rendered, its status line leads, and the card follows the message"
         );
     }
 
@@ -4101,6 +4136,67 @@ mod tests {
         let mut open = std::collections::HashSet::new();
         open.insert(1u64);
         assert!(!turn_folded_for(&items, 3, &open), "re-opened shows tools");
+    }
+
+    #[test]
+    fn restored_turns_get_a_status_line_with_the_timestamped_duration() {
+        let mut state = empty_state();
+        let user_at = |secs: f64| {
+            AgentMessage::User(pi_rpc::protocol::UserMessage {
+                content: pi_rpc::protocol::UserContent::Text("again".into()),
+                timestamp: secs,
+                attachments: None,
+            })
+        };
+        let assistant_at = |secs: f64| {
+            AgentMessage::Assistant(pi_rpc::protocol::AssistantMessage {
+                content: Vec::new(),
+                api: None,
+                provider: None,
+                model: None,
+                usage: None,
+                stop_reason: None,
+                error_message: None,
+                timestamp: secs,
+            })
+        };
+        let entries = vec![
+            message_entry("u1", None, user_at(100.0)),
+            message_entry("a1", Some("u1"), assistant_at(130.0)),
+            message_entry("u2", Some("a1"), user_at(200.0)),
+            message_entry("a2", Some("u2"), assistant_at(230.0)),
+        ];
+        state.load_entries(&entries, Some("a2"), "context compacted", "branch summary");
+
+        let kinds: Vec<String> = state
+            .transcript
+            .iter()
+            .map(|item| match item {
+                TranscriptItem::Turn { took, .. } => format!(
+                    "turn({})",
+                    took.map(|took| took.as_secs().to_string())
+                        .unwrap_or_else(|| "running".into())
+                ),
+                TranscriptItem::User { .. } => "user".into(),
+                TranscriptItem::Assistant(_) => "assistant".into(),
+                _ => "other".into(),
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            [
+                "turn(30)",
+                "user",
+                "assistant",
+                "turn(30)",
+                "user",
+                "assistant"
+            ],
+            "each restored turn carries its finished status line"
+        );
+        // A finished status line folds its turn until re-opened.
+        let none = std::collections::HashSet::new();
+        assert!(turn_folded_for(&state.transcript, 2, &none));
     }
 
     #[test]

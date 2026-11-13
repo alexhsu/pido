@@ -2,9 +2,7 @@
 //! cards, and the session header (model / thinking / stats pickers).
 
 use ely_gpui_component::agent::ToolCallCard;
-use ely_gpui_component::chat::{
-    MessageBubble, MessageHeader, MessageList, Role, StepState, ThinkingBlock,
-};
+use ely_gpui_component::chat::{MessageBubble, MessageList, Role, StepState, ThinkingBlock};
 
 use ely_gpui_component::theme::{ActiveTheme, ControlSize, IconSize, TextSize};
 use ely_gpui_component::typography::{Caption, Paragraph};
@@ -374,14 +372,12 @@ fn render_item(
                 .group(group)
                 .flex()
                 .flex_col()
-                .child(
-                    MessageBubble::new(Role::User)
-                        .header(MessageHeader::new(("header", ix), i18n::t(cx, "you")))
-                        .child(ely_gpui_component::typography::SelectableText::new(
-                            ("user-text", ix),
-                            text.clone(),
-                        )),
-                )
+                .child(MessageBubble::new(Role::User).child(
+                    ely_gpui_component::typography::SelectableText::new(
+                        ("user-text", ix),
+                        text.clone(),
+                    ),
+                ))
                 .child(footer)
                 .into_any_element()
         }
@@ -394,8 +390,7 @@ fn render_item(
             if view.finished && view.error.is_none() && empty {
                 return div().into_any_element();
             }
-            let mut bubble = MessageBubble::new(Role::Assistant)
-                .header(MessageHeader::new(("header", ix), i18n::t(cx, "pi")));
+            let mut bubble = MessageBubble::new(Role::Assistant);
             if !thinking.is_empty() && !folded {
                 // Only a still-thinking view ticks; a finished one shows the
                 // frozen duration. Restored history records no durations, so
