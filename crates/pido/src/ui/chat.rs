@@ -183,14 +183,34 @@ pub fn render_header(
 /// theme's medium container width.
 pub fn render_transcript(state: &Entity<AppState>, cx: &App) -> impl IntoElement + use<> {
     let s = state.read(cx);
-    let count = s.transcript.len();
-    let empty = count == 0;
+    let empty = s.transcript.is_empty();
     let app = state.clone();
     let list_epoch = s.session_epoch;
     let notice = s
         .notice
         .clone()
         .map(|(kind, text)| render_notice(kind, text, app.clone(), cx));
+
+    // Folded content must not exist in the list at all: an empty row would
+    // still hold its slot, so the hidden tool calls would keep their space.
+    // Rows that show something map back to their transcript index.
+    let visible: Vec<usize> = s
+        .transcript
+        .iter()
+        .enumerate()
+        .filter(|(ix, item)| match item {
+            TranscriptItem::Tool(_) => {
+                !crate::state::turn_folded_for(&s.transcript, *ix, &s.expanded_turns)
+            }
+            TranscriptItem::Assistant(view) => {
+                let empty_view = view.text().is_empty() && view.thinking().is_empty();
+                !empty_view || !crate::state::turn_folded_for(&s.transcript, *ix, &s.expanded_turns)
+            }
+            _ => true,
+        })
+        .map(|(ix, _)| ix)
+        .collect();
+    let count = visible.len();
 
     // MessageList is rendered as the direct child of ChatContainer's
     // messages slot: it needs that flex height to resolve its 100%. The
@@ -223,8 +243,9 @@ pub fn render_transcript(state: &Entity<AppState>, cx: &App) -> impl IntoElement
                 .child(MessageList::new(
                     ("transcript", list_epoch),
                     count,
-                    move |ix, _window, cx| {
+                    move |pos, _window, cx| {
                         let s = app.read(cx);
+                        let ix = visible[pos];
                         let column = cx
                             .theme()
                             .container_width(ely_gpui_component::theme::ContainerSize::Md);

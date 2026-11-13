@@ -2363,13 +2363,17 @@ impl AppState {
         };
         // The staged images leave with the message, whatever its fate.
         self.clear_images();
+        self.transcript.push(TranscriptItem::User {
+            text: text.clone().into(),
+            time: Some(now_secs()),
+        });
         if follow {
             self.pending_follow_ups.push(text.clone());
         } else if steering {
             self.pending_steers.push(text.clone());
         } else {
-            // A fresh turn: its status line sits between this prompt and the
-            // content, clocking the work until the agent settles.
+            // A fresh turn: its status line sits under this prompt, clocking
+            // the work until the agent settles.
             self.transcript.push(TranscriptItem::Turn {
                 started: Instant::now(),
                 took: None,
@@ -2377,10 +2381,6 @@ impl AppState {
             self.turn_running = true;
             self.spawn_turn_ticker(cx);
         }
-        self.transcript.push(TranscriptItem::User {
-            text: text.clone().into(),
-            time: Some(now_secs()),
-        });
         cx.notify();
 
         let label = if follow {
@@ -2404,6 +2404,17 @@ impl AppState {
                 };
                 if let Some(error) = failure {
                     s.remove_last_user_text(&text);
+                    if !steering {
+                        // The optimistic status line has no run behind it:
+                        // drop it, or its clock ticks forever.
+                        if matches!(
+                            s.transcript.last(),
+                            Some(TranscriptItem::Turn { took: None, .. })
+                        ) {
+                            s.transcript.pop();
+                            s.turn_running = false;
+                        }
+                    }
                     if follow {
                         s.pending_follow_ups.retain(|pending| pending != &text);
                     } else if steering {
@@ -3512,13 +3523,13 @@ impl AppState {
                             // length, foldable all the same.
                             _ => Some(Duration::ZERO),
                         };
-                        self.transcript.push(TranscriptItem::Turn {
-                            started: Instant::now(),
-                            took,
-                        });
                         self.transcript.push(TranscriptItem::User {
                             text: text.into(),
                             time: unix_secs(user.timestamp),
+                        });
+                        self.transcript.push(TranscriptItem::Turn {
+                            started: Instant::now(),
+                            took,
                         });
                     }
                 }
@@ -3624,9 +3635,20 @@ pub(crate) fn turn_folded_for(
     ix: usize,
     expanded: &std::collections::HashSet<u64>,
 ) -> bool {
+    // The prompt and its status line always show; the fold starts under the
+    // status line.
+    match items.get(ix) {
+        Some(TranscriptItem::User { .. }) | Some(TranscriptItem::Turn { .. }) => return false,
+        _ => {}
+    }
     for (j, item) in items[..ix.min(items.len())].iter().enumerate().rev() {
-        if let TranscriptItem::Turn { took, .. } = item {
-            return took.is_some() && !expanded.contains(&(j as u64));
+        match item {
+            TranscriptItem::Turn { took, .. } => {
+                return took.is_some() && !expanded.contains(&(j as u64));
+            }
+            // The row sits before any status line — nothing to fold it into.
+            TranscriptItem::User { .. } => return false,
+            _ => {}
         }
     }
     false
@@ -4054,12 +4076,12 @@ mod tests {
         assert_eq!(
             kinds,
             [
-                "turn",
                 "user:hi",
+                "turn",
                 "assistant:hello",
                 "tool:bash:Some(\"a.txt\")"
             ],
-            "only the active branch is rendered, its status line leads, and the card follows the message"
+            "only the active branch is rendered, its status line follows the prompt, and the card follows the message"
         );
     }
 
@@ -4185,18 +4207,22 @@ mod tests {
         assert_eq!(
             kinds,
             [
-                "turn(30)",
                 "user",
+                "turn(30)",
                 "assistant",
-                "turn(30)",
                 "user",
+                "turn(30)",
                 "assistant"
             ],
-            "each restored turn carries its finished status line"
+            "each restored turn carries its finished status line, under its prompt"
         );
         // A finished status line folds its turn until re-opened.
         let none = std::collections::HashSet::new();
         assert!(turn_folded_for(&state.transcript, 2, &none));
+        assert!(
+            !turn_folded_for(&state.transcript, 0, &none),
+            "the prompt itself never folds"
+        );
     }
 
     #[test]
