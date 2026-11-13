@@ -35,6 +35,18 @@ A native desktop client for the [Pi coding agent](https://github.com/earendil-wo
 - **认证**:在终端运行 `pi`,执行 `/login`(或 `pi auth login <provider>`)。pido 不经手凭据,pi 自己读取 `~/.pi/agent/auth.json`
 - **Rust 1.98+**(仅构建时需要)
 
+## 下载 / Download
+
+打 `v*` 标签会触发三平台构建并发布 GitHub Release,附件:
+
+- `pido-x.y.z-windows-x64.zip` — 解压运行 `pido.exe`
+- `pido-x.y.z-macos-aarch64.zip` — 解压得到 `pido.app`,拖进「应用程序」
+- `pido-x.y.z-linux-x64.AppImage` — `chmod +x` 后直接运行
+
+English: a `v*` tag builds all three platforms and publishes a GitHub
+Release with a Windows zip, a macOS `.app` bundle (Apple silicon), and a
+Linux AppImage.
+
 ## 运行 / Run
 
 ```bash

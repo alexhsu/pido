@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=pido
+Comment=A native desktop client for the Pi coding agent
+Exec=pido
+Icon=pido
+Terminal=false
+Categories=Development;Utility;
+Keywords=pi;coding;agent;ai;
