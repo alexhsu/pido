@@ -149,6 +149,9 @@ struct Inner {
     /// The last few stderr lines, for diagnostics when a spawn or request
     /// fails. Pi writes fatal startup errors here.
     stderr_tail: Mutex<VecDeque<String>>,
+    /// Every record that came in from Pi, counted. A watchdog compares this
+    /// across a failed probe to tell a wedged process from a busy one.
+    inbound_records: AtomicU64,
 }
 
 /// Handle to a running Pi RPC process.
@@ -224,6 +227,7 @@ impl PiClient {
             subscribers: Mutex::new(Vec::new()),
             shutdown: Mutex::new(false),
             handle_count: AtomicU64::new(1),
+            inbound_records: AtomicU64::new(0),
             stderr_tail: Mutex::new(VecDeque::new()),
         });
 
@@ -302,6 +306,9 @@ impl PiClient {
                 .name("pi-rpc-dispatch".into())
                 .spawn(move || {
                     for event in raw_rx {
+                        inner
+                            .inbound_records
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         match &event {
                             ClientEvent::Record(RpcRecord::Response(response)) => {
                                 let waiter = response
@@ -487,6 +494,26 @@ impl PiClient {
     /// Whether shutdown has been initiated.
     pub fn is_shut_down(&self) -> bool {
         *self.inner.shutdown.lock().unwrap()
+    }
+
+    /// How many records Pi has sent so far. A watchdog snapshots this around
+    /// a failed probe: new records mean the process is alive, just busy.
+    pub fn records_seen(&self) -> u64 {
+        self.inner.inbound_records.load(Ordering::Relaxed)
+    }
+
+    /// Kill the process right away. A wedged Pi will not read its stdin, so
+    /// graceful shutdown would hang; killing it surfaces the disconnect to
+    /// subscribers, which is what a watchdog wants.
+    pub fn kill(&self) {
+        *self.inner.shutdown.lock().unwrap() = true;
+        *self.inner.stdin.lock().unwrap() = None;
+        let mut guard = self.inner.child.lock().unwrap();
+        if let Some(child) = guard.as_mut() {
+            log::warn!("pi-rpc: killing the unresponsive process");
+            let _ = child.kill();
+            let _ = child.wait();
+        }
     }
 
     /// The last stderr lines Pi wrote, newest last. Useful when a request or

@@ -682,6 +682,11 @@ pub struct AppState {
     stopping: bool,
     /// Why the client last died, for the give-up banner.
     last_error: String,
+    /// Bumped on every successful connect; the liveness probe loop of an
+    /// older client stops when it sees a different generation.
+    conn_gen: u64,
+    /// Consecutive failed liveness probes; two in a row declare pi wedged.
+    probe_fail: u32,
     /// Active crash recovery: what to relaunch and how many times already.
     recovering: Option<Recovery>,
     /// Sessions the user pinned, as normalized keys.
@@ -790,6 +795,8 @@ impl AppState {
                 session_file: None,
                 stopping: false,
                 last_error: String::new(),
+                conn_gen: 0,
+                probe_fail: 0,
                 recovering: None,
                 session_id: None,
                 draft_session_file: None,
@@ -1035,6 +1042,9 @@ impl AppState {
                                         .retain(|level| *level != ThinkingLevel::Unknown);
                                 }
                                 s.start_pump(client.clone(), cx);
+                                s.conn_gen += 1;
+                                s.probe_fail = 0;
+                                s.start_probe_loop(s.conn_gen, cx);
                                 // A resumed session opens with its history;
                                 // a fresh one starts empty.
                                 if s.last_session_loaded {
@@ -1061,6 +1071,72 @@ impl AppState {
                         cx.notify();
                     })
                     .ok();
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// A liveness probe every 45s while a session is live: GetState must
+    /// come back within 15s, or some other record must have arrived since
+    /// the probe started. Two dead probes in a row mean the process is
+    /// wedged — kill it and let the recovery loop relaunch pi for the same
+    /// session. The loop dies with its generation, so each reconnect owns
+    /// exactly one probe.
+    fn start_probe_loop(&self, generation: u64, cx: &Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_secs(45))
+                    .await;
+                let probe = this.update(cx, |s, _| {
+                    if s.conn_gen != generation || s.conn != Conn::Live {
+                        return None;
+                    }
+                    s.client.clone()
+                });
+                let Ok(Some(probe_client)) = probe else {
+                    break;
+                };
+                let seen = probe_client.records_seen();
+                let moved = probe_client.clone();
+                let result = cx
+                    .background_executor()
+                    .spawn(async move {
+                        moved.request_with_timeout(
+                            Command::GetState,
+                            std::time::Duration::from_secs(15),
+                        )
+                    })
+                    .await;
+                let alive = this.update(cx, |s, cx| {
+                    if s.conn_gen != generation || s.conn != Conn::Live {
+                        return false;
+                    }
+                    let answered = result.as_ref().map(|r| r.success).unwrap_or(false);
+                    let busy = probe_client.records_seen() > seen;
+                    if answered || busy {
+                        s.probe_fail = 0;
+                    } else {
+                        s.probe_fail += 1;
+                    }
+                    if s.probe_fail >= 2 {
+                        log::warn!(
+                            "state: pi unresponsive ({} probes), killing for recovery",
+                            s.probe_fail
+                        );
+                        s.probe_fail = 0;
+                        if let Some(client) = s.client.take() {
+                            client.kill();
+                        }
+                        // The reader surfaces the disconnect; the existing
+                        // recovery loop relaunches pi for the same session.
+                    }
+                    cx.notify();
+                    s.conn == Conn::Live
+                });
+                if !alive.unwrap_or(false) {
+                    break;
                 }
             }
         })
@@ -3404,6 +3480,8 @@ mod tests {
             collapsed_projects: std::collections::HashSet::new(),
             stopping: false,
             last_error: String::new(),
+            conn_gen: 0,
+            probe_fail: 0,
             recovering: None,
             user_projects: Vec::new(),
             project_labels: HashMap::new(),
