@@ -2034,9 +2034,10 @@ impl AppState {
         self.refresh_sessions(cx);
     }
 
-    /// Fork the open session from the user prompt that started the turn the
-    /// pointer is on: pi branches there and rebinds, so the transcript is
-    /// rebuilt from the new leaf afterwards.
+    /// Fork the open session from the user prompt at `occurrence`: pi
+    /// branches before that prompt into a new session and rebinds, so the
+    /// transcript rebuilds without it — and the prompt's text returns to the
+    /// composer for re-editing, pi's `/tree` flow at file granularity.
     pub fn fork_turn(&mut self, user_text: &str, occurrence: usize, cx: &mut Context<Self>) {
         if self.conn != Conn::Live {
             return;
@@ -2085,8 +2086,12 @@ impl AppState {
                                 i18n::t(cx, "session_cancelled").to_string(),
                             );
                         } else {
-                            // Pi rebound to the fork; rebuild around it.
+                            // Pi rebound to the fork; rebuild around it. The
+                            // fork lands before the prompt, so the prompt is
+                            // not in the new session — hand it back for
+                            // re-editing.
                             s.finish_fork(cx);
+                            s.restore_to_composer(&user_text);
                         }
                     }
                     Err(error) => s.push_notice(NoticeKind::Error, error.to_string()),
@@ -3541,22 +3546,26 @@ impl AppState {
     }
 }
 
-/// The fork point of the assistant turn at `ix`: the text of the user
-/// prompt that started it, and which occurrence of that text it is, so
-/// duplicate prompts land on the right entry.
+/// The fork point of the row at `ix`: the text of the user prompt it hangs
+/// from, and which occurrence of that text it is, so duplicate prompts land
+/// on the right entry. Hovering a user prompt forks from itself; hovering an
+/// assistant turn forks from the prompt that started it.
 pub(crate) fn fork_point_for(items: &[TranscriptItem], ix: usize) -> Option<(String, usize)> {
     let row = items.get(ix)?;
-    if !matches!(row, TranscriptItem::Assistant(_)) {
-        return None;
-    }
-    let mut at = None;
-    for (j, item) in items[..ix].iter().enumerate().rev() {
-        if let TranscriptItem::User { text, .. } = item {
-            at = Some((j, text.to_string()));
-            break;
+    let (j, text) = match row {
+        TranscriptItem::User { text, .. } => (ix, text.to_string()),
+        TranscriptItem::Assistant(_) => {
+            let mut at = None;
+            for (j, item) in items[..ix].iter().enumerate().rev() {
+                if let TranscriptItem::User { text, .. } = item {
+                    at = Some((j, text.to_string()));
+                    break;
+                }
+            }
+            at?
         }
-    }
-    let (j, text) = at?;
+        _ => return None,
+    };
     let occurrence = items[..j]
         .iter()
         .filter(|item| matches!(item, TranscriptItem::User { text: t, .. } if *t == text))
@@ -4104,7 +4113,14 @@ mod tests {
         let items = vec![user("hi"), assistant(), user("hi"), assistant()];
         assert_eq!(fork_point_for(&items, 1), Some(("hi".to_string(), 0)));
         assert_eq!(fork_point_for(&items, 3), Some(("hi".to_string(), 1)));
-        assert_eq!(fork_point_for(&items, 0), None, "not an assistant row");
+        // Hovering a user prompt forks from itself, occurrence counted.
+        assert_eq!(fork_point_for(&items, 0), Some(("hi".to_string(), 0)));
+        assert_eq!(fork_point_for(&items, 2), Some(("hi".to_string(), 1)));
+        assert_eq!(
+            fork_point_for(&items, 1),
+            Some(("hi".to_string(), 0)),
+            "assistant rows still fork from their starting prompt"
+        );
     }
 
     #[test]

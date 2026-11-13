@@ -230,7 +230,6 @@ pub fn render_transcript(state: &Entity<AppState>, cx: &App) -> impl IntoElement
                         let column = cx
                             .theme()
                             .container_width(ely_gpui_component::theme::ContainerSize::Md);
-                        let fork_point = crate::state::fork_point_for(&s.transcript, ix);
                         // A finished turn folds its tool calls and thinking
                         // away until its status line is clicked.
                         let folded =
@@ -243,7 +242,6 @@ pub fn render_transcript(state: &Entity<AppState>, cx: &App) -> impl IntoElement
                             .child(div().w_full().max_w(column).min_w_0().child(render_item(
                                 &app,
                                 &s.transcript[ix],
-                                fork_point,
                                 folded,
                                 ix,
                                 cx,
@@ -259,7 +257,6 @@ pub fn render_transcript(state: &Entity<AppState>, cx: &App) -> impl IntoElement
 fn render_item(
     app: &Entity<AppState>,
     item: &TranscriptItem,
-    fork_point: Option<(String, usize)>,
     folded: bool,
     ix: usize,
     cx: &App,
@@ -342,6 +339,24 @@ fn render_item(
                         .text_color(theme.colors.fg_subtle)
                         .child(i18n::format_time(cx, *time)),
                 )
+                .child({
+                    let app = app.clone();
+                    ely_gpui_component::buttons::IconButton::new(
+                        ("fork-user", ix),
+                        ely_gpui_component::primitives::IconName::GitBranch,
+                    )
+                    .variant(ely_gpui_component::buttons::ButtonVariant::Ghost)
+                    .size(ControlSize::Sm)
+                    .tooltip(i18n::t(cx, "fork_turn"))
+                    .on_click(move |_, _, cx| {
+                        let Some((text, occurrence)) =
+                            crate::state::fork_point_for(&app.read(cx).transcript, ix)
+                        else {
+                            return;
+                        };
+                        app.update(cx, |s, cx| s.fork_turn(&text, occurrence, cx));
+                    })
+                })
                 .child({
                     let copy = text.clone();
                     ely_gpui_component::buttons::IconButton::new(
@@ -446,7 +461,7 @@ fn render_item(
             // has nothing stable to copy yet.
             if view.finished {
                 wrapper
-                    .child(assistant_footer(app, fork_point, ix, view, cx))
+                    .child(assistant_footer(ix, view, cx))
                     .into_any_element()
             } else {
                 wrapper.into_any_element()
@@ -501,13 +516,7 @@ fn group(ix: usize) -> SharedString {
 
 /// The action row under a finished assistant message: copy, fork the turn,
 /// what it cost in tokens, and when it landed.
-fn assistant_footer(
-    app: &Entity<AppState>,
-    fork_point: Option<(String, usize)>,
-    ix: usize,
-    view: &AssistantView,
-    cx: &App,
-) -> AnyElement {
+fn assistant_footer(ix: usize, view: &AssistantView, cx: &App) -> AnyElement {
     let theme = cx.theme();
     let copy = view.text();
     let usage = view
@@ -531,22 +540,6 @@ fn assistant_footer(
             .tooltip(i18n::t(cx, "copy_message"))
             .on_click(move |_, _, cx| {
                 cx.write_to_clipboard(gpui::ClipboardItem::new_string(copy.to_string()));
-            })
-        })
-        .when_some(fork_point, |this, (text, occurrence)| {
-            this.child({
-                let app = app.clone();
-                ely_gpui_component::buttons::IconButton::new(
-                    ("fork-turn", ix),
-                    ely_gpui_component::primitives::IconName::GitBranch,
-                )
-                .variant(ely_gpui_component::buttons::ButtonVariant::Ghost)
-                .size(ControlSize::Sm)
-                .tooltip(i18n::t(cx, "fork_turn"))
-                .on_click(move |_, _, cx| {
-                    let (text, occurrence) = (text.clone(), occurrence);
-                    app.update(cx, |s, cx| s.fork_turn(&text, occurrence, cx));
-                })
             })
         })
         .when_some(usage, |this, usage| {

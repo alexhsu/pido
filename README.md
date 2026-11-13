@@ -12,7 +12,7 @@ A native desktop client for the [Pi coding agent](https://github.com/earendil-wo
 - **运行中转向** — agent 执行中继续输入即 steer(转向),也可切为「追加」(follow-up)排队等本轮结束;排队中的消息以标签显示在输入框上方,可一键清空;Esc 或停止按钮 = 清空队列 + 中止
 - **模型与思考级别切换** — 输入框右下角的模型胶囊,两级菜单切换 provider 模型和 thinking level
 - **会话管理** — 侧栏按项目分组列出 `~/.pi/agent/sessions` 的历史会话:分叉/克隆出的子会话按血统嵌套在父会话下(可折叠);「项目」标题栏可一键全部折叠、"+" 添加任意文件夹为项目(无会话也常驻列表),拖拽调宽且限定 200–480px;右键菜单可置顶、重命名、分叉、复制 Session ID、在文件夹显示、归档(归档项收进底部「已归档」折叠)
-- **消息操作** — 悬停用户消息显示提交时间和复制;悬停回答显示复制、从这轮分叉、token 用量和时间
+- **消息操作** — 悬停用户消息显示分叉(分出新会话,该条消息回填输入框供修改重发)、时间和复制;悬停回答显示复制、token 用量和时间
 - **回合状态** — 提交后回答上方计时(「已工作 1分4秒」),结束定格为「已完成,用时 X」;完成后默认折叠工具调用和思考过程,点状态行可展开
 - **上下文压缩** — 头部压缩按钮:立即压缩,或开/关 pi 的自动压缩;压缩完成的横幅带前后 token 数,历史会话在压缩点留摘要标记
 - **导出 HTML** — 头部一键把当前会话导出为 HTML 并在文件管理器中显示
@@ -24,7 +24,7 @@ A native desktop client for the [Pi coding agent](https://github.com/earendil-wo
 - **Steering** — typing while the agent runs steers it, or switches to queueing it as a follow-up; queued messages show as chips over the composer and can be cleared in one click; Esc or the stop button clears the queue and aborts
 - **Model & thinking switching** — the model pill at the composer's right opens two levels: model and thinking level
 - **Sessions** — the sidebar lists past sessions grouped by project, with forked/cloned children nested under the session they came from (foldable): the "Projects" header folds everything at once and a "+" button adds any folder as a project (it stays listed even with no sessions); the width drags between 200–480px. The right-click menu pins, renames, forks, copies the session ID, reveals the file, and archives (archived sessions collect under an "Archived" fold at the bottom)
-- **Message actions** — hover a prompt for its time and a copy button; hover a reply for copy, fork-from-here, token usage and time
+- **Message actions** — hover a prompt to fork (a new session without it, its text back in the composer for re-editing), or copy; hover a reply for copy, token usage and time
 - **Turn status** — a clock above the reply while it works ("Working · 1m 4s"), frozen to "Done in X" on completion; tool calls and thinking fold away, click the line to re-open
 - **Compaction** — the header compaction button: compact now, or toggle pi's auto-compaction; the finished banner reports the before/after token counts, and restored sessions keep a summary marker at each compaction seam
 - **HTML export** — one click exports the open session to HTML and reveals the file
