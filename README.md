@@ -15,7 +15,6 @@ A native desktop client for the [Pi coding agent](https://github.com/earendil-wo
 - **消息操作** — 悬停用户消息显示提交时间和复制;悬停回答显示复制、从这轮分叉、token 用量和时间
 - **回合状态** — 提交后回答上方计时(「已工作 1分4秒」),结束定格为「已完成,用时 X」;完成后默认折叠工具调用和思考过程,点状态行可展开
 - **上下文压缩** — 头部压缩按钮:立即压缩,或开/关 pi 的自动压缩;压缩完成的横幅带前后 token 数,历史会话在压缩点留摘要标记
-- **分支树** — 会话右键「分支…」列出会话树中的每条提问(缩进分层,当前路径高亮),点任意一条即从那里分出新会话
 - **导出 HTML** — 头部一键把当前会话导出为 HTML 并在文件管理器中显示
 - **改动审查** — agent 用 `edit`/`write` 改过的文件按项目路径汇总,在可调宽、可隐藏的右侧栏里看统一/并排 diff,打开的历史会话也能重建
 - **内置终端** — 右侧栏终端页运行真实 shell(Windows 为 PowerShell,Linux/macOS 为 `$SHELL`,ConPTY/PTY 驱动),可新建、随会话目录启动
@@ -28,7 +27,6 @@ A native desktop client for the [Pi coding agent](https://github.com/earendil-wo
 - **Message actions** — hover a prompt for its time and a copy button; hover a reply for copy, fork-from-here, token usage and time
 - **Turn status** — a clock above the reply while it works ("Working · 1m 4s"), frozen to "Done in X" on completion; tool calls and thinking fold away, click the line to re-open
 - **Compaction** — the header compaction button: compact now, or toggle pi's auto-compaction; the finished banner reports the before/after token counts, and restored sessions keep a summary marker at each compaction seam
-- **Branch tree** — a session's right-click menu lists every prompt in its tree (depth-indented, the active path highlighted); clicking one forks a new session from there
 - **HTML export** — one click exports the open session to HTML and reveals the file
 - **Change review** — files the agent edited or wrote, in a resizable, hideable right panel with unified/split diffs; restored sessions too
 - **Built-in terminal** — the right panel's terminal tab runs a real shell (PowerShell on Windows, `$SHELL` on Linux/macOS) via ConPTY/PTY; spawn a fresh one any time

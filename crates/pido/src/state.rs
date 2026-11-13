@@ -17,7 +17,7 @@ use gpui::{App, AppContext, Context, Entity};
 use pi_rpc::client::{ClientEvent, PiClient, PiProcessConfig};
 use pi_rpc::protocol::{
     AgentMessage, AssistantMessageEvent, ClearedQueue, Command, Event, Model, Response, RpcRecord,
-    SessionEntry, SessionState, SessionStats, SessionTreeNode, StreamingBehavior, ThinkingLevel,
+    SessionEntry, SessionState, SessionStats, StreamingBehavior, ThinkingLevel,
 };
 use pi_rpc::sessions::{self, SessionGroup};
 
@@ -762,14 +762,6 @@ pub struct AppState {
     pub session_epoch: u64,
     /// Steer messages queued by the UI that pi has not delivered yet.
     pending_steers: Vec<String>,
-    /// The branch dialog's rows, flattened from the active session's tree;
-    /// `Some` while the dialog is open.
-    pub branch_rows: Option<Vec<TreeRow>>,
-    /// Whether the branch dialog is showing.
-    pub branch_tree_open: bool,
-    /// Set when the branch dialog was asked for a session that is not open:
-    /// the tree fetch rides `switch_session`'s success path.
-    pending_branch_tree: bool,
     /// Follow-up messages queued by the UI that pi has not delivered yet.
     pending_follow_ups: Vec<String>,
     /// Where a message typed mid-run goes: steer the current run or queue
@@ -865,9 +857,6 @@ impl AppState {
                 queue_mode,
                 queued_steers: Vec::new(),
                 queued_follow_ups: Vec::new(),
-                branch_rows: None,
-                branch_tree_open: false,
-                pending_branch_tree: false,
                 expanded_turns: std::collections::HashSet::new(),
                 turn_running: false,
                 changes: Vec::new(),
@@ -1977,111 +1966,6 @@ impl AppState {
         .detach();
     }
 
-    /// Fork the open session at a user-prompt entry from the branch dialog:
-    /// pi creates a branched session at that point and rebinds to it.
-    pub fn fork_from_entry(&mut self, entry_id: &str, cx: &mut Context<Self>) {
-        if self.conn != Conn::Live {
-            return;
-        }
-        if self.streaming {
-            self.push_notice(NoticeKind::Warn, i18n::t(cx, "agent_busy").to_string());
-            cx.notify();
-            return;
-        }
-        let Some(client) = self.client() else { return };
-        let entry_id = entry_id.to_string();
-        cx.spawn(async move |this, cx| {
-            let result = cx
-                .background_executor()
-                .spawn(async move {
-                    let forked = client.request(Command::Fork { entry_id })?;
-                    if !forked.success {
-                        anyhow::bail!("fork failed: {:?}", forked.error);
-                    }
-                    Ok(session_action_cancelled(&forked))
-                })
-                .await;
-            this.update(cx, |s, cx| {
-                match result {
-                    Ok(cancelled) => {
-                        if cancelled {
-                            s.push_notice(
-                                NoticeKind::Warn,
-                                i18n::t(cx, "session_cancelled").to_string(),
-                            );
-                        } else {
-                            s.finish_fork(cx);
-                        }
-                    }
-                    Err(error) => s.push_notice(NoticeKind::Error, error.to_string()),
-                }
-                cx.notify();
-            })
-            .ok();
-        })
-        .detach();
-    }
-
-    /// Open the branch dialog for a session. The open one lists right away;
-    /// a different session is switched to first, and the tree fetch rides
-    /// that switch's success path.
-    pub fn open_branch_tree(&mut self, path: &str, cx: &mut Context<Self>) {
-        if self.conn != Conn::Live {
-            return;
-        }
-        if self.streaming {
-            self.push_notice(NoticeKind::Warn, i18n::t(cx, "agent_busy").to_string());
-            cx.notify();
-            return;
-        }
-        let same = self
-            .session_file
-            .as_deref()
-            .is_some_and(|open| session_key(open) == session_key(path));
-        if same {
-            self.fetch_tree(cx);
-        } else {
-            self.pending_branch_tree = true;
-            self.switch_session(PathBuf::from(path), cx);
-        }
-    }
-
-    /// Pull the active session's tree and flatten it into the branch
-    /// dialog's rows.
-    fn fetch_tree(&mut self, cx: &mut Context<Self>) {
-        let Some(client) = self.client() else {
-            self.pending_branch_tree = false;
-            return;
-        };
-        cx.spawn(async move |this, cx| {
-            let result = cx
-                .background_executor()
-                .spawn(async move {
-                    let response = client.request(Command::GetTree)?;
-                    if !response.success {
-                        anyhow::bail!("get_tree failed: {:?}", response.error);
-                    }
-                    response.data_as::<pi_rpc::protocol::SessionTree>()
-                })
-                .await;
-            this.update(cx, |s, cx| {
-                s.pending_branch_tree = false;
-                match result {
-                    Ok(Some(tree)) => {
-                        let leaf_id = tree.leaf_id.as_deref();
-                        s.branch_rows = Some(flatten_tree(&tree.tree, leaf_id));
-                        s.branch_tree_open = true;
-                    }
-                    Ok(None) => {}
-                    Err(error) => s.push_notice(NoticeKind::Error, error.to_string()),
-                }
-                cx.notify();
-            })
-            .ok();
-        })
-        .detach();
-    }
-
     /// Duplicate a session's active branch into a new session. Forking a
     /// session that is not open switches to it for the clone and then back,
     /// so the user's place survives; forking the open one leaves the clone
@@ -2186,9 +2070,6 @@ impl AppState {
         self.expanded_turns.clear();
         self.turn_running = false;
         self.clear_changes();
-        // A rebuilt conversation invalidates the tree the dialog shows.
-        self.branch_tree_open = false;
-        self.branch_rows = None;
         self.streaming = false;
         self.stats = None;
         self.session_name = None;
@@ -2577,7 +2458,6 @@ impl AppState {
                 match result {
                     Ok((cancelled, cwd)) => {
                         if cancelled {
-                            s.pending_branch_tree = false;
                             s.push_notice(
                                 NoticeKind::Warn,
                                 i18n::t(cx, "session_cancelled").to_string(),
@@ -2603,16 +2483,9 @@ impl AppState {
                             s.query_state(cx);
                             s.load_history(cx);
                             s.refresh_stats(cx);
-                            // A branch dialog asked for this session.
-                            if s.pending_branch_tree {
-                                s.fetch_tree(cx);
-                            }
                         }
                     }
-                    Err(error) => {
-                        s.pending_branch_tree = false;
-                        s.push_notice(NoticeKind::Error, error.to_string());
-                    }
+                    Err(error) => s.push_notice(NoticeKind::Error, error.to_string()),
                 }
                 cx.notify();
             })
@@ -3442,9 +3315,6 @@ impl AppState {
         self.expanded_turns.clear();
         self.turn_running = false;
         self.clear_changes();
-        // A rebuilt conversation invalidates the tree the dialog shows.
-        self.branch_tree_open = false;
-        self.branch_rows = None;
 
         // `write` calls carry their content in the call itself; the result
         // that follows only confirms it.
@@ -3619,68 +3489,6 @@ fn compact_tokens_label(n: u64) -> String {
     } else {
         n.to_string()
     }
-}
-
-/// One user-prompt row in the branch dialog.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TreeRow {
-    pub entry_id: String,
-    /// The prompt's first line, or the entry's label when one was set.
-    pub text: String,
-    /// How many prompts sit above this one; drives the dialog's indent.
-    pub depth: usize,
-    /// On the path from the root to the active leaf.
-    pub active: bool,
-}
-
-/// Flatten a session tree into one row per user prompt, depth-first in
-/// append order. Rows on the path from the root to `leaf_id` are the
-/// active branch.
-fn flatten_tree(tree: &[SessionTreeNode], leaf_id: Option<&str>) -> Vec<TreeRow> {
-    // The active path is the parent chain from the leaf back to the root.
-    let mut parents: HashMap<&str, Option<&str>> = HashMap::new();
-    let mut stack: Vec<&SessionTreeNode> = tree.iter().collect();
-    while let Some(node) = stack.pop() {
-        parents.insert(node.entry.id.as_str(), node.entry.parent_id.as_deref());
-        stack.extend(node.children.iter());
-    }
-    let mut active_ids: HashSet<&str> = HashSet::new();
-    if let Some(mut current) = leaf_id {
-        while let Some(parent) = parents.get(current).copied() {
-            active_ids.insert(current);
-            match parent {
-                Some(parent) => current = parent,
-                None => break,
-            }
-        }
-    }
-
-    fn walk(
-        nodes: &[SessionTreeNode],
-        depth: usize,
-        active: &HashSet<&str>,
-        rows: &mut Vec<TreeRow>,
-    ) {
-        for node in nodes {
-            let label = node.label.as_deref();
-            if let Some(AgentMessage::User(user)) = node.entry.message.as_ref() {
-                let text = user.text();
-                let first = text.lines().next().unwrap_or_default().trim().to_string();
-                if !first.is_empty() {
-                    rows.push(TreeRow {
-                        entry_id: node.entry.id.clone(),
-                        text: label.map_or(first, str::to_string),
-                        depth,
-                        active: active.contains(node.entry.id.as_str()),
-                    });
-                }
-            }
-            walk(&node.children, depth + 1, active, rows);
-        }
-    }
-    let mut rows = Vec::new();
-    walk(tree, 0, &active_ids, &mut rows);
-    rows
 }
 
 /// Entries on the path from the root to `leaf_id`, in append order. Falls
@@ -3918,97 +3726,6 @@ mod tests {
         assert_eq!(QueueChoice::default(), QueueChoice::Steer);
     }
 
-    fn tree_node(
-        id: &str,
-        parent: Option<&str>,
-        text: Option<&str>,
-        children: Vec<SessionTreeNode>,
-    ) -> SessionTreeNode {
-        let message = text.map(|text| {
-            AgentMessage::User(pi_rpc::protocol::UserMessage {
-                content: pi_rpc::protocol::UserContent::Text(text.into()),
-                timestamp: 1.0,
-                attachments: None,
-            })
-        });
-        SessionTreeNode {
-            entry: SessionEntry {
-                entry_type: "message".into(),
-                id: id.into(),
-                parent_id: parent.map(str::to_string),
-                timestamp: None,
-                message,
-                summary: None,
-            },
-            children,
-            label: None,
-            label_timestamp: None,
-        }
-    }
-
-    #[test]
-    fn flatten_tree_lists_user_prompts_and_marks_the_active_path() {
-        // root ─ a ─ b(active leaf)
-        //       └─ side (abandoned)
-        let tree = vec![tree_node(
-            "root",
-            None,
-            Some("first"),
-            vec![
-                tree_node(
-                    "a",
-                    Some("root"),
-                    Some("second"),
-                    vec![tree_node(
-                        "b",
-                        Some("a"),
-                        Some("third\nfourth line"),
-                        vec![],
-                    )],
-                ),
-                tree_node("side", Some("root"), Some("abandoned"), vec![]),
-            ],
-        )];
-        let rows = flatten_tree(&tree, Some("b"));
-        assert_eq!(
-            rows,
-            vec![
-                TreeRow {
-                    entry_id: "root".into(),
-                    text: "first".into(),
-                    depth: 0,
-                    active: true,
-                },
-                TreeRow {
-                    entry_id: "a".into(),
-                    text: "second".into(),
-                    depth: 1,
-                    active: true,
-                },
-                TreeRow {
-                    entry_id: "b".into(),
-                    // only the first line of a multi-line prompt
-                    text: "third".into(),
-                    depth: 2,
-                    active: true,
-                },
-                TreeRow {
-                    entry_id: "side".into(),
-                    text: "abandoned".into(),
-                    depth: 1,
-                    active: false,
-                },
-            ]
-        );
-        // No leaf: nothing is marked active, everything still lists.
-        let rows = flatten_tree(&tree, None);
-        assert_eq!(rows.len(), 4);
-        assert!(rows.iter().all(|row| !row.active));
-        // An unknown leaf: same.
-        let rows = flatten_tree(&tree, Some("missing"));
-        assert!(rows.iter().all(|row| !row.active));
-    }
-
     pub(super) fn empty_state() -> AppState {
         AppState {
             conn: Conn::Idle,
@@ -4053,9 +3770,6 @@ mod tests {
             queue_mode: QueueChoice::Steer,
             queued_steers: Vec::new(),
             queued_follow_ups: Vec::new(),
-            branch_rows: None,
-            branch_tree_open: false,
-            pending_branch_tree: false,
             expanded_turns: std::collections::HashSet::new(),
             turn_running: false,
             changes: Vec::new(),

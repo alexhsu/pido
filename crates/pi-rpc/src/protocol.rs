@@ -1039,30 +1039,6 @@ pub struct SessionEntry {
     pub summary: Option<String>,
 }
 
-/// A `get_tree` node: one entry, its descendants, and the resolved label
-/// (from the session's `label` entries), if any.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SessionTreeNode {
-    pub entry: SessionEntry,
-    #[serde(default)]
-    pub children: Vec<SessionTreeNode>,
-    #[serde(default)]
-    pub label: Option<String>,
-    #[serde(default)]
-    pub label_timestamp: Option<String>,
-}
-
-/// `get_tree` payload. `leaf_id` is the current leaf of the active branch;
-/// orphaned entries appear as extra roots.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SessionTree {
-    #[serde(default)]
-    pub tree: Vec<SessionTreeNode>,
-    pub leaf_id: Option<String>,
-}
-
 /// `get_session_stats` payload.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -1261,44 +1237,6 @@ mod tests {
             }
             other => panic!("expected response, got {other:?}"),
         }
-    }
-
-    #[test]
-    fn parse_get_tree_response() {
-        let record = parse_record(
-            r#"{"id":"7","type":"response","command":"get_tree","success":true,"data":{
-                "tree":[
-                    {"entry":{"type":"message","id":"abc123","parentId":null,"timestamp":"2026-11-14T10:00:00.000Z",
-                        "message":{"role":"user","content":[{"type":"text","text":"First prompt"}],"timestamp":1733234567890}},
-                     "children":[
-                        {"entry":{"type":"message","id":"def456","parentId":"abc123","timestamp":"2026-11-14T10:01:00.000Z",
-                            "message":{"role":"user","content":[{"type":"text","text":"Second"}],"timestamp":1733234568000}},
-                         "children":[]},
-                        {"entry":{"type":"message","id":"branched","parentId":"abc123","timestamp":"2026-11-14T10:02:00.000Z",
-                            "message":{"role":"user","content":[{"type":"text","text":"Branch"}],"timestamp":1733234569000}},
-                         "label":"Fix attempt","children":[]}
-                     ],
-                     "label":null}
-                ],
-                "leafId":"branched"}}"#,
-        )
-        .unwrap();
-        let RpcRecord::Response(response) = record else {
-            panic!("expected response");
-        };
-        assert!(response.success);
-        let tree = response.data_as::<SessionTree>().unwrap().unwrap();
-        assert_eq!(tree.leaf_id.as_deref(), Some("branched"));
-        let root = &tree.tree[0];
-        assert_eq!(root.entry.id, "abc123");
-        assert_eq!(root.children.len(), 2);
-        let (second, branched) = (&root.children[0], &root.children[1]);
-        assert_eq!(second.entry.parent_id.as_deref(), Some("abc123"));
-        assert_eq!(branched.label.as_deref(), Some("Fix attempt"));
-        let AgentMessage::User(user) = branched.entry.message.as_ref().unwrap() else {
-            panic!("expected a user message");
-        };
-        assert_eq!(user.text(), "Branch");
     }
 
     #[test]

@@ -596,14 +596,6 @@ fn session_menu(
             move |_, cx| state.update(cx, |s, cx| s.fork_session(&path, cx))
         });
 
-    let branches = MenuItem::new(i18n::t(cx, "branch_tree"))
-        .icon(IconName::Network)
-        .on_click({
-            let state = state.clone();
-            let path = path.to_string();
-            move |_, cx| state.update(cx, |s, cx| s.open_branch_tree(&path, cx))
-        });
-
     let reveal = MenuItem::new(i18n::t(cx, "reveal_in_folder"))
         .icon(IconName::FolderOpen)
         .on_click({
@@ -639,7 +631,6 @@ fn session_menu(
         .item(pin)
         .item(rename)
         .item(fork)
-        .item(branches)
         .separator()
         .item(copy)
         .item(reveal)

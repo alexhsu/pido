@@ -288,12 +288,11 @@ impl Render for PidoApp {
         };
 
         // Extension and rename dialogs ride at the root, above every pane;
-        // the remove-project confirmation and the branch tree join them.
+        // the remove-project confirmation joins them.
         let overlay = self
             .extension_dialog_overlay(&state, window, cx)
             .or_else(|| self.rename_dialog(cx))
-            .or_else(|| self.remove_project_dialog(cx))
-            .or_else(|| self.branch_tree_dialog(&state, cx));
+            .or_else(|| self.remove_project_dialog(cx));
         // The right panel mounts into the split when open; closing drops the
         // pane, so the two-pane layout gets the full width back.
         let right = self
@@ -717,111 +716,6 @@ impl PidoApp {
                             save_me.update(cx, |this, cx| this.finish_rename(&save_field, cx));
                             close(window, cx);
                         })
-                })
-                .into_any_element(),
-        )
-    }
-
-    /// The branch dialog for the open session: every user prompt in the
-    /// session's tree, indented by depth, the active path marked. Clicking
-    /// a row forks a new session at that prompt — the only way RPC offers
-    /// to move onto a branch.
-    fn branch_tree_dialog(
-        &mut self,
-        state: &gpui::Entity<AppState>,
-        cx: &mut Context<Self>,
-    ) -> Option<gpui::AnyElement> {
-        use gpui::prelude::FluentBuilder;
-        use {
-            ely_gpui_component::buttons::{Button, ButtonVariant},
-            ely_gpui_component::overlays::Dialog,
-        };
-
-        let s = state.read(cx);
-        if !s.branch_tree_open {
-            return None;
-        }
-        let rows = s.branch_rows.clone().unwrap_or_default();
-        let close_state = state.clone();
-        let shut = move |_: &mut Window, cx: &mut App| {
-            close_state.update(cx, |s, cx| {
-                s.branch_tree_open = false;
-                s.branch_rows = None;
-                cx.notify();
-            });
-        };
-        // Labels resolve here: the closures must be 'static, so they cannot
-        // borrow `cx` to look a string up when they run.
-        let title = crate::i18n::t(cx, "branch_tree");
-        let detail = crate::i18n::t(cx, "branch_tree_hint");
-        let close_label = crate::i18n::t(cx, "ext_cancel");
-        let empty_label = crate::i18n::t(cx, "tree_empty");
-        let active_label = crate::i18n::t(cx, "tree_active");
-        let colors = cx.theme().colors.clone();
-        let pick_state = state.clone();
-        let mut list = div()
-            .id("branch-list")
-            .w(gpui::px(560.0))
-            .max_h(gpui::px(420.0))
-            .overflow_y_scroll()
-            .flex()
-            .flex_col()
-            .gap_0p5();
-        if rows.is_empty() {
-            list = list.child(div().py_3().text_color(colors.fg_subtle).child(empty_label));
-        }
-        for (ix, row) in rows.iter().enumerate() {
-            let row_state = pick_state.clone();
-            let entry_id = row.entry_id.clone();
-            let row_active = row.active;
-            let text: gpui::SharedString = row.text.clone().into();
-            let active_chip: gpui::SharedString = active_label.clone();
-            list = list.child(
-                div()
-                    .id(("branch-row", ix))
-                    .w_full()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .px_2()
-                    .py_1()
-                    .rounded_sm()
-                    .cursor_pointer()
-                    .hover(|style| style.bg(colors.hover))
-                    .on_click(move |_, _, cx| {
-                        row_state.update(cx, |s, cx| {
-                            s.branch_tree_open = false;
-                            s.branch_rows = None;
-                            s.fork_from_entry(&entry_id, cx);
-                        });
-                    })
-                    // Each level of the tree indents one step; abandoned
-                    // branches sit deeper, under their fork point.
-                    .child(div().flex_none().w(gpui::px(row.depth as f32 * 18.0)))
-                    .when(row_active, |el| el.text_color(colors.info))
-                    .child(div().flex_1().min_w_0().truncate().child(text))
-                    .when(row_active, |el| {
-                        el.child(
-                            div()
-                                .flex_none()
-                                .px_1p5()
-                                .rounded_full()
-                                .bg(colors.info_subtle)
-                                .text_color(colors.info)
-                                .text_size(gpui::px(11.0))
-                                .child(active_chip),
-                        )
-                    }),
-            );
-        }
-        Some(
-            Dialog::new("branch-dialog", title, shut)
-                .detail(detail)
-                .child(list)
-                .action(move |close| {
-                    Button::new("branch-close", close_label.clone())
-                        .variant(ButtonVariant::Ghost)
-                        .on_click(move |_, window, cx| close(window, cx))
                 })
                 .into_any_element(),
         )
