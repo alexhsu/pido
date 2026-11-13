@@ -118,16 +118,16 @@ jobs:
         run: |
           VERSION="${{ steps.version.outputs.version }}"
           STAGE="stage/pido-${VERSION}-linux-x64.AppDir"
-          mkdir -p "$STAGE/usr/bin"
+          mkdir -p "$STAGE/usr/bin" "$STAGE/usr/share/applications" "$STAGE/usr/share/icons/hicolor/256x256/apps"
           cp target/release/pido "$STAGE/usr/bin/"
-          cp pido.desktop "$STAGE/"
+          cp pido.desktop "$STAGE/usr/share/applications/"
           cp crates/pido/assets/pido-mark-512.png "$STAGE/pido.png"
-          # AppImages want their icon next to the desktop entry at 128px too.
-          cp crates/pido/assets/pido-mark-512.png "$STAGE/usr/share/icons/hicolor/256x256/apps/pido.png" 2>/dev/null || {
-            mkdir -p "$STAGE/usr/share/icons/hicolor/256x256/apps"
-            cp crates/pido/assets/pido-mark-512.png \
-              "$STAGE/usr/share/icons/hicolor/256x256/apps/pido.png"
-          }
+          cp crates/pido/assets/pido-mark-512.png "$STAGE/usr/share/icons/hicolor/256x256/apps/pido.png"
+          cp LICENSE "$STAGE/"
+          cp pido.desktop "$STAGE/usr/share/applications/"
+          cp crates/pido/assets/pido-mark-512.png "$STAGE/pido.png"
+          cp crates/pido/assets/pido-mark-512.png \n            "$STAGE/usr/share/icons/hicolor/256x256/apps/pido.png"
+          cp LICENSE "$STAGE/"
 
           curl -fsSL -o linuxdeploy \
             "https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage"
