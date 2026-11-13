@@ -712,6 +712,9 @@ pub struct AppState {
     /// Set while a startup resume is in flight: once live, load its history.
     last_session_loaded: bool,
     pub stats: Option<SessionStats>,
+    /// Pi's auto-compaction switch, as `get_state` last reported it. `None`
+    /// before the first round trip.
+    pub auto_compaction: Option<bool>,
     /// A dismissible banner over the transcript.
     pub notice: Option<(NoticeKind, String)>,
     /// The last-used project directory, to prefill the welcome picker.
@@ -803,6 +806,7 @@ impl AppState {
                 awaiting_new_session_file: false,
                 last_session_loaded: false,
                 stats: None,
+                auto_compaction: None,
                 notice: None,
                 last_project,
                 next_image_key: 1,
@@ -1827,7 +1831,8 @@ impl AppState {
                             payload.entries.len(),
                             payload.leaf_id
                         );
-                        s.load_entries(&payload.entries, payload.leaf_id.as_deref());
+                        let compacted = i18n::t(cx, "context_compacted").to_string();
+                        s.load_entries(&payload.entries, payload.leaf_id.as_deref(), &compacted);
                     }
                     Ok(None) => {}
                     Err(error) => s.push_notice(NoticeKind::Error, error.to_string()),
@@ -2525,6 +2530,46 @@ impl AppState {
         );
     }
 
+    /// Flip pi's auto-compaction switch. Optimistic, like the model pick:
+    /// a failed round trip restores the previous value.
+    pub fn set_auto_compaction(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        if self.auto_compaction == Some(enabled) {
+            return;
+        }
+        let Some(client) = self.client() else { return };
+        let previous = self.auto_compaction;
+        self.auto_compaction = Some(enabled);
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { client.request(Command::SetAutoCompaction { enabled }) })
+                .await;
+            this.update(cx, |s, cx| {
+                match result {
+                    Ok(response) if response.success => {}
+                    Ok(response) => {
+                        s.auto_compaction = previous;
+                        s.push_notice(
+                            NoticeKind::Error,
+                            format!(
+                                "set_auto_compaction: {}",
+                                response.error.unwrap_or_default()
+                            ),
+                        );
+                    }
+                    Err(error) => {
+                        s.auto_compaction = previous;
+                        s.push_notice(NoticeKind::Error, error.to_string());
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+        cx.notify();
+    }
+
     /// Run a command in the background and surface failures as notices.
     fn check_command(&self, command: Command, label: &str, cx: &Context<Self>) {
         let Some(client) = self.client() else { return };
@@ -2566,6 +2611,7 @@ impl AppState {
                     s.thinking_level = payload.thinking_level;
                     s.session_name = payload.session_name;
                     s.session_id = payload.session_id;
+                    s.auto_compaction = Some(payload.auto_compaction_enabled);
                     let file = payload.session_file;
                     s.remember_session_file(file.as_deref());
                     // `new_chat` waits for this round trip to learn the file
@@ -2914,11 +2960,22 @@ impl AppState {
                         NoticeKind::Warn,
                         i18n::t(cx, "context_compacted_aborted").to_string(),
                     );
-                } else if result.is_some() {
-                    self.push_notice(
-                        NoticeKind::Info,
-                        i18n::t(cx, "context_compacted").to_string(),
-                    );
+                } else if let Some(result) = &result {
+                    let text = match compaction_tokens(result) {
+                        Some((before, after)) => i18n::t_arg(
+                            cx,
+                            "context_compacted_range",
+                            "range",
+                            &format!(
+                                "{} → {} tok",
+                                compact_tokens_label(before),
+                                compact_tokens_label(after)
+                            ),
+                        )
+                        .to_string(),
+                        None => i18n::t(cx, "context_compacted").to_string(),
+                    };
+                    self.push_notice(NoticeKind::Info, text);
                 } else {
                     let detail = error_message
                         .unwrap_or_else(|| i18n::t(cx, "context_compacted_failed").to_string());
@@ -3113,7 +3170,15 @@ impl AppState {
     }
 
     /// Rebuild the transcript from `get_entries` payload.
-    fn load_entries(&mut self, entries: &[SessionEntry], leaf_id: Option<&str>) {
+    /// Rebuild the transcript from session entries. `compacted_label` is the
+    /// localized "context compacted" text for compaction seams; `cx` is only
+    /// needed by the caller that renders it.
+    fn load_entries(
+        &mut self,
+        entries: &[SessionEntry],
+        leaf_id: Option<&str>,
+        compacted_label: &str,
+    ) {
         self.transcript.clear();
         self.expanded_turns.clear();
         self.turn_running = false;
@@ -3124,8 +3189,21 @@ impl AppState {
         let mut calls: HashMap<String, pi_rpc::protocol::ToolCall> = HashMap::new();
         for entry in active_branch(entries, leaf_id) {
             let Some(message) = &entry.message else {
+                // A compaction entry marks where older messages were folded
+                // into a summary; keep the marker so the restored transcript
+                // shows the seam.
                 if entry.entry_type == "compaction" {
-                    // The compacted summary is a checkpoint, not chat.
+                    let text = match entry.summary.as_deref() {
+                        Some(summary) => format!(
+                            "{compacted_label} — {}",
+                            truncate_for_display(summary, 160)
+                        ),
+                        None => compacted_label.to_string(),
+                    };
+                    self.transcript.push(TranscriptItem::Notice {
+                        kind: NoticeKind::Info,
+                        text,
+                    });
                 }
                 continue;
             };
@@ -3260,6 +3338,26 @@ fn session_action_cancelled(response: &Response) -> bool {
         .and_then(|data| data.get("cancelled"))
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false)
+}
+
+/// The before/after token counts a successful compaction reports, for the
+/// banner. `estimatedTokensAfter` is pi's heuristic, not an exact count.
+fn compaction_tokens(result: &serde_json::Value) -> Option<(u64, u64)> {
+    let before = result.get("tokensBefore")?.as_u64()?;
+    let after = result.get("estimatedTokensAfter")?.as_u64()?;
+    Some((before, after))
+}
+
+/// `1_234_567` → `1.2M`, `15_000` → `15.0k` — a compact label for the
+/// compaction banner's token range.
+fn compact_tokens_label(n: u64) -> String {
+    if n >= 1_000_000 {
+        format!("{:.1}M", n as f64 / 1_000_000.0)
+    } else if n >= 1_000 {
+        format!("{:.1}k", n as f64 / 1_000.0)
+    } else {
+        n.to_string()
+    }
 }
 
 /// Entries on the path from the root to `leaf_id`, in append order. Falls
@@ -3406,6 +3504,7 @@ mod tests {
             parent_id: parent.map(str::to_string),
             timestamp: None,
             message: None,
+            summary: None,
         }
     }
 
@@ -3464,6 +3563,29 @@ mod tests {
         assert_eq!(active_branch(&entries, None).len(), 2);
     }
 
+    #[test]
+    fn compaction_tokens_reads_the_reported_range() {
+        let full: serde_json::Value = serde_json::from_str(
+            r#"{"summary":"s","firstKeptEntryId":"e1","tokensBefore":150000,"estimatedTokensAfter":32000}"#,
+        )
+        .unwrap();
+        assert_eq!(compaction_tokens(&full), Some((150_000, 32_000)));
+
+        let no_estimate: serde_json::Value =
+            serde_json::from_str(r#"{"tokensBefore":150000}"#).unwrap();
+        assert_eq!(compaction_tokens(&no_estimate), None);
+
+        let aborted: serde_json::Value = serde_json::Value::Null;
+        assert_eq!(compaction_tokens(&aborted), None);
+    }
+
+    #[test]
+    fn compact_tokens_label_scales() {
+        assert_eq!(compact_tokens_label(900), "900");
+        assert_eq!(compact_tokens_label(15_000), "15.0k");
+        assert_eq!(compact_tokens_label(1_234_567), "1.2M");
+    }
+
     pub(super) fn empty_state() -> AppState {
         AppState {
             conn: Conn::Idle,
@@ -3494,6 +3616,7 @@ mod tests {
             awaiting_new_session_file: false,
             last_session_loaded: false,
             stats: None,
+            auto_compaction: None,
             notice: None,
             last_project: None,
             commands: Vec::new(),
@@ -3537,6 +3660,7 @@ mod tests {
             parent_id: parent.map(str::to_string),
             timestamp: None,
             message: Some(message),
+            summary: None,
         }
     }
 
@@ -3590,7 +3714,7 @@ mod tests {
             message_entry("x1", Some("u1"), abandoned),
         ];
 
-        state.load_entries(&entries, Some("t1"));
+        state.load_entries(&entries, Some("t1"), "context compacted");
 
         let kinds = state
             .transcript
@@ -3838,7 +3962,7 @@ two
             message_entry("t1", Some("a1"), result),
             message_entry("t2", Some("t1"), edit),
         ];
-        state.load_entries(&entries, Some("t2"));
+        state.load_entries(&entries, Some("t2"), "context compacted");
 
         let paths: Vec<&str> = state
             .changes

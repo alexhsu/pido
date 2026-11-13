@@ -247,7 +247,7 @@ impl Render for PidoApp {
                 .child(
                     div()
                         .flex_none()
-                        .child(chat::render_header(&state, &cx.entity(), cx)),
+                        .child(chat::render_header(&state, &cx.entity(), window, cx)),
                 )
                 .child(
                     div()

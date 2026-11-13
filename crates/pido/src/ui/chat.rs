@@ -10,7 +10,7 @@ use ely_gpui_component::theme::{ActiveTheme, ControlSize, IconSize, TextSize};
 use ely_gpui_component::typography::{Caption, Paragraph};
 use gpui::{
     AnyElement, App, Entity, InteractiveElement, IntoElement, ParentElement, SharedString,
-    StatefulInteractiveElement, Styled, div, prelude::FluentBuilder,
+    StatefulInteractiveElement, Styled, Window, div, prelude::FluentBuilder,
 };
 use pi_rpc::protocol::ThinkingLevel;
 
@@ -24,7 +24,8 @@ use crate::ui::app::{RightTab, toggle_theme};
 pub fn render_header(
     state: &Entity<AppState>,
     view: &Entity<crate::ui::app::PidoApp>,
-    cx: &App,
+    window: &mut Window,
+    cx: &mut App,
 ) -> impl IntoElement + use<> {
     let theme = cx.theme();
     let s = state.read(cx);
@@ -131,13 +132,41 @@ pub fn render_header(
         )
         .child({
             let app = app.clone();
-            ely_gpui_component::buttons::IconButton::new(
-                "compact",
-                ely_gpui_component::primitives::IconName::Minimize2,
+            let auto = s.auto_compaction.unwrap_or(true);
+            let compact_label = i18n::t(cx, "compact_now").to_string();
+            let auto_label = i18n::t(cx, "auto_compact").to_string();
+            let tooltip = i18n::t(cx, "compact_now");
+            let compact = app.clone();
+            let menu = ely_gpui_component::menus::Menu::new()
+                .item(
+                    ely_gpui_component::menus::MenuItem::new(compact_label)
+                        .icon(ely_gpui_component::primitives::IconName::Minimize2)
+                        .on_click(move |_, cx| compact.update(cx, |s, cx| s.compact_now(cx))),
+                )
+                .item({
+                    let app = app.clone();
+                    ely_gpui_component::menus::MenuItem::check(auto_label, auto).on_click(
+                        move |_, cx| {
+                            app.update(cx, |s, cx| s.set_auto_compaction(!auto, cx));
+                        },
+                    )
+                });
+            ely_gpui_component::menus::menu_under(
+                "compact".into(),
+                &menu,
+                move |click| {
+                    ely_gpui_component::buttons::IconButton::new(
+                        "compact-button",
+                        ely_gpui_component::primitives::IconName::Minimize2,
+                    )
+                    .variant(ely_gpui_component::buttons::ButtonVariant::Ghost)
+                    .tooltip(tooltip)
+                    .on_click(move |event, window, cx| click(event, window, cx))
+                    .into_any_element()
+                },
+                window,
+                cx,
             )
-            .variant(ely_gpui_component::buttons::ButtonVariant::Ghost)
-            .tooltip(i18n::t(cx, "compact_now"))
-            .on_click(move |_, _, cx| app.update(cx, |s, cx| s.compact_now(cx)))
         })
 }
 

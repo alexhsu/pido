@@ -1033,6 +1033,10 @@ pub struct SessionEntry {
     pub timestamp: Option<String>,
     #[serde(default)]
     pub message: Option<AgentMessage>,
+    /// Compaction entries carry the summary that replaced the older
+    /// messages; absent on every other entry type.
+    #[serde(default)]
+    pub summary: Option<String>,
 }
 
 /// `get_session_stats` payload.
