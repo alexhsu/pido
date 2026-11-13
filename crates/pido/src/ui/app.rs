@@ -6,7 +6,7 @@ use ely_gpui_component::primitives::FocusScope;
 use ely_gpui_component::theme::{ActiveTheme, ContainerSize, Mode, Theme};
 use gpui::{
     App, AppContext, Context, FocusHandle, InteractiveElement, IntoElement, ParentElement, Render,
-    StatefulInteractiveElement, Styled, Window, actions, div,
+    Styled, Window, actions, div,
 };
 
 use crate::state::{AppState, Conn};

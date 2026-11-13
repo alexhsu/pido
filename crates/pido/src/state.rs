@@ -274,6 +274,10 @@ pub enum SidebarRow {
         updated: Option<i64>,
         pinned: bool,
         archived: bool,
+        /// How many fork generations sit above this one; drives the indent.
+        depth: usize,
+        /// Direct forks this session has, for the fold arrow.
+        children: usize,
     },
 }
 
@@ -313,7 +317,13 @@ pub fn reveal_in_folder(path: &Path) {
 }
 
 /// One session as a sidebar row.
-fn session_row(session: &sessions::SessionSummary, pinned: bool, archived: bool) -> SidebarRow {
+fn session_row(
+    session: &sessions::SessionSummary,
+    pinned: bool,
+    archived: bool,
+    depth: usize,
+    children: usize,
+) -> SidebarRow {
     let title = session
         .name
         .clone()
@@ -326,18 +336,110 @@ fn session_row(session: &sessions::SessionSummary, pinned: bool, archived: bool)
         updated: session.updated_secs,
         pinned,
         archived,
+        depth,
+        children,
     }
 }
 
+/// Order one project's sessions as a fork tree: each session nests under the
+/// file its header's `parentSession` names (pi writes it on every fork and
+/// clone), pinned sessions hoist to roots, and sessions whose parent is not
+/// in the tree (deleted, archived, or another project's file) stand as roots.
+/// `collapsed` hides a session's subtree. Cycles — impossible in practice,
+/// but a copied file could make one — still list, emitted as roots.
+fn session_tree<'a>(
+    sessions: &[&'a sessions::SessionSummary],
+    pinned: &HashSet<String>,
+    collapsed: &HashSet<String>,
+) -> Vec<(usize, &'a sessions::SessionSummary)> {
+    fn emit<'a>(
+        session: &'a sessions::SessionSummary,
+        depth: usize,
+        children: &HashMap<String, Vec<&'a sessions::SessionSummary>>,
+        collapsed: &HashSet<String>,
+        emitted: &mut HashSet<String>,
+        rows: &mut Vec<(usize, &'a sessions::SessionSummary)>,
+    ) {
+        let key = session_key(&session.path.to_string_lossy());
+        if !emitted.insert(key.clone()) {
+            return;
+        }
+        rows.push((depth, session));
+        if collapsed.contains(&key) {
+            return;
+        }
+        for kid in children.get(&key).into_iter().flatten() {
+            emit(kid, depth + 1, children, collapsed, emitted, rows);
+        }
+    }
+
+    fn mark(
+        session: &sessions::SessionSummary,
+        children: &HashMap<String, Vec<&sessions::SessionSummary>>,
+        reachable: &mut HashSet<String>,
+    ) {
+        let key = session_key(&session.path.to_string_lossy());
+        if !reachable.insert(key.clone()) {
+            return;
+        }
+        for kid in children.get(&key).into_iter().flatten() {
+            mark(kid, children, reachable);
+        }
+    }
+
+    let key = |session: &sessions::SessionSummary| session_key(&session.path.to_string_lossy());
+    let listed: HashSet<String> = sessions.iter().map(|s| key(s)).collect();
+    let mut children: HashMap<String, Vec<&sessions::SessionSummary>> = HashMap::new();
+    let mut roots: Vec<&sessions::SessionSummary> = Vec::new();
+    for session in sessions {
+        match &session.parent_session {
+            Some(parent)
+                if !pinned.contains(&key(session)) && listed.contains(&session_key(parent)) =>
+            {
+                children
+                    .entry(session_key(parent))
+                    .or_default()
+                    .push(session);
+            }
+            _ => roots.push(session),
+        }
+    }
+    // The scanner lists newest first; pinned hoisted roots lead.
+    let (hoisted, plain): (Vec<_>, Vec<_>) = roots
+        .into_iter()
+        .partition(|session| pinned.contains(&key(session)));
+    let ordered_roots: Vec<&sessions::SessionSummary> = hoisted.into_iter().chain(plain).collect();
+    // Everything reachable from a root belongs to the tree — folded subtrees
+    // included — so the cycle rescue below cannot hoist them as orphans.
+    let mut reachable = HashSet::new();
+    for root in &ordered_roots {
+        mark(root, &children, &mut reachable);
+    }
+    let mut rows = Vec::with_capacity(sessions.len());
+    let mut emitted = HashSet::new();
+    for root in &ordered_roots {
+        emit(root, 0, &children, collapsed, &mut emitted, &mut rows);
+    }
+    // A cycle never reaches a root; its members still list, as roots.
+    for session in sessions {
+        if !reachable.contains(&key(session)) {
+            emit(session, 0, &children, collapsed, &mut emitted, &mut rows);
+        }
+    }
+    rows
+}
+
 /// Flatten grouped sessions into the sidebar's row order: pinned sessions
-/// first inside their project, archived ones collected into a fold at the
-/// bottom. The archive fold sits under the empty-string key.
+/// first inside their project, forks nested under the session they were
+/// forked from, archived ones collected into a fold at the bottom. The
+/// archive fold sits under the empty-string key.
 fn flatten_groups(
     groups: &[SessionGroup],
     collapsed: &std::collections::HashSet<String>,
     labels: &HashMap<String, String>,
     pinned: &HashSet<String>,
     archived: &HashSet<String>,
+    collapsed_sessions: &HashSet<String>,
 ) -> Vec<SidebarRow> {
     let mut rows = Vec::with_capacity(
         groups
@@ -372,13 +474,19 @@ fn flatten_groups(
         if folded {
             continue;
         }
-        // Stable sort: pinned first, everything else in the scanner's order.
-        let mut active = active;
-        active
-            .sort_by_key(|session| !pinned.contains(&session_key(&session.path.to_string_lossy())));
-        for session in active {
+        // Forks nest under the session they were forked from; pinned ones
+        // hoist to roots and lead, the rest keep the scanner's order.
+        for (depth, session) in session_tree(&active, pinned, collapsed_sessions) {
             let pinned = pinned.contains(&session_key(&session.path.to_string_lossy()));
-            rows.push(session_row(session, pinned, false));
+            let children = active
+                .iter()
+                .filter(|other| {
+                    other.parent_session.as_deref().is_some_and(|parent| {
+                        session_key(parent) == session_key(&session.path.to_string_lossy())
+                    })
+                })
+                .count();
+            rows.push(session_row(session, pinned, false, depth, children));
         }
     }
     if !archived_sessions.is_empty() {
@@ -397,6 +505,8 @@ fn flatten_groups(
                     session,
                     pinned.contains(&session_key(&session.path.to_string_lossy())),
                     true,
+                    0,
+                    0,
                 ));
             }
         }
@@ -700,6 +810,9 @@ pub struct AppState {
     /// Projects the user folded shut, keyed by working directory. The
     /// archive fold uses the empty string.
     pub collapsed_projects: std::collections::HashSet<String>,
+    /// Sessions whose fork subtree the user folded shut, keyed like the
+    /// pin/archive sets. Not persisted: forks refold on restart.
+    pub collapsed_sessions: std::collections::HashSet<String>,
     /// Project folders the user added; they list even without sessions.
     pub user_projects: Vec<String>,
     /// Sidebar labels the user gave projects, keyed like pin/archive sets.
@@ -827,6 +940,7 @@ impl AppState {
                 session_groups: Vec::new(),
                 sidebar_rows: Vec::new(),
                 collapsed_projects: collapsed,
+                collapsed_sessions: HashSet::new(),
                 user_projects,
                 project_labels: persisted.project_labels.iter().cloned().collect(),
                 pinned_sessions,
@@ -1263,6 +1377,7 @@ impl AppState {
                 &self.project_labels,
                 &self.pinned_sessions,
                 &self.archived_sessions,
+                &self.collapsed_sessions,
             );
         };
         // New activity leads its project, and that project leads the list;
@@ -1292,6 +1407,7 @@ impl AppState {
             &self.project_labels,
             &self.pinned_sessions,
             &self.archived_sessions,
+            &self.collapsed_sessions,
         )
     }
 
@@ -1320,6 +1436,7 @@ impl AppState {
             name: self.session_name.clone(),
             preview: None,
             message_count: 0,
+            parent_session: None,
         })
     }
 
@@ -1467,6 +1584,16 @@ impl AppState {
         let mut pinned: Vec<String> = self.pinned_sessions.iter().cloned().collect();
         pinned.sort();
         crate::settings::save_setting(|s| s.pinned_sessions = pinned);
+        self.sidebar_rows = self.sidebar_rows_now();
+        cx.notify();
+    }
+
+    /// Fold or unfold a session's fork subtree.
+    pub fn toggle_session_fold(&mut self, path: &str, cx: &mut Context<Self>) {
+        let key = session_key(path);
+        if !self.collapsed_sessions.remove(&key) {
+            self.collapsed_sessions.insert(key);
+        }
         self.sidebar_rows = self.sidebar_rows_now();
         cx.notify();
     }
@@ -1872,7 +1999,12 @@ impl AppState {
                             payload.leaf_id
                         );
                         let compacted = i18n::t(cx, "context_compacted").to_string();
-                        s.load_entries(&payload.entries, payload.leaf_id.as_deref(), &compacted);
+                        s.load_entries(
+                            &payload.entries,
+                            payload.leaf_id.as_deref(),
+                            &compacted,
+                            &i18n::t(cx, "branch_left").to_string(),
+                        );
                     }
                     Ok(None) => {}
                     Err(error) => s.push_notice(NoticeKind::Error, error.to_string()),
@@ -3302,14 +3434,16 @@ impl AppState {
     }
 
     /// Rebuild the transcript from `get_entries` payload.
-    /// Rebuild the transcript from session entries. `compacted_label` is the
-    /// localized "context compacted" text for compaction seams; `cx` is only
-    /// needed by the caller that renders it.
+    /// Rebuild the transcript from session entries. `compacted_label` and
+    /// `branch_label` are the localized texts for compaction and
+    /// branch-summary seams; `cx` is only needed by the caller that renders
+    /// them.
     fn load_entries(
         &mut self,
         entries: &[SessionEntry],
         leaf_id: Option<&str>,
         compacted_label: &str,
+        branch_label: &str,
     ) {
         self.transcript.clear();
         self.expanded_turns.clear();
@@ -3321,15 +3455,20 @@ impl AppState {
         let mut calls: HashMap<String, pi_rpc::protocol::ToolCall> = HashMap::new();
         for entry in active_branch(entries, leaf_id) {
             let Some(message) = &entry.message else {
-                // A compaction entry marks where older messages were folded
-                // into a summary; keep the marker so the restored transcript
-                // shows the seam.
-                if entry.entry_type == "compaction" {
+                // Compaction and branch-summary entries mark where older
+                // context was folded away; keep the markers so the restored
+                // transcript shows the seams.
+                if entry.entry_type == "compaction" || entry.entry_type == "branch_summary" {
+                    let label = if entry.entry_type == "compaction" {
+                        compacted_label
+                    } else {
+                        branch_label
+                    };
                     let text = match entry.summary.as_deref() {
                         Some(summary) => {
-                            format!("{compacted_label} — {}", truncate_for_display(summary, 160))
+                            format!("{label} — {}", truncate_for_display(summary, 160))
                         }
-                        None => compacted_label.to_string(),
+                        None => label.to_string(),
                     };
                     self.transcript.push(TranscriptItem::Notice {
                         kind: NoticeKind::Info,
@@ -3740,6 +3879,7 @@ mod tests {
             session_groups: Vec::new(),
             sidebar_rows: Vec::new(),
             collapsed_projects: std::collections::HashSet::new(),
+            collapsed_sessions: HashSet::new(),
             stopping: false,
             last_error: String::new(),
             conn_gen: 0,
@@ -3792,6 +3932,7 @@ mod tests {
             name: Some(format!("session {id}")),
             preview: None,
             message_count: 1,
+            parent_session: None,
         }
     }
 
@@ -3856,7 +3997,7 @@ mod tests {
             message_entry("x1", Some("u1"), abandoned),
         ];
 
-        state.load_entries(&entries, Some("t1"), "context compacted");
+        state.load_entries(&entries, Some("t1"), "context compacted", "branch summary");
 
         let kinds = state
             .transcript
@@ -4104,7 +4245,7 @@ two
             message_entry("t1", Some("a1"), result),
             message_entry("t2", Some("t1"), edit),
         ];
-        state.load_entries(&entries, Some("t2"), "context compacted");
+        state.load_entries(&entries, Some("t2"), "context compacted", "branch summary");
 
         let paths: Vec<&str> = state
             .changes
@@ -4238,6 +4379,7 @@ mod sidebar_tests {
                     name: Some(format!("session {ix}")),
                     preview: None,
                     message_count: 1,
+                    parent_session: None,
                 })
                 .collect(),
         }
@@ -4252,6 +4394,7 @@ mod sidebar_tests {
             &Default::default(),
             &Default::default(),
             &Default::default(),
+            &Default::default(),
         );
         assert_eq!(open.len(), 2 + 3 + 2, "two headers and five sessions");
 
@@ -4260,6 +4403,7 @@ mod sidebar_tests {
         let rows = flatten_groups(
             &groups,
             &folded,
+            &Default::default(),
             &Default::default(),
             &Default::default(),
             &Default::default(),
@@ -4300,6 +4444,7 @@ mod sidebar_tests {
             &Default::default(),
             &pinned,
             &Default::default(),
+            &Default::default(),
         );
         match &rows[1] {
             SidebarRow::Session { path, pinned, .. } => {
@@ -4318,6 +4463,7 @@ mod sidebar_tests {
             &Default::default(),
             &HashSet::new(),
             &archived,
+            &Default::default(),
         );
         let group_a = match &rows[0] {
             SidebarRow::Group { sessions, .. } => *sessions,
@@ -4347,6 +4493,134 @@ mod sidebar_tests {
         assert!(collapsed.contains("D:/a"));
         toggle_fold(&mut collapsed, "D:/a");
         assert!(!collapsed.contains("D:/a"));
+    }
+
+    /// A forked session: `parent` is the file path its header names.
+    fn forked(cwd: &str, id: &str, path: &str, parent: Option<&str>) -> sessions::SessionSummary {
+        sessions::SessionSummary {
+            parent_session: parent.map(str::to_string),
+            ..super::tests::summary(cwd, id, path)
+        }
+    }
+
+    fn paths(rows: &[SidebarRow]) -> Vec<String> {
+        rows.iter()
+            .filter_map(|row| match row {
+                SidebarRow::Session { path, depth, .. } => Some((path.to_string(), *depth)),
+                _ => None,
+            })
+            .collect::<Vec<(String, usize)>>()
+            .into_iter()
+            .map(|(path, depth)| format!("{path}@{depth}"))
+            .collect()
+    }
+
+    #[test]
+    fn forks_nest_under_the_session_they_forked_from() {
+        let group = SessionGroup {
+            cwd: "D:/a".into(),
+            sessions: vec![
+                forked("D:/a", "b", "D:/a/b.jsonl", Some("D:/a/a.jsonl")),
+                super::tests::summary("D:/a", "a", "D:/a/a.jsonl"),
+                // A fork of the fork: two generations deep.
+                forked("D:/a", "c", "D:/a/c.jsonl", Some("D:/a/b.jsonl")),
+                super::tests::summary("D:/a", "other", "D:/a/other.jsonl"),
+            ],
+        };
+        let rows = flatten_groups(
+            &[group],
+            &Default::default(),
+            &Default::default(),
+            &Default::default(),
+            &Default::default(),
+            &Default::default(),
+        );
+        assert_eq!(
+            paths(&rows),
+            [
+                "D:/a/a.jsonl@0",
+                "D:/a/b.jsonl@1",
+                "D:/a/c.jsonl@2",
+                "D:/a/other.jsonl@0",
+            ],
+            "the fork chain nests in order, unrelated sessions stay roots"
+        );
+    }
+
+    #[test]
+    fn pinned_forks_hoist_and_orphans_become_roots() {
+        let group = SessionGroup {
+            cwd: "D:/a".into(),
+            sessions: vec![
+                forked("D:/a", "b", "D:/a/b.jsonl", Some("D:/a/a.jsonl")),
+                super::tests::summary("D:/a", "a", "D:/a/a.jsonl"),
+                // Parent file is gone: an orphan lists as a root.
+                forked("D:/a", "orphan", "D:/a/o.jsonl", Some("D:/a/gone.jsonl")),
+            ],
+        };
+        let mut pinned = HashSet::new();
+        pinned.insert(session_key("D:/a/b.jsonl"));
+        let rows = flatten_groups(
+            &[group],
+            &Default::default(),
+            &Default::default(),
+            &pinned,
+            &Default::default(),
+            &Default::default(),
+        );
+        assert_eq!(
+            paths(&rows),
+            ["D:/a/b.jsonl@0", "D:/a/a.jsonl@0", "D:/a/o.jsonl@0",],
+            "the pinned fork leads as a root; the orphan stands alone"
+        );
+    }
+
+    #[test]
+    fn a_cycle_still_lists_every_session() {
+        // Copied files could point at each other; nothing may drop.
+        let group = SessionGroup {
+            cwd: "D:/a".into(),
+            sessions: vec![
+                forked("D:/a", "x", "D:/a/x.jsonl", Some("D:/a/y.jsonl")),
+                forked("D:/a", "y", "D:/a/y.jsonl", Some("D:/a/x.jsonl")),
+            ],
+        };
+        let rows = flatten_groups(
+            &[group],
+            &Default::default(),
+            &Default::default(),
+            &Default::default(),
+            &Default::default(),
+            &Default::default(),
+        );
+        assert_eq!(rows.len(), 1 + 2, "the header plus both cycle members");
+    }
+
+    #[test]
+    fn folding_a_session_hides_its_fork_subtree() {
+        let group = SessionGroup {
+            cwd: "D:/a".into(),
+            sessions: vec![
+                forked("D:/a", "b", "D:/a/b.jsonl", Some("D:/a/a.jsonl")),
+                super::tests::summary("D:/a", "a", "D:/a/a.jsonl"),
+                forked("D:/a", "c", "D:/a/c.jsonl", Some("D:/a/b.jsonl")),
+            ],
+        };
+        let mut folded = HashSet::new();
+        folded.insert(session_key("D:/a/a.jsonl"));
+        let rows = flatten_groups(
+            &[group],
+            &Default::default(),
+            &Default::default(),
+            &Default::default(),
+            &Default::default(),
+            &folded,
+        );
+        assert_eq!(
+            paths(&rows),
+            ["D:/a/a.jsonl@0"],
+            "the folded session's forks hide with it"
+        );
     }
 
     #[test]
@@ -4438,6 +4712,8 @@ mod sidebar_tests {
                 updated: Some(1),
                 pinned: false,
                 archived: false,
+                depth: 0,
+                children: 0,
             },
             SidebarRow::Session {
                 path: "D:/a/two.jsonl".into(),
@@ -4446,6 +4722,8 @@ mod sidebar_tests {
                 updated: Some(2),
                 pinned: false,
                 archived: false,
+                depth: 0,
+                children: 0,
             },
         ];
         patch_session_title(&mut rows, "D:/a/one.jsonl", "renamed");

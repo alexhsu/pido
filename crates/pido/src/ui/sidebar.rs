@@ -259,6 +259,8 @@ pub fn render(
                                         updated,
                                         pinned,
                                         archived,
+                                        depth,
+                                        children,
                                     } => session_row(
                                         cx,
                                         ix,
@@ -270,6 +272,8 @@ pub fn render(
                                         *updated,
                                         *pinned,
                                         *archived,
+                                        *depth,
+                                        *children,
                                         control_h,
                                         radius_md,
                                         text_sm,
@@ -421,7 +425,9 @@ fn project_menu(
         .item(remove)
 }
 
-/// One session row, wrapped in its right-click menu.
+/// One session row, wrapped in its right-click menu. Forked sessions indent
+/// one step per generation, under the session they were forked from; a
+/// session with forks carries a fold caret.
 #[allow(clippy::too_many_arguments)]
 fn session_row(
     cx: &App,
@@ -434,6 +440,8 @@ fn session_row(
     updated: Option<i64>,
     pinned: bool,
     archived: bool,
+    depth: usize,
+    children: usize,
     control_h: gpui::Rems,
     radius_md: gpui::Rems,
     text_sm: gpui::Rems,
@@ -459,9 +467,15 @@ fn session_row(
     } else {
         title
     };
+    let folded = state
+        .read(cx)
+        .collapsed_sessions
+        .contains(crate::state::session_key(&path).as_str());
     let age = i18n::relative_time(cx, updated);
     let app = state.clone();
     let click_path = path.clone();
+    let fold_path = path.clone();
+    let fold_state = state.clone();
     let row = div()
         .id(("session", ix as u64))
         .role(gpui::Role::ListItem)
@@ -472,7 +486,7 @@ fn session_row(
         .items_center()
         .gap_1()
         .h(control_h)
-        .pl(px(12.) + label_lead)
+        .pl(px(12. + 14. * depth as f32) + label_lead)
         .pr_0p5()
         .rounded(radius_md)
         .text_size(text_sm)
@@ -485,6 +499,27 @@ fn session_row(
             app.update(cx, |s, cx| {
                 s.switch_session(std::path::PathBuf::from(click_path.to_string()), cx)
             });
+        })
+        .when(children > 0, |row| {
+            row.child(
+                div()
+                    .id(("session-fold", ix as u64))
+                    .flex_none()
+                    .cursor_pointer()
+                    .child(
+                        Icon::new(if folded {
+                            IconName::ChevronRight
+                        } else {
+                            IconName::ChevronDown
+                        })
+                        .size(IconSize::Xs)
+                        .color(colors.fg_subtle),
+                    )
+                    .on_click(move |_, _, cx| {
+                        cx.stop_propagation();
+                        fold_state.update(cx, |s, cx| s.toggle_session_fold(&fold_path, cx));
+                    }),
+            )
         })
         .child(div().flex_1().min_w_0().child(Ellipsis::new(title.clone())))
         .when(pinned, |row| {

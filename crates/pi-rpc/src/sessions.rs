@@ -46,6 +46,9 @@ pub struct SessionSummary {
     pub preview: Option<String>,
     /// Number of `message` entries in the file.
     pub message_count: usize,
+    /// The session file this one was forked/cloned from, as recorded in the
+    /// header by pi's `createBranchedSession`. `None` for original sessions.
+    pub parent_session: Option<String>,
 }
 
 /// A project directory plus its sessions, newest first.
@@ -65,6 +68,8 @@ struct SessionHeader {
     timestamp: Option<String>,
     #[serde(default)]
     cwd: Option<String>,
+    #[serde(default, rename = "parentSession")]
+    parent_session: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -355,6 +360,7 @@ fn parse_session_file(path: &Path) -> Option<SessionSummary> {
         name,
         preview: preview.map(|p| truncate(&p, 120)),
         message_count,
+        parent_session: header.parent_session,
     })
 }
 
@@ -481,6 +487,48 @@ mod tests {
             Some("Older question about Rust")
         );
         assert_eq!(group_a.sessions[1].message_count, 1);
+    }
+
+    #[test]
+    fn summary_records_the_fork_lineage_from_the_header() {
+        let root = tempdir();
+        let project = root.path().join("--C--proj--");
+        write_session(
+            &project,
+            "2026-01-01T10-00-00-000Z_id-child.jsonl",
+            &[
+                r#"{"type":"session","version":3,"id":"id-child","timestamp":"2026-01-01T10:00:00.000Z","cwd":"C:\\proj","parentSession":"C:\\Users\\x\\.pi\\agent\\sessions\\--C--proj--\\parent.jsonl"}"#.into(),
+            ],
+            10,
+        );
+        write_session(
+            &project,
+            "2026-01-01T09-00-00-000Z_id-root.jsonl",
+            &[
+                r#"{"type":"session","version":3,"id":"id-root","timestamp":"2026-01-01T09:00:00.000Z","cwd":"C:\\proj"}"#.into(),
+            ],
+            5,
+        );
+
+        let groups = scan_sessions(root.path()).unwrap();
+        let sessions = &groups[0].sessions;
+        let child = sessions
+            .iter()
+            .find(|session| session.session_id == "id-child")
+            .unwrap();
+        let root_session = sessions
+            .iter()
+            .find(|session| session.session_id == "id-root")
+            .unwrap();
+        assert!(
+            child
+                .parent_session
+                .as_deref()
+                .unwrap()
+                .ends_with("parent.jsonl"),
+            "the fork records its parent"
+        );
+        assert!(root_session.parent_session.is_none());
     }
 
     #[test]
