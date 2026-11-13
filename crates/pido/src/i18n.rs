@@ -131,6 +131,7 @@ pub fn init(cx: &mut App, default: &str) {
                     ("copy_message", "复制内容"),
                     ("queued_steer", "转向"),
                     ("queued_follow_up", "追加"),
+                    ("queue_mode", "运行中发送:转向立即介入,追加等本轮结束"),
                 ],
             )
             .catalog(
@@ -248,6 +249,7 @@ pub fn init(cx: &mut App, default: &str) {
                     ("copy_message", "Copy text"),
                     ("queued_steer", "Steer"),
                     ("queued_follow_up", "Follow-up"),
+                    ("queue_mode", "Mid-run sends: steer joins now, follow-up queues"),
                 ],
             ),
     );

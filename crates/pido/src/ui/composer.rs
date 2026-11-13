@@ -16,7 +16,7 @@ use gpui::{
 };
 
 use crate::i18n;
-use crate::state::AppState;
+use crate::state::{AppState, QueueChoice};
 use crate::ui::app::PidoApp;
 use crate::ui::chat::level_slug;
 
@@ -167,8 +167,47 @@ pub fn render(state: &Entity<AppState>, app: &mut PidoApp, cx: &App) -> impl Int
         });
 
     // The model pill sits at the right of the tool row, beside send; a
-    // separate stop button appears while the agent runs.
+    // separate stop button appears while the agent runs, next to the
+    // steer/follow-up pick that governs mid-run sends.
     let pill = model_pill(s, state.clone(), cx);
+    let queue_pick = if streaming {
+        let steer_state = state.clone();
+        let follow_state = state.clone();
+        let (steer_label, follow_label) = (
+            i18n::t(cx, "queued_steer").to_string(),
+            i18n::t(cx, "queued_follow_up").to_string(),
+        );
+        let current = s.queue_mode;
+        let menu = ely_gpui_component::menus::Menu::new()
+            .item(
+                ely_gpui_component::menus::MenuItem::radio(
+                    steer_label,
+                    current == QueueChoice::Steer,
+                )
+                .on_click(move |_, cx| {
+                    steer_state.update(cx, |s, cx| s.set_queue_mode(QueueChoice::Steer, cx));
+                }),
+            )
+            .item(
+                ely_gpui_component::menus::MenuItem::radio(
+                    follow_label,
+                    current == QueueChoice::FollowUp,
+                )
+                .on_click(move |_, cx| {
+                    follow_state.update(cx, |s, cx| s.set_queue_mode(QueueChoice::FollowUp, cx));
+                }),
+            );
+        let label = match current {
+            QueueChoice::Steer => i18n::t(cx, "queued_steer"),
+            QueueChoice::FollowUp => i18n::t(cx, "queued_follow_up"),
+        };
+        Some(
+            ely_gpui_component::menus::DropdownMenu::new("composer-queue", label, menu)
+                .variant(ButtonVariant::Ghost),
+        )
+    } else {
+        None
+    };
     let stop = if streaming {
         let stop_state = state.clone();
         Some(
@@ -223,6 +262,7 @@ pub fn render(state: &Entity<AppState>, app: &mut PidoApp, cx: &App) -> impl Int
                     .items_center()
                     .justify_end()
                     .gap_1()
+                    .children(queue_pick)
                     .children(stop)
                     .child(pill),
             ),

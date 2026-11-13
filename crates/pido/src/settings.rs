@@ -38,6 +38,10 @@ pub struct Settings {
     /// Sidebar labels the user gave projects, as (key, label) pairs.
     #[serde(default)]
     pub project_labels: Vec<(String, String)>,
+    /// How mid-run sends are delivered: `"steer"` (default) or
+    /// `"follow_up"`. Pure client preference; pi has no server-side default.
+    #[serde(default)]
+    pub queue_mode: Option<String>,
     pub window: Option<WindowState>,
 }
 

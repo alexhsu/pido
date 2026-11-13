@@ -656,6 +656,33 @@ pub enum NoticeKind {
     Error,
 }
 
+/// How a message typed while the agent runs is delivered: steer into the
+/// current run, or queue behind it as a follow-up. Pure client preference —
+/// pi takes whichever command each message carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum QueueChoice {
+    #[default]
+    Steer,
+    FollowUp,
+}
+
+impl QueueChoice {
+    fn key(self) -> &'static str {
+        match self {
+            QueueChoice::Steer => "steer",
+            QueueChoice::FollowUp => "follow_up",
+        }
+    }
+
+    fn from_key(key: &str) -> Option<Self> {
+        match key {
+            "steer" => Some(QueueChoice::Steer),
+            "follow_up" => Some(QueueChoice::FollowUp),
+            _ => None,
+        }
+    }
+}
+
 pub struct AppState {
     pub conn: Conn,
     pub environment: Environment,
@@ -735,6 +762,11 @@ pub struct AppState {
     pub session_epoch: u64,
     /// Steer messages queued by the UI that pi has not delivered yet.
     pending_steers: Vec<String>,
+    /// Follow-up messages queued by the UI that pi has not delivered yet.
+    pending_follow_ups: Vec<String>,
+    /// Where a message typed mid-run goes: steer the current run or queue
+    /// as a follow-up. The composer shows the toggle while streaming.
+    pub queue_mode: QueueChoice,
     /// Messages waiting in pi's queues, as `queue_update` reports them.
     pub queued_steers: Vec<gpui::SharedString>,
     pub queued_follow_ups: Vec<gpui::SharedString>,
@@ -762,6 +794,11 @@ impl AppState {
     pub fn new(cx: &mut App) -> Entity<Self> {
         let persisted = crate::settings::Settings::load();
         let last_project = persisted.last_project;
+        let queue_mode = persisted
+            .queue_mode
+            .as_deref()
+            .and_then(QueueChoice::from_key)
+            .unwrap_or_default();
         let user_projects = persisted.projects.clone();
         let pinned_sessions = persisted
             .pinned_sessions
@@ -816,6 +853,8 @@ impl AppState {
                 pending_dialog: None,
                 session_epoch: 0,
                 pending_steers: Vec::new(),
+                pending_follow_ups: Vec::new(),
+                queue_mode,
                 queued_steers: Vec::new(),
                 queued_follow_ups: Vec::new(),
                 expanded_turns: std::collections::HashSet::new(),
@@ -924,6 +963,7 @@ impl AppState {
         if recovery.is_none() {
             self.session_epoch += 1;
             self.pending_steers.clear();
+            self.pending_follow_ups.clear();
             self.queued_steers.clear();
             self.queued_follow_ups.clear();
             self.pending_composer_text = None;
@@ -1904,6 +1944,7 @@ impl AppState {
                             s.stats = None;
                             s.session_epoch += 1;
                             s.pending_steers.clear();
+                            s.pending_follow_ups.clear();
                             s.query_state(cx);
                             s.load_history(cx);
                             s.refresh_stats(cx);
@@ -1992,6 +2033,7 @@ impl AppState {
                             s.stats = None;
                             s.session_epoch += 1;
                             s.pending_steers.clear();
+                            s.pending_follow_ups.clear();
                             s.apply_session_cwd(fork_cwd, cx);
                             s.query_state(cx);
                             s.load_history(cx);
@@ -2029,6 +2071,7 @@ impl AppState {
         self.awaiting_new_session_file = false;
         self.sidebar_rows = self.sidebar_rows_now();
         self.pending_steers.clear();
+        self.pending_follow_ups.clear();
         self.queued_steers.clear();
         self.queued_follow_ups.clear();
         self.pending_composer_text = None;
@@ -2143,6 +2186,7 @@ impl AppState {
                 .collect::<Vec<_>>()
         });
         let steering = self.streaming;
+        let follow = steering && self.queue_mode == QueueChoice::FollowUp;
         let command = if steering {
             // Extension/prompt-template commands are not allowed through
             // `steer`; pi expands them on a prompt with streamingBehavior.
@@ -2150,7 +2194,16 @@ impl AppState {
                 Command::Prompt {
                     message: text.clone(),
                     images,
-                    streaming_behavior: Some(StreamingBehavior::Steer),
+                    streaming_behavior: Some(if follow {
+                        StreamingBehavior::FollowUp
+                    } else {
+                        StreamingBehavior::Steer
+                    }),
+                }
+            } else if follow {
+                Command::FollowUp {
+                    message: text.clone(),
+                    images,
                 }
             } else {
                 Command::Steer {
@@ -2167,7 +2220,9 @@ impl AppState {
         };
         // The staged images leave with the message, whatever its fate.
         self.clear_images();
-        if steering {
+        if follow {
+            self.pending_follow_ups.push(text.clone());
+        } else if steering {
             self.pending_steers.push(text.clone());
         } else {
             // A fresh turn: its status line sits between this prompt and the
@@ -2185,7 +2240,13 @@ impl AppState {
         });
         cx.notify();
 
-        let label = if steering { "steer" } else { "prompt" };
+        let label = if follow {
+            "follow_up"
+        } else if steering {
+            "steer"
+        } else {
+            "prompt"
+        };
         let restore = text.clone();
         cx.spawn(async move |this, cx| {
             let result = cx
@@ -2200,7 +2261,9 @@ impl AppState {
                 };
                 if let Some(error) = failure {
                     s.remove_last_user_text(&text);
-                    if steering {
+                    if follow {
+                        s.pending_follow_ups.retain(|pending| pending != &text);
+                    } else if steering {
                         s.pending_steers.retain(|pending| pending != &text);
                     }
                     s.restore_to_composer(&restore);
@@ -2266,6 +2329,7 @@ impl AppState {
                             s.restore_to_composer(&restored);
                         }
                         s.pending_steers.clear();
+                        s.pending_follow_ups.clear();
                     }
                     Ok(response) => s.push_notice(
                         NoticeKind::Error,
@@ -2319,6 +2383,7 @@ impl AppState {
                             s.stats = None;
                             s.session_epoch += 1;
                             s.pending_steers.clear();
+                            s.pending_follow_ups.clear();
                             // The new session starts unsaved: pi assigns its
                             // file path now and writes the file on the first
                             // reply. Follow the path so the sidebar can show
@@ -2400,6 +2465,7 @@ impl AppState {
                             s.stats = None;
                             s.session_epoch += 1;
                             s.pending_steers.clear();
+                            s.pending_follow_ups.clear();
                             // Any draft belonged to the session being left.
                             s.draft_session_file = None;
                             s.awaiting_new_session_file = false;
@@ -2528,6 +2594,17 @@ impl AppState {
             "compact",
             cx,
         );
+    }
+
+    /// Pick where a message typed mid-run goes. Client-side only: pi takes
+    /// whichever command each message carries.
+    pub fn set_queue_mode(&mut self, mode: QueueChoice, cx: &mut Context<Self>) {
+        if self.queue_mode == mode {
+            return;
+        }
+        self.queue_mode = mode;
+        crate::settings::save_setting(|s| s.queue_mode = Some(mode.key().to_string()));
+        cx.notify();
     }
 
     /// Flip pi's auto-compaction switch. Optimistic, like the model pick:
@@ -2824,6 +2901,7 @@ impl AppState {
                 self.streaming = false;
                 self.finish_running_turn();
                 self.pending_steers.clear();
+                self.pending_follow_ups.clear();
                 self.queued_steers.clear();
                 self.queued_follow_ups.clear();
                 // Any assistant view still live is finished now.
@@ -3586,6 +3664,15 @@ mod tests {
         assert_eq!(compact_tokens_label(1_234_567), "1.2M");
     }
 
+    #[test]
+    fn queue_choice_keys_round_trip() {
+        for choice in [QueueChoice::Steer, QueueChoice::FollowUp] {
+            assert_eq!(QueueChoice::from_key(choice.key()), Some(choice));
+        }
+        assert_eq!(QueueChoice::from_key("other"), None);
+        assert_eq!(QueueChoice::default(), QueueChoice::Steer);
+    }
+
     pub(super) fn empty_state() -> AppState {
         AppState {
             conn: Conn::Idle,
@@ -3626,6 +3713,8 @@ mod tests {
             next_image_key: 1,
             session_epoch: 0,
             pending_steers: Vec::new(),
+            pending_follow_ups: Vec::new(),
+            queue_mode: QueueChoice::Steer,
             queued_steers: Vec::new(),
             queued_follow_ups: Vec::new(),
             expanded_turns: std::collections::HashSet::new(),
