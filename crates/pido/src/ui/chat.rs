@@ -132,6 +132,16 @@ pub fn render_header(
         )
         .child({
             let app = app.clone();
+            ely_gpui_component::buttons::IconButton::new(
+                "export-html",
+                ely_gpui_component::primitives::IconName::ExternalLink,
+            )
+            .variant(ely_gpui_component::buttons::ButtonVariant::Ghost)
+            .tooltip(i18n::t(cx, "export_html"))
+            .on_click(move |_, _, cx| app.update(cx, |s, cx| s.export_html(cx)))
+        })
+        .child({
+            let app = app.clone();
             let auto = s.auto_compaction.unwrap_or(true);
             let compact_label = i18n::t(cx, "compact_now").to_string();
             let auto_label = i18n::t(cx, "auto_compact").to_string();

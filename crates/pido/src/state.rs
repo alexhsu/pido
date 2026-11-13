@@ -2607,6 +2607,54 @@ impl AppState {
         cx.notify();
     }
 
+    /// Export the open session to the HTML file pi picks, then reveal it in
+    /// the file manager. pi decides the output path when none is given.
+    pub fn export_html(&mut self, cx: &mut Context<Self>) {
+        if self.conn != Conn::Live {
+            return;
+        }
+        let Some(client) = self.client() else { return };
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { client.request(Command::ExportHtml { output_path: None }) })
+                .await;
+            this.update(cx, |s, cx| {
+                match result {
+                    Ok(response) if response.success => {
+                        let path = response
+                            .data
+                            .as_ref()
+                            .and_then(|data| data.get("path"))
+                            .and_then(serde_json::Value::as_str)
+                            .map(str::to_string);
+                        match path {
+                            Some(path) => {
+                                s.push_notice(
+                                    NoticeKind::Info,
+                                    i18n::t_arg(cx, "export_html_done", "path", &path).to_string(),
+                                );
+                                reveal_in_folder(std::path::Path::new(&path));
+                            }
+                            None => s.push_notice(
+                                NoticeKind::Warn,
+                                i18n::t(cx, "export_html_no_path").to_string(),
+                            ),
+                        }
+                    }
+                    Ok(response) => s.push_notice(
+                        NoticeKind::Error,
+                        format!("export_html: {}", response.error.unwrap_or_default()),
+                    ),
+                    Err(error) => s.push_notice(NoticeKind::Error, error.to_string()),
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     /// Flip pi's auto-compaction switch. Optimistic, like the model pick:
     /// a failed round trip restores the previous value.
     pub fn set_auto_compaction(&mut self, enabled: bool, cx: &mut Context<Self>) {
