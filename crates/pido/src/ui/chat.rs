@@ -258,6 +258,14 @@ pub fn render_transcript(
     }
     let list = app.transcript_list.clone().expect("transcript list");
     let scroll = app.transcript_scroll.clone().expect("transcript scroll");
+    if app.find.is_some() {
+        log::info!(
+            "render_transcript: find active, top={:?} items={} visible={}",
+            list.logical_scroll_top(),
+            list.item_count(),
+            count
+        );
+    }
     let feed_count = list.item_count();
     let (away, fresh) = {
         let scroll = scroll.read(cx);

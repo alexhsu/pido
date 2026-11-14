@@ -147,15 +147,32 @@ pub fn render(
                 .flex()
                 .gap_2()
                 .child(
-                    ely_gpui_component::buttons::Button::new("debug-find", "DBG find").on_click(
-                        move |_, window, cx| {
+                    div()
+                        .id("debug-find")
+                        .cursor_pointer()
+                        .px_2()
+                        .py_1()
+                        .rounded_sm()
+                        .bg(colors.surface)
+                        .border_1()
+                        .border_color(colors.border)
+                        .child("DBG find")
+                        .on_click(move |_, window, cx| {
                             view_dbg_find.update(cx, |this, cx| this.debug_find(window, cx));
-                        },
-                    ),
+                        }),
                 )
                 .child(
-                    ely_gpui_component::buttons::Button::new("debug-pal", "DBG pal").on_click(
-                        move |_, window, cx| {
+                    div()
+                        .id("debug-pal")
+                        .cursor_pointer()
+                        .px_2()
+                        .py_1()
+                        .rounded_sm()
+                        .bg(colors.surface)
+                        .border_1()
+                        .border_color(colors.border)
+                        .child("DBG pal")
+                        .on_click(move |_, window, cx| {
                             view_dbg_pal.update(cx, |this, cx| {
                                 if this.palette.is_some() {
                                     this.close_palette(cx);
@@ -163,8 +180,7 @@ pub fn render(
                                     this.open_palette(window, cx);
                                 }
                             });
-                        },
-                    ),
+                        }),
                 )
         })
         .when_some(search_field, |this, field| {
