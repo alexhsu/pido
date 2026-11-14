@@ -16,6 +16,11 @@ A native desktop client for the [Pi coding agent](https://github.com/earendil-wo
 - **回合状态** — 提交后回答上方计时(「已工作 1分4秒」),结束定格为「已完成,用时 X」;完成后默认折叠工具调用和思考过程,点状态行可展开
 - **上下文压缩** — 头部压缩按钮:立即压缩,或开/关 pi 的自动压缩;压缩完成的横幅带前后 token 数,历史会话在压缩点留摘要标记
 - **导出 HTML** — 头部一键把当前会话导出为 HTML 并在文件管理器中显示
+- **命令运行器** — 输入框输 `!cmd` 直接跑 shell 命令(`!!` 发送原文),输出流式进转录行、可中止,并进入模型上下文;命令面板带「运行命令」模板
+- **状态同步** — pi 侧的改名/换思考级别即时反映到侧栏与选择器;重试显示「第 2/3 次(2s 后):错误详情」;压缩启动有提示
+- **运行控制** — 队列投递方式可选(全部一次 / 每轮一条);头部「复制最后回答」一键复制;流式中实时显示累计 token
+- **富展示** — 工具返回的图片(read 截图等)直接在卡片下渲染;工具结果一键复制
+- **搜索/面板增强** — 面板与侧栏过滤支持子序列模糊匹配(`xs` 找到「新会话」);面板置顶工作区文件(@ 引用);查找条显示命中行类型与上下文摘录
 - **会话搜索** — 转录区 Ctrl+F 即时过滤并循环跳转(高亮当前行);侧栏输入框按标题/内容过滤会话,内容命中带上下文摘录
 - **命令面板** — Ctrl+K 呼出:跳会话、切模型/思考级别、执行 pi 的 / 命令、新会话/导出/压缩/切主题,方向键 + Enter 即达
 - **改动审查** — agent 用 `edit`/`write` 改过的文件按项目路径汇总,在可调宽、可隐藏的右侧栏里看统一/并排 diff,打开的历史会话也能重建
@@ -30,6 +35,11 @@ A native desktop client for the [Pi coding agent](https://github.com/earendil-wo
 - **Turn status** — a clock above the reply while it works ("Working · 1m 4s"), frozen to "Done in X" on completion; tool calls and thinking fold away, click the line to re-open
 - **Compaction** — the header compaction button: compact now, or toggle pi's auto-compaction; the finished banner reports the before/after token counts, and restored sessions keep a summary marker at each compaction seam
 - **HTML export** — one click exports the open session to HTML and reveals the file
+- **Shell runner** — type `!cmd` to run a shell command (`!!` sends literally); output streams into a transcript row with a stop button and joins the model's context; the palette carries a run-a-command entry
+- **State sync** — renames and thinking-level picks made in pi reach the sidebar and picker live; retries name their attempt and delay; compaction start announces itself
+- **Run controls** — queue delivery is all-at-once or one-per-turn; the header copies the last answer; a streaming answer shows its cumulative token count as it grows
+- **Rich results** — images a tool returns (screenshot reads) render under the card; results copy in one click
+- **Search/palette** — subsequence fuzzy matching (`xs` finds 新会话); workspace files lead the palette (@refs); the find bar names the matched row's kind and excerpt
 - **Search** — Ctrl+F filters the transcript and cycles through matches (the current row tints); the sidebar filters sessions by title or content, with a snippet on content hits
 - **Command palette** — Ctrl+K: jump to sessions, switch models and thinking levels, run pi's slash commands, new chat / export / compact / theme — arrows and Enter
 - **Change review** — files the agent edited or wrote, in a resizable, hideable right panel with unified/split diffs; restored sessions too
