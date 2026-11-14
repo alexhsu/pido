@@ -7,8 +7,8 @@ use ely_gpui_component::chat::{MessageBubble, Role, StepState, ThinkingBlock};
 use ely_gpui_component::theme::{ActiveTheme, ControlSize, IconSize, TextSize};
 use ely_gpui_component::typography::{Caption, Paragraph};
 use gpui::{
-    AnyElement, App, Entity, InteractiveElement, IntoElement, ParentElement, SharedString,
-    StatefulInteractiveElement, Styled, Window, div, prelude::FluentBuilder,
+    AnyElement, App, AppContext, Entity, InteractiveElement, IntoElement, ParentElement,
+    SharedString, StatefulInteractiveElement, Styled, Window, div, prelude::FluentBuilder,
 };
 
 use crate::i18n;
@@ -188,32 +188,34 @@ pub fn render_transcript(
     window: &mut Window,
     cx: &mut App,
 ) -> impl IntoElement + use<> {
-    let s = state.read(cx);
-    let empty = s.transcript.is_empty();
-    let notice = s
-        .notice
-        .clone()
-        .map(|(kind, text)| render_notice(kind, text, state.clone(), cx));
-
-    // Folded content must not exist in the list at all: an empty row would
-    // still hold its slot, so the hidden tool calls would keep their space.
-    let visible: Vec<usize> = s.visible_rows();
+    let (empty, notice, visible, epoch) = {
+        let s = state.read(cx);
+        let empty = s.transcript.is_empty();
+        let notice = s
+            .notice
+            .clone()
+            .map(|(kind, text)| render_notice(kind, text, state.clone(), cx).into_any_element());
+        (empty, notice, s.visible_rows(), s.session_epoch)
+    };
     let count = visible.len();
 
     // Own the scroll state: rebuilt when the conversation was replaced, kept
-    // (with its measured heights and away badge) across re-renders.
-    if app.list_epoch != s.session_epoch || app.transcript_list.is_none() {
+    // (with its measured heights and away badge) across re-renders. The away
+    // badge lives in its own entity — the list's paint pass reads it, and
+    // reading the view there would re-enter the view's update.
+    if app.list_epoch != epoch || app.transcript_list.is_none() {
         let overdraw = cx.theme().list_overdraw().to_pixels(window.rem_size());
         let list = gpui::ListState::new(count, gpui::ListAlignment::Bottom, overdraw);
-        let watcher = view.downgrade();
+        let scroll = cx.new(|_| crate::ui::app::TranscriptScroll::default());
+        let watcher = scroll.downgrade();
         list.set_scroll_handler(move |event, _, cx| {
             let away = event.is_scrolled;
             watcher
-                .update(cx, |app, cx| {
-                    if app.transcript_away != away {
-                        app.transcript_away = away;
+                .update(cx, |scroll, cx| {
+                    if scroll.away != away {
+                        scroll.away = away;
                         if away {
-                            app.transcript_fresh = 0;
+                            scroll.fresh = 0;
                         }
                         cx.notify();
                     }
@@ -221,17 +223,24 @@ pub fn render_transcript(
                 .ok();
         });
         app.transcript_list = Some(list);
-        app.list_epoch = s.session_epoch;
-        app.transcript_away = false;
-        app.transcript_fresh = 0;
+        app.transcript_scroll = Some(scroll);
+        app.list_epoch = epoch;
     }
     let list = app.transcript_list.clone().expect("transcript list");
+    let scroll = app.transcript_scroll.clone().expect("transcript scroll");
     let feed_count = list.item_count();
+    let (away, fresh) = {
+        let scroll = scroll.read(cx);
+        (scroll.away, scroll.fresh)
+    };
     if feed_count != count {
         // Rows arriving while scrolled away count for the jump badge; at the
         // bottom, Bottom alignment pins to the newest row for free.
-        if count > feed_count && app.transcript_away {
-            app.transcript_fresh += count - feed_count;
+        if count > feed_count && away {
+            scroll.update(cx, |scroll, cx| {
+                scroll.fresh += count - feed_count;
+                cx.notify();
+            });
         }
         if count >= feed_count {
             list.splice(feed_count..feed_count, count - feed_count);
@@ -321,21 +330,17 @@ pub fn render_transcript(
                 .child(
                     gpui::canvas(
                         {
-                            let view = view.downgrade();
+                            let scroll = scroll.clone();
                             let list = list.clone();
                             move |_, window, cx| {
                                 let held = list.logical_scroll_top().item_ix >= list.item_count();
-                                let away = view
-                                    .upgrade()
-                                    .is_some_and(|app| app.read(cx).transcript_away);
+                                let away = scroll.read(cx).away;
                                 if away && held {
-                                    if let Some(view) = view.upgrade() {
-                                        view.update(cx, |app, cx| {
-                                            app.transcript_away = false;
-                                            app.transcript_fresh = 0;
-                                            cx.notify();
-                                        });
-                                    }
+                                    scroll.update(cx, |scroll, cx| {
+                                        scroll.away = false;
+                                        scroll.fresh = 0;
+                                        cx.notify();
+                                    });
                                     window.request_animation_frame();
                                 }
                             }
@@ -347,7 +352,7 @@ pub fn render_transcript(
                     .left_0()
                     .size_full(),
                 )
-                .when(app.transcript_away, |this| {
+                .when(away, |this| {
                     this.child(
                         div()
                             .absolute()
@@ -357,25 +362,22 @@ pub fn render_transcript(
                             .flex()
                             .justify_center()
                             .child({
-                                let view = view.downgrade();
+                                let scroll = scroll.clone();
+                                let list = list.clone();
                                 ely_gpui_component::chat::ScrollToBottomButton::new(
                                     ("transcript-jump", app.list_epoch),
-                                    app.transcript_fresh,
+                                    fresh,
                                     move |_, cx| {
-                                        if let Some(view) = view.upgrade() {
-                                            view.update(cx, |app, cx| {
-                                                if let Some(list) = &app.transcript_list {
-                                                    let end = list.item_count();
-                                                    list.scroll_to(gpui::ListOffset {
-                                                        item_ix: end,
-                                                        offset_in_item: gpui::px(0.),
-                                                    });
-                                                }
-                                                app.transcript_away = false;
-                                                app.transcript_fresh = 0;
-                                                cx.notify();
-                                            });
-                                        }
+                                        let end = list.item_count();
+                                        list.scroll_to(gpui::ListOffset {
+                                            item_ix: end,
+                                            offset_in_item: gpui::px(0.),
+                                        });
+                                        scroll.update(cx, |scroll, cx| {
+                                            scroll.away = false;
+                                            scroll.fresh = 0;
+                                            cx.notify();
+                                        });
                                     },
                                 )
                             }),

@@ -32,6 +32,7 @@ use crate::ui::app::PidoApp;
 pub fn render(
     state: &Entity<AppState>,
     view: &Entity<PidoApp>,
+    search_field: Option<gpui::Entity<ely_gpui_component::forms::TextInput>>,
     window: &Window,
     cx: &App,
 ) -> impl IntoElement + use<> {
@@ -135,7 +136,7 @@ pub fn render(
                     ),
             )
         })
-        .when_some(view.read(cx).search_field.clone(), |this, field| {
+        .when_some(search_field, |this, field| {
             // The session search: titles filter as you type, content matches
             // join in from the background pass.
             this.child(

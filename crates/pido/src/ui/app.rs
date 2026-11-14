@@ -91,10 +91,9 @@ pub struct PidoApp {
     /// `list_epoch` falls behind the state's `session_epoch`.
     pub transcript_list: Option<gpui::ListState>,
     pub list_epoch: u64,
-    /// Whether the transcript is scrolled away from the bottom, and how many
-    /// rows arrived while away (the jump-to-latest badge).
-    pub transcript_away: bool,
-    pub transcript_fresh: usize,
+    /// The tail-follow badge state, owned separately from the view so the
+    /// list's paint pass can read it without re-entering the view.
+    pub transcript_scroll: Option<gpui::Entity<TranscriptScroll>>,
     /// The transcript find bar, while Ctrl+F has it open.
     pub find: Option<FindState>,
     /// The command palette, while Ctrl+K has it open.
@@ -122,6 +121,15 @@ pub struct FindState {
 pub struct PaletteState {
     pub field: gpui::Entity<TextInput>,
     pub open_gen: u64,
+}
+
+/// The transcript's tail-follow badge state, in its own entity: the list's
+/// paint pass reads it, and reading the view itself there would re-enter
+/// the view's update.
+#[derive(Debug, Default)]
+pub struct TranscriptScroll {
+    pub away: bool,
+    pub fresh: usize,
 }
 
 /// The right panel's two tabs.
@@ -193,8 +201,7 @@ impl PidoApp {
             terminal: None,
             transcript_list: None,
             list_epoch: 0,
-            transcript_away: false,
-            transcript_fresh: 0,
+            transcript_scroll: None,
             find: None,
             palette: None,
             palette_gen: 0,
@@ -424,7 +431,13 @@ impl Render for PidoApp {
                         let me = cx.entity().downgrade();
                         SplitPane::new("shell", gpui::Axis::Horizontal, gpui::px(200.))
                             .sizes(&sizes)
-                            .pane(sidebar::render(&state, &cx.entity(), window, cx))
+                            .pane(sidebar::render(
+                                &state,
+                                &cx.entity(),
+                                self.search_field.clone(),
+                                window,
+                                cx,
+                            ))
                             .pane(main)
                             .children(right)
                             .on_resize(move |shares, _, cx| {
