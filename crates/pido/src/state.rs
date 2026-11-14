@@ -3485,7 +3485,11 @@ impl AppState {
                     self.record_write(&write.path, &write.content);
                 }
             }
-            Event::CompactionStart { .. } => {}
+            Event::CompactionStart { .. } => {
+                // A banner that a run is briefly paused for compaction; the
+                // settled refresh clears it via the success notice.
+                self.push_notice(NoticeKind::Info, i18n::t(cx, "compacting").to_string());
+            }
             Event::CompactionEnd {
                 aborted,
                 result,
@@ -3519,8 +3523,26 @@ impl AppState {
                     self.push_notice(NoticeKind::Error, detail);
                 }
             }
-            Event::AutoRetryStart { .. } => {
-                self.push_notice(NoticeKind::Warn, i18n::t(cx, "retrying").to_string());
+            Event::AutoRetryStart {
+                attempt,
+                max_attempts,
+                delay_ms,
+                error_message,
+                ..
+            } => {
+                let detail = error_message.as_deref().unwrap_or_default();
+                self.push_notice(
+                    NoticeKind::Warn,
+                    i18n::t_arg(
+                        cx,
+                        "retrying_detail",
+                        "n",
+                        &format!("{attempt}/{max_attempts}"),
+                    )
+                    .replace("{delay}", &format!("{}s", delay_ms / 1000))
+                    .replace("{e}", detail)
+                    .into(),
+                );
             }
             Event::AutoRetryEnd {
                 success,
@@ -3543,6 +3565,24 @@ impl AppState {
                     self.push_notice(NoticeKind::Error, error);
                 }
             }
+            Event::SessionInfoChanged { name } => {
+                // A rename made pi-side (slash command or extension) must
+                // reach the header and the sidebar, not just this client.
+                self.session_name = name.clone();
+                if let Some(name) = &name {
+                    if let Some(file) = &self.session_file {
+                        patch_session_title(&mut self.sidebar_rows, file, name);
+                    }
+                }
+                self.refresh_sessions(cx);
+            }
+            Event::ThinkingLevelChanged { level } => {
+                if self.thinking_level != Some(level) {
+                    self.thinking_level = Some(level);
+                }
+            }
+            // Declared so it parses; no UI yet.
+            Event::EntryAppended => {}
             Event::QueueUpdate {
                 steering,
                 follow_up,

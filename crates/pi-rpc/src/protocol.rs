@@ -341,6 +341,9 @@ const KNOWN_EVENT_TYPES: &[&str] = &[
     "summarization_retry_attempt_start",
     "summarization_retry_finished",
     "extension_error",
+    "session_info_changed",
+    "thinking_level_changed",
+    "entry_appended",
 ];
 
 /// A session event streamed from Pi.
@@ -477,6 +480,19 @@ pub enum Event {
         #[serde(default)]
         error: Option<String>,
     },
+    /// The session's display name changed (or was cleared) outside this
+    /// client — a pi-side rename must not leave the sidebar stale.
+    SessionInfoChanged {
+        #[serde(default)]
+        name: Option<String>,
+    },
+    /// The thinking level changed outside this client.
+    ThinkingLevelChanged {
+        level: ThinkingLevel,
+    },
+    /// An extension appended a custom entry; the payload is opaque to the
+    /// client for now — declaring it keeps it out of the unknown log.
+    EntryAppended,
 }
 
 impl Event {
@@ -1237,6 +1253,37 @@ mod tests {
             }
             other => panic!("expected response, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn parse_sync_events() {
+        let record = parse_record(r#"{"type":"session_info_changed","name":"renamed"}"#).unwrap();
+        match record {
+            RpcRecord::Event(Event::SessionInfoChanged { name }) => {
+                assert_eq!(name.as_deref(), Some("renamed"));
+            }
+            other => panic!("expected session_info_changed, got {other:?}"),
+        }
+        // An absent name means the rename was cleared.
+        let record = parse_record(r#"{"type":"session_info_changed"}"#).unwrap();
+        match record {
+            RpcRecord::Event(Event::SessionInfoChanged { name }) => assert!(name.is_none()),
+            other => panic!("expected session_info_changed, got {other:?}"),
+        }
+
+        let record = parse_record(r#"{"type":"thinking_level_changed","level":"high"}"#).unwrap();
+        match record {
+            RpcRecord::Event(Event::ThinkingLevelChanged { level }) => {
+                assert_eq!(level, ThinkingLevel::High);
+            }
+            other => panic!("expected thinking_level_changed, got {other:?}"),
+        }
+
+        let record = parse_record(
+            r#"{"type":"entry_appended","entry":{"type":"custom","id":"x1","parentId":null}}"#,
+        )
+        .unwrap();
+        assert!(matches!(record, RpcRecord::Event(Event::EntryAppended)));
     }
 
     #[test]
