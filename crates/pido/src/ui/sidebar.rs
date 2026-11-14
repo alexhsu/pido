@@ -135,6 +135,22 @@ pub fn render(
                     ),
             )
         })
+        .when_some(view.read(cx).search_field.clone(), |this, field| {
+            // The session search: titles filter as you type, content matches
+            // join in from the background pass.
+            this.child(
+                div().flex_none().px_4().pb_2().child(
+                    div()
+                        .w_full()
+                        .rounded_md()
+                        .border_1()
+                        .border_color(colors.border)
+                        .bg(colors.surface)
+                        .px_2()
+                        .child(field),
+                ),
+            )
+        })
         .child(
             // The list must be the only growing part and stay inside the
             // window; without a bound its content stretches the whole row and
@@ -261,6 +277,7 @@ pub fn render(
                                         archived,
                                         depth,
                                         children,
+                                        hint,
                                     } => session_row(
                                         cx,
                                         ix,
@@ -274,6 +291,7 @@ pub fn render(
                                         *archived,
                                         *depth,
                                         *children,
+                                        hint.clone(),
                                         control_h,
                                         radius_md,
                                         text_sm,
@@ -442,6 +460,7 @@ fn session_row(
     archived: bool,
     depth: usize,
     children: usize,
+    hint: Option<SharedString>,
     control_h: gpui::Rems,
     radius_md: gpui::Rems,
     text_sm: gpui::Rems,
@@ -483,9 +502,7 @@ fn session_row(
         .aria_selected(active)
         .w_full()
         .flex()
-        .items_center()
-        .gap_1()
-        .h(control_h)
+        .flex_col()
         .pl(px(12. + 14. * depth as f32) + label_lead)
         .pr_0p5()
         .rounded(radius_md)
@@ -500,42 +517,60 @@ fn session_row(
                 s.switch_session(std::path::PathBuf::from(click_path.to_string()), cx)
             });
         })
-        .when(children > 0, |row| {
-            row.child(
-                div()
-                    .id(("session-fold", ix as u64))
-                    .flex_none()
-                    .cursor_pointer()
-                    .child(
-                        Icon::new(if folded {
-                            IconName::ChevronRight
-                        } else {
-                            IconName::ChevronDown
-                        })
-                        .size(IconSize::Xs)
-                        .color(colors.fg_subtle),
-                    )
-                    .on_click(move |_, _, cx| {
-                        cx.stop_propagation();
-                        fold_state.update(cx, |s, cx| s.toggle_session_fold(&fold_path, cx));
-                    }),
-            )
-        })
-        .child(div().flex_1().min_w_0().child(Ellipsis::new(title.clone())))
-        .when(pinned, |row| {
-            row.child(
-                Icon::new(IconName::Pin)
-                    .size(IconSize::Xs)
-                    .color(colors.fg_subtle),
-            )
-        })
         .child(
             div()
+                .flex()
+                .items_center()
+                .gap_1()
+                .h(control_h)
+                .when(children > 0, |row| {
+                    row.child(
+                        div()
+                            .id(("session-fold", ix as u64))
+                            .flex_none()
+                            .cursor_pointer()
+                            .child(
+                                Icon::new(if folded {
+                                    IconName::ChevronRight
+                                } else {
+                                    IconName::ChevronDown
+                                })
+                                .size(IconSize::Xs)
+                                .color(colors.fg_subtle),
+                            )
+                            .on_click(move |_, _, cx| {
+                                cx.stop_propagation();
+                                fold_state
+                                    .update(cx, |s, cx| s.toggle_session_fold(&fold_path, cx));
+                            }),
+                    )
+                })
+                .child(div().flex_1().min_w_0().child(Ellipsis::new(title.clone())))
+                .when(pinned, |row| {
+                    row.child(
+                        Icon::new(IconName::Pin)
+                            .size(IconSize::Xs)
+                            .color(colors.fg_subtle),
+                    )
+                })
+                .child(
+                    div()
+                        .flex_none()
+                        .text_size(text_xs)
+                        .text_color(colors.fg_subtle)
+                        .child(age),
+                ),
+        )
+        .children(hint.map(|hint| {
+            // A content-search hit: the matched text, quiet, under the title.
+            div()
                 .flex_none()
+                .pr_2()
+                .pb_1()
                 .text_size(text_xs)
                 .text_color(colors.fg_subtle)
-                .child(age),
-        );
+                .child(Ellipsis::new(hint))
+        }));
 
     let menu = session_menu(
         cx,

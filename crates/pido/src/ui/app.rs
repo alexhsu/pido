@@ -102,6 +102,8 @@ pub struct PidoApp {
     /// Bumped each time the palette opens; keys its picker state so a stale
     /// dismissal never sticks.
     palette_gen: u64,
+    /// The sidebar's session-search field, created once in setup.
+    pub search_field: Option<gpui::Entity<TextInput>>,
 }
 
 /// The transcript find bar: the query field, the rows that match and which
@@ -196,6 +198,7 @@ impl PidoApp {
             find: None,
             palette: None,
             palette_gen: 0,
+            search_field: None,
         };
         app.observe_window_for_quit(cx);
         app
@@ -223,6 +226,17 @@ impl PidoApp {
                 .multi_line(1, 8)
                 .placeholder_key("idle_hint")
         }));
+        // The sidebar's session search: every keystroke refilters the rows,
+        // and a debounced background pass adds content matches.
+        let search = cx.new(|cx| TextInput::new(window, cx).placeholder_key("search_sessions"));
+        cx.subscribe(&search, move |this, field, event: &InputEvent, cx| {
+            if *event == InputEvent::Changed {
+                let query = field.read(cx).text().to_string();
+                this.state.update(cx, |s, cx| s.set_search(&query, cx));
+            }
+        })
+        .detach();
+        self.search_field = Some(search);
         // A session restored with the terminal tab out gets its shell back.
         if self.right_open && self.right_tab == RightTab::Terminal {
             self.ensure_terminal(cx);

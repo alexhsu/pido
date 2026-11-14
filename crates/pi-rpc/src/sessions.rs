@@ -405,6 +405,64 @@ fn truncate(text: &str, max_chars: usize) -> String {
     format!("{truncated}…")
 }
 
+/// Find the session files whose message text contains `query` (case-
+/// insensitive), with a short snippet around the first hit in each. Reads
+/// line by line and stops at a file's first hit; JSONL keeps each message on
+/// one line, so a raw-line hit is a cheap prefilter before parsing only that
+/// line.
+pub fn search_content(root: &Path, query: &str) -> Vec<(PathBuf, String)> {
+    let needle = query.trim().to_lowercase();
+    if needle.is_empty() {
+        return Vec::new();
+    }
+    let Ok(files) = walk_dirs(root) else {
+        return Vec::new();
+    };
+    let mut hits = Vec::new();
+    for path in files {
+        let Ok(file) = std::fs::File::open(&path) else {
+            continue;
+        };
+        let mut reader = BufReader::new(file);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            match reader.read_line(&mut line) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            }
+            if !line.to_lowercase().contains(&needle) || !line.starts_with("{\"type\":\"message\"")
+            {
+                continue;
+            }
+            // Parse only the line that matched, then aim the snippet at the
+            // match instead of the text's head. The snippet comes from the
+            // lowercased text: `to_lowercase` can shift byte offsets between
+            // the two, and a quiet-case snippet is fine.
+            let Ok(entry) = serde_json::from_str::<EntryTail>(line.trim_end()) else {
+                continue;
+            };
+            if let Some(message) = &entry.message {
+                if let Some(text) = user_message_preview(message) {
+                    let lower = text.to_lowercase();
+                    if let Some(at) = lower.find(&needle) {
+                        let start = lower
+                            .char_indices()
+                            .map(|(ix, _)| ix)
+                            .filter(|ix| *ix <= at)
+                            .next_back()
+                            .unwrap_or(0);
+                        let snippet: String = lower[start..].chars().take(120).collect();
+                        hits.push((path.clone(), snippet));
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    hits
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -487,6 +545,37 @@ mod tests {
             Some("Older question about Rust")
         );
         assert_eq!(group_a.sessions[1].message_count, 1);
+    }
+
+    #[test]
+    fn search_content_finds_messages_with_snippets() {
+        let root = tempdir();
+        let project = root.path().join("--C--proj--");
+        write_session(
+            &project,
+            "2026-01-01T10-00-00-000Z_id-hit.jsonl",
+            &[
+                r#"{"type":"session","version":3,"id":"id-hit","timestamp":"2026-01-01T10:00:00.000Z","cwd":"C:\proj"}"#.into(),
+                r#"{"type":"message","id":"m1","parentId":null,"timestamp":"2026-01-01T10:00:01.000Z","message":{"role":"user","content":"How does token compaction work?","timestamp":1}}"#.into(),
+                r#"{"type":"message","id":"m2","parentId":"m1","timestamp":"2026-01-01T10:00:02.000Z","message":{"role":"assistant","content":[{"type":"text","text":"Compaction folds older messages into a summary."}],"timestamp":2}}"#.into(),
+            ],
+            10,
+        );
+        write_session(
+            &project,
+            "2026-01-01T09-00-00-000Z_id-other.jsonl",
+            &[
+                r#"{"type":"session","version":3,"id":"id-other","timestamp":"2026-01-01T09:00:00.000Z","cwd":"C:\proj"}"#.into(),
+                r#"{"type":"message","id":"m0","parentId":null,"timestamp":"2026-01-01T09:00:01.000Z","message":{"role":"user","content":"Unrelated question","timestamp":0}}"#.into(),
+            ],
+            5,
+        );
+
+        let hits = search_content(root.path(), "COMPACTION");
+        assert_eq!(hits.len(), 1, "only the session that mentions it");
+        // The snippet aims at the match, not the text's head.
+        assert!(hits[0].1.to_lowercase().contains("compaction"));
+        assert!(search_content(root.path(), "zzz").is_empty());
     }
 
     #[test]

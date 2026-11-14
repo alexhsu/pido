@@ -278,6 +278,9 @@ pub enum SidebarRow {
         depth: usize,
         /// Direct forks this session has, for the fold arrow.
         children: usize,
+        /// While searching: a snippet from the session's content that
+        /// matched, when the title itself did not.
+        hint: Option<gpui::SharedString>,
     },
 }
 
@@ -323,6 +326,7 @@ fn session_row(
     archived: bool,
     depth: usize,
     children: usize,
+    hint: Option<String>,
 ) -> SidebarRow {
     let title = session
         .name
@@ -338,6 +342,7 @@ fn session_row(
         archived,
         depth,
         children,
+        hint: hint.map(gpui::SharedString::from),
     }
 }
 
@@ -432,7 +437,8 @@ fn session_tree<'a>(
 /// Flatten grouped sessions into the sidebar's row order: pinned sessions
 /// first inside their project, forks nested under the session they were
 /// forked from, archived ones collected into a fold at the bottom. The
-/// archive fold sits under the empty-string key.
+/// archive fold sits under the empty-string key. `hints` carries the
+/// content-search snippets shown under matched rows while searching.
 fn flatten_groups(
     groups: &[SessionGroup],
     collapsed: &std::collections::HashSet<String>,
@@ -440,6 +446,7 @@ fn flatten_groups(
     pinned: &HashSet<String>,
     archived: &HashSet<String>,
     collapsed_sessions: &HashSet<String>,
+    hints: &HashMap<String, String>,
 ) -> Vec<SidebarRow> {
     let mut rows = Vec::with_capacity(
         groups
@@ -486,7 +493,10 @@ fn flatten_groups(
                     })
                 })
                 .count();
-            rows.push(session_row(session, pinned, false, depth, children));
+            let hint = hints
+                .get(&session_key(&session.path.to_string_lossy()))
+                .cloned();
+            rows.push(session_row(session, pinned, false, depth, children, hint));
         }
     }
     if !archived_sessions.is_empty() {
@@ -501,12 +511,16 @@ fn flatten_groups(
         });
         if !folded {
             for session in archived_sessions {
+                let hint = hints
+                    .get(&session_key(&session.path.to_string_lossy()))
+                    .cloned();
                 rows.push(session_row(
                     session,
                     pinned.contains(&session_key(&session.path.to_string_lossy())),
                     true,
                     0,
                     0,
+                    hint,
                 ));
             }
         }
@@ -852,6 +866,12 @@ pub struct AppState {
     pub user_projects: Vec<String>,
     /// Sidebar labels the user gave projects, keyed like pin/archive sets.
     pub project_labels: HashMap<String, String>,
+    /// The sidebar's session search: the trimmed query (empty when off) and
+    /// a generation that retires stale background content searches.
+    search_query: String,
+    search_gen: u64,
+    /// Content-search hits: session file path → the snippet that matched.
+    content_hits: Vec<(String, String)>,
     /// True while closing the client on purpose: the Disconnected event
     /// must not trigger crash recovery.
     stopping: bool,
@@ -1012,6 +1032,9 @@ impl AppState {
                 changes_seq: 0,
                 pending_writes: HashMap::new(),
                 pending_composer_text: None,
+                search_query: String::new(),
+                search_gen: 0,
+                content_hits: Vec::new(),
                 session_scan: Arc::new(Mutex::new(sessions::SessionScanner::default())),
                 client: None,
             };
@@ -1405,44 +1428,93 @@ impl AppState {
     /// The unsaved session `new_chat` just opened is merged in as a draft so
     /// it shows before pi writes its file.
     fn sidebar_rows_now(&self) -> Vec<SidebarRow> {
-        let Some(draft) = self.draft_summary() else {
-            return flatten_groups(
-                &self.session_groups,
-                &self.collapsed_projects,
-                &self.project_labels,
-                &self.pinned_sessions,
-                &self.archived_sessions,
-                &self.collapsed_sessions,
-            );
+        // While searching, matches surface wherever they live: projects
+        // unfold, the archive fold opens, and sessions that only matched by
+        // content carry their snippet as a hint.
+        let searching = !self.search_query.is_empty();
+        let needle = self.search_query.to_lowercase();
+        let title_hit = |session: &sessions::SessionSummary| {
+            let haystacks = [
+                session.name.as_deref(),
+                session.preview.as_deref(),
+                Some(session.session_id.as_str()),
+            ];
+            haystacks
+                .into_iter()
+                .flatten()
+                .any(|text| text.to_lowercase().contains(&needle))
         };
-        // New activity leads its project, and that project leads the list;
-        // the scanner orders things the same way once the file exists.
-        let project = session_key(&draft.cwd);
+        let hint_for = |session: &sessions::SessionSummary| -> Option<String> {
+            let key = session_key(&session.path.to_string_lossy());
+            self.content_hits
+                .iter()
+                .find(|(path, _)| session_key(path) == key)
+                .map(|(_, snippet)| snippet.clone())
+        };
+
         let mut groups = self.session_groups.clone();
-        match groups
-            .iter()
-            .position(|group| session_key(&group.cwd) == project)
-        {
-            Some(ix) => {
-                let mut group = groups.remove(ix);
-                group.sessions.insert(0, draft);
-                groups.insert(0, group);
+        if let Some(draft) = self.draft_summary() {
+            // New activity leads its project, and that project leads the
+            // list; the scanner orders things the same way once the file
+            // exists.
+            let project = session_key(&draft.cwd);
+            let keep = !searching || title_hit(&draft);
+            match groups
+                .iter()
+                .position(|group| session_key(&group.cwd) == project)
+            {
+                Some(ix) => {
+                    let mut group = groups.remove(ix);
+                    if keep {
+                        group.sessions.insert(0, draft);
+                    }
+                    groups.insert(0, group);
+                }
+                None => {
+                    if keep {
+                        groups.insert(
+                            0,
+                            SessionGroup {
+                                cwd: draft.cwd.clone(),
+                                sessions: vec![draft],
+                            },
+                        );
+                    }
+                }
             }
-            None => groups.insert(
-                0,
-                SessionGroup {
-                    cwd: draft.cwd.clone(),
-                    sessions: vec![draft],
-                },
-            ),
         }
+        if searching {
+            for group in &mut groups {
+                group
+                    .sessions
+                    .retain(|session| title_hit(session) || hint_for(session).is_some());
+            }
+            groups.retain(|group| !group.sessions.is_empty());
+        }
+        let (collapsed_projects, collapsed_sessions) = if searching {
+            (Default::default(), Default::default())
+        } else {
+            (
+                self.collapsed_projects.clone(),
+                self.collapsed_sessions.clone(),
+            )
+        };
+        let hints: HashMap<String, String> = if searching {
+            self.content_hits
+                .iter()
+                .map(|(path, snippet)| (session_key(path), snippet.clone()))
+                .collect()
+        } else {
+            Default::default()
+        };
         flatten_groups(
             &groups,
-            &self.collapsed_projects,
+            &collapsed_projects,
             &self.project_labels,
             &self.pinned_sessions,
             &self.archived_sessions,
-            &self.collapsed_sessions,
+            &collapsed_sessions,
+            &hints,
         )
     }
 
@@ -1546,6 +1618,53 @@ impl AppState {
             }
         }
         items
+    }
+
+    /// Set the sidebar's session search. Title matches apply immediately;
+    /// content matches run in the background after a short debounce, and a
+    /// newer query retires the stale results via the generation.
+    pub fn set_search(&mut self, query: &str, cx: &mut Context<Self>) {
+        let query = query.trim().to_string();
+        if self.search_query == query {
+            return;
+        }
+        self.search_query = query.clone();
+        self.search_gen += 1;
+        let stamp = self.search_gen;
+        self.sidebar_rows = self.sidebar_rows_now();
+        if query.is_empty() {
+            self.content_hits.clear();
+            cx.notify();
+            return;
+        }
+        let dir = sessions::default_session_dir();
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(250))
+                .await;
+            let hits = cx
+                .background_executor()
+                .spawn(async move {
+                    match dir {
+                        Some(dir) => sessions::search_content(&dir, &query),
+                        None => Vec::new(),
+                    }
+                })
+                .await;
+            this.update(cx, |s, cx| {
+                if s.search_gen != stamp {
+                    return; // a newer query superseded this one
+                }
+                s.content_hits = hits
+                    .into_iter()
+                    .map(|(path, snippet)| (path.to_string_lossy().into_owned(), snippet))
+                    .collect();
+                s.sidebar_rows = s.sidebar_rows_now();
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     /// The draft row for the session `new_chat` just opened: pi already knows
@@ -4159,6 +4278,9 @@ mod tests {
             changes_seq: 0,
             pending_writes: HashMap::new(),
             pending_composer_text: None,
+            search_query: String::new(),
+            search_gen: 0,
+            content_hits: Vec::new(),
             session_scan: Arc::new(Mutex::new(sessions::SessionScanner::default())),
             client: None,
         }
@@ -4824,6 +4946,7 @@ mod sidebar_tests {
             &Default::default(),
             &Default::default(),
             &Default::default(),
+            &Default::default(),
         );
         assert_eq!(open.len(), 2 + 3 + 2, "two headers and five sessions");
 
@@ -4832,6 +4955,7 @@ mod sidebar_tests {
         let rows = flatten_groups(
             &groups,
             &folded,
+            &Default::default(),
             &Default::default(),
             &Default::default(),
             &Default::default(),
@@ -4874,6 +4998,7 @@ mod sidebar_tests {
             &pinned,
             &Default::default(),
             &Default::default(),
+            &Default::default(),
         );
         match &rows[1] {
             SidebarRow::Session { path, pinned, .. } => {
@@ -4892,6 +5017,7 @@ mod sidebar_tests {
             &Default::default(),
             &HashSet::new(),
             &archived,
+            &Default::default(),
             &Default::default(),
         );
         let group_a = match &rows[0] {
@@ -4963,6 +5089,7 @@ mod sidebar_tests {
             &Default::default(),
             &Default::default(),
             &Default::default(),
+            &Default::default(),
         );
         assert_eq!(
             paths(&rows),
@@ -4996,6 +5123,7 @@ mod sidebar_tests {
             &pinned,
             &Default::default(),
             &Default::default(),
+            &Default::default(),
         );
         assert_eq!(
             paths(&rows),
@@ -5016,6 +5144,7 @@ mod sidebar_tests {
         };
         let rows = flatten_groups(
             &[group],
+            &Default::default(),
             &Default::default(),
             &Default::default(),
             &Default::default(),
@@ -5044,6 +5173,7 @@ mod sidebar_tests {
             &Default::default(),
             &Default::default(),
             &folded,
+            &Default::default(),
         );
         assert_eq!(
             paths(&rows),
@@ -5143,6 +5273,7 @@ mod sidebar_tests {
                 archived: false,
                 depth: 0,
                 children: 0,
+                hint: None,
             },
             SidebarRow::Session {
                 path: "D:/a/two.jsonl".into(),
@@ -5153,6 +5284,7 @@ mod sidebar_tests {
                 archived: false,
                 depth: 0,
                 children: 0,
+                hint: None,
             },
         ];
         patch_session_title(&mut rows, "D:/a/one.jsonl", "renamed");
