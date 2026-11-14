@@ -10,7 +10,7 @@ use gpui::{
 };
 
 use crate::i18n;
-use crate::state::{AppState, Conn, PaletteAction, PaletteKind};
+use crate::state::{AppState, Conn, PaletteAction, PaletteKind, TranscriptItem};
 use crate::ui::{chat, composer, sidebar, welcome};
 
 actions!(
@@ -619,6 +619,16 @@ impl PidoApp {
             (find.current + len - 1) % len
         };
         let ix = find.matches[find.current];
+        // A match can live inside a folded turn — a tool result, most often.
+        // Unfold that turn so the row exists to scroll to and tint.
+        let turn_ix = self.state.read(cx).transcript[..ix]
+            .iter()
+            .rposition(|item| matches!(item, TranscriptItem::Turn { .. }));
+        if let Some(turn_ix) = turn_ix {
+            self.state.update(cx, |s, _| {
+                s.expanded_turns.insert(turn_ix as u64);
+            });
+        }
         let pos = self
             .state
             .read(cx)
