@@ -3157,17 +3157,14 @@ impl AppState {
                 running,
                 ..
             } = item
+                && row_id == id
+                && *running
             {
-                if row_id == id && *running {
-                    if let Some(error) = error {
-                        output.push_str(&format!(
-                            "
-[{error}]"
-                        ));
-                    }
-                    *running = false;
-                    break;
+                if let Some(error) = error {
+                    output.push_str(&format!("\n[{error}]"));
                 }
+                *running = false;
+                break;
             }
         }
         cx.notify();
@@ -3766,18 +3763,15 @@ impl AppState {
                 ..
             } => {
                 let detail = error_message.as_deref().unwrap_or_default();
-                self.push_notice(
-                    NoticeKind::Warn,
-                    i18n::t_arg(
-                        cx,
-                        "retrying_detail",
-                        "n",
-                        &format!("{attempt}/{max_attempts}"),
-                    )
-                    .replace("{delay}", &format!("{}s", delay_ms / 1000))
-                    .replace("{e}", detail)
-                    .into(),
-                );
+                let text = i18n::t_arg(
+                    cx,
+                    "retrying_detail",
+                    "n",
+                    &format!("{attempt}/{max_attempts}"),
+                )
+                .replace("{delay}", &format!("{}s", delay_ms / 1000))
+                .replace("{e}", detail);
+                self.push_notice(NoticeKind::Warn, text);
             }
             Event::AutoRetryEnd {
                 success,
@@ -3804,10 +3798,8 @@ impl AppState {
                 // A rename made pi-side (slash command or extension) must
                 // reach the header and the sidebar, not just this client.
                 self.session_name = name.clone();
-                if let Some(name) = &name {
-                    if let Some(file) = &self.session_file {
-                        patch_session_title(&mut self.sidebar_rows, file, name);
-                    }
+                if let (Some(name), Some(file)) = (&name, &self.session_file) {
+                    patch_session_title(&mut self.sidebar_rows, file, name);
                 }
                 self.refresh_sessions(cx);
             }

@@ -874,7 +874,9 @@ impl PidoApp {
                                 .bg(theme.colors.surface)
                                 .shadow_lg()
                                 .overflow_hidden()
-                                .on_mouse_down(gpui::MouseButton::Left, |_, _, _| {})
+                                .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| {
+                                    cx.stop_propagation()
+                                })
                                 // Arrows and Enter steer the palette before
                                 // they reach the input's own bindings.
                                 .capture_action({
@@ -1137,6 +1139,17 @@ impl PidoApp {
     }
 
     /// The rename dialog, while open.
+    /// Close the rename dialog and drop every target it carried. Both of
+    /// the dialog's close paths go through this — a cancel button that
+    /// misses a field would rename the wrong thing next time.
+    fn close_rename(&mut self, cx: &mut Context<Self>) {
+        self.rename_open = false;
+        self.rename_field = None;
+        self.rename_target = None;
+        self.rename_project = None;
+        cx.notify();
+    }
+
     fn rename_dialog(&mut self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
         use ely_gpui_component::buttons::{Button, ButtonVariant};
         use ely_gpui_component::overlays::Dialog;
@@ -1147,13 +1160,7 @@ impl PidoApp {
         let field = self.rename_field.clone()?;
         let close_me = cx.entity();
         let shut = move |_: &mut Window, cx: &mut App| {
-            close_me.update(cx, |this, cx| {
-                this.rename_open = false;
-                this.rename_field = None;
-                this.rename_target = None;
-                this.rename_project = None;
-                cx.notify();
-            });
+            close_me.update(cx, |this, cx| this.close_rename(cx));
         };
         let save_field = field.clone();
         let save_me = cx.entity();
@@ -1182,12 +1189,7 @@ impl PidoApp {
                         Button::new("rename-cancel", cancel_label.clone())
                             .variant(ButtonVariant::Ghost)
                             .on_click(move |_, window, cx| {
-                                me.update(cx, |this, cx| {
-                                    this.rename_open = false;
-                                    this.rename_field = None;
-                                    this.rename_target = None;
-                                    cx.notify();
-                                });
+                                me.update(cx, |this, cx| this.close_rename(cx));
                                 close(window, cx);
                             })
                     }

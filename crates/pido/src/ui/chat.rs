@@ -720,22 +720,27 @@ fn render_item(
                 wrapper
                     .child(assistant_footer(ix, view, cx))
                     .into_any_element()
-            } else if let Some(tokens) = view.live_tokens {
-                div()
-                    .flex_none()
-                    .flex()
-                    .justify_end()
-                    .pt_0p5()
-                    .text_size(theme.text_size(TextSize::Xs))
-                    .text_color(theme.colors.fg_subtle)
-                    .child(format!(
-                        "{} {}",
-                        i18n::t(cx, "usage"),
-                        compact_tokens(tokens)
-                    ))
-                    .into_any_element()
-                    .into()
             } else {
+                // The token ticker rides under the streaming bubble — the
+                // bubble itself must stay, tokens or no tokens.
+                if let Some(tokens) = view.live_tokens {
+                    return wrapper
+                        .child(
+                            div()
+                                .flex_none()
+                                .flex()
+                                .justify_end()
+                                .pt_0p5()
+                                .text_size(theme.text_size(TextSize::Xs))
+                                .text_color(theme.colors.fg_subtle)
+                                .child(format!(
+                                    "{} {}",
+                                    i18n::t(cx, "usage"),
+                                    compact_tokens(tokens)
+                                )),
+                        )
+                        .into_any_element();
+                }
                 wrapper.into_any_element()
             }
         }
