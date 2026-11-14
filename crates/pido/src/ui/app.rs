@@ -629,12 +629,18 @@ impl PidoApp {
                 s.expanded_turns.insert(turn_ix as u64);
             });
         }
-        let pos = self
-            .state
-            .read(cx)
-            .visible_rows()
-            .iter()
-            .position(|&row| row == ix);
+        let visible = self.state.read(cx).visible_rows();
+        // The unfold grew the list: sync its item count now, or the scroll
+        // below computes its anchor against the stale, shorter list.
+        if let Some(list) = &self.transcript_list {
+            let feed_count = list.item_count();
+            if visible.len() > feed_count {
+                list.splice(feed_count..feed_count, visible.len() - feed_count);
+            } else if visible.len() < feed_count {
+                list.splice(visible.len()..feed_count, 0);
+            }
+        }
+        let pos = visible.iter().position(|&row| row == ix);
         log::info!(
             "find_step: ix={ix} pos={pos:?} list={}",
             self.transcript_list.is_some()
