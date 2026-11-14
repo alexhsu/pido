@@ -707,7 +707,8 @@ impl PidoApp {
             ),
         ];
         let state = self.state.clone();
-        let items = state.read(cx).palette_items(&query, &actions);
+        let files = state.read(cx).workspace_files.clone();
+        let items = state.read(cx).palette_items(&query, &files, &actions);
         let kind_label = |kind: PaletteKind| -> gpui::SharedString {
             i18n::t(
                 cx,
@@ -717,6 +718,7 @@ impl PidoApp {
                     PaletteKind::Thinking => "kind_thinking",
                     PaletteKind::Session => "kind_session",
                     PaletteKind::Action => "kind_action",
+                    PaletteKind::File => "kind_file",
                 },
             )
         };
@@ -727,6 +729,7 @@ impl PidoApp {
                 PaletteKind::Thinking => IconName::Lightbulb,
                 PaletteKind::Session => IconName::MessageSquareDiff,
                 PaletteKind::Action => IconName::Zap,
+                PaletteKind::File => IconName::File,
             }
         };
 
@@ -769,6 +772,12 @@ impl PidoApp {
                 PaletteAction::ShellTemplate => {
                     if let Some(draft) = &this.draft {
                         draft.update(cx, |field, cx| field.set_text("!", cx));
+                    }
+                }
+                PaletteAction::InsertFile(file) => {
+                    if let Some(draft) = &this.draft {
+                        let at = format!("@{file} ");
+                        draft.update(cx, |field, cx| field.insert(&at, cx));
                     }
                 }
                 PaletteAction::NewChat => {

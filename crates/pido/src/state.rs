@@ -831,6 +831,7 @@ pub enum PaletteKind {
     Thinking,
     Session,
     Action,
+    File,
 }
 
 /// What running a palette entry does.
@@ -846,6 +847,8 @@ pub enum PaletteAction {
     /// Insert a `!` prefix into the composer; typing after it runs the
     /// rest as a shell command.
     ShellTemplate,
+    /// Insert a workspace file reference at the composer caret.
+    InsertFile(String),
     NewChat,
     ExportHtml,
     Compact,
@@ -1577,14 +1580,23 @@ impl AppState {
     pub fn palette_items(
         &self,
         query: &str,
+        files: &[String],
         actions: &[(String, PaletteAction)],
     ) -> Vec<PaletteItem> {
         const CAP: usize = 15;
         let needle = query.trim().to_lowercase();
         let mut items: Vec<PaletteItem> = Vec::new();
-        let fits = |len: usize, label: &str| {
-            len < CAP && (needle.is_empty() || label.to_lowercase().contains(&needle))
-        };
+        let fits = |len: usize, label: &str| len < CAP && fuzzy_matches(label, &needle);
+        for file in files.iter().take(8) {
+            if fits(items.len(), file) {
+                items.push(PaletteItem {
+                    kind: PaletteKind::File,
+                    value: format!("file:{file}"),
+                    label: file.clone(),
+                    action: PaletteAction::InsertFile(file.clone()),
+                });
+            }
+        }
         for command in &self.commands {
             let label = format!("/{}", command.name);
             if fits(items.len(), &label) {
@@ -2697,11 +2709,27 @@ impl AppState {
                 .spawn(async move { client.request(command) })
                 .await;
             this.update(cx, |s, cx| {
+                // `handled` means an extension consumed the prompt and no run
+                // follows — no settled event will come, so the optimistic
+                // turn clock must go now or it would tick forever.
+                let handled = matches!(
+                    &result,
+                    Ok(response)
+                        if response
+                            .data
+                            .as_ref()
+                            .and_then(|data| data.get("disposition"))
+                            .and_then(serde_json::Value::as_str)
+                            == Some("handled")
+                );
                 let failure = match &result {
                     Ok(response) if response.success => None,
                     Ok(response) => Some(response.error.clone().unwrap_or_default()),
                     Err(error) => Some(error.to_string()),
                 };
+                if handled {
+                    s.finish_running_turn();
+                }
                 if let Some(error) = failure {
                     s.remove_last_user_text(&text);
                     if !steering {
@@ -4104,6 +4132,43 @@ impl AppState {
     }
 }
 
+/// The kind of a transcript row, for the find bar's context line.
+pub(crate) enum RowKind {
+    User,
+    Assistant,
+    Tool,
+    Notice,
+    Shell,
+}
+
+/// What a match on row `ix` is, and the text around it — the find bar shows
+/// this so a jump to a long row is recognizable before it lands.
+pub(crate) fn row_context(items: &[TranscriptItem], ix: usize) -> Option<(RowKind, String)> {
+    let (kind, text) = match items.get(ix)? {
+        TranscriptItem::User { text, .. } => (RowKind::User, text.to_string()),
+        TranscriptItem::Assistant(view) => (RowKind::Assistant, view.text().to_string()),
+        TranscriptItem::Tool(card) => (
+            RowKind::Tool,
+            format!(
+                "{} {}",
+                card.name,
+                card.result.as_deref().unwrap_or_default()
+            ),
+        ),
+        TranscriptItem::Notice { text, .. } => (RowKind::Notice, text.to_string()),
+        TranscriptItem::Shell {
+            command, output, ..
+        } => (RowKind::Shell, format!("{command} {output}")),
+        TranscriptItem::Turn { .. } => return None,
+    };
+    let flat = text.replace('\n', " ");
+    let trimmed = flat.trim();
+    Some((
+        kind,
+        trimmed.chars().take(60).collect::<String>().to_string(),
+    ))
+}
+
 /// The transcript rows whose visible text contains `query`, case-
 /// insensitively — user prompts, assistant text, tool cards (name and
 /// result) and notices. Status lines carry nothing to find.
@@ -4136,6 +4201,24 @@ pub(crate) fn find_matches(items: &[TranscriptItem], query: &str) -> Vec<usize> 
         })
         .map(|(ix, _)| ix)
         .collect()
+}
+
+/// Case-insensitive substring-or-subsequence match: `xs` matches "新会话"
+/// (every character appears in order) and "extras", so a couple of letters
+/// find an entry without a pinyin table. Subsequence hits rank after
+/// substrings by the caller's ordering.
+pub fn fuzzy_matches(label: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    let label = label.to_lowercase();
+    if label.contains(needle) {
+        return true;
+    }
+    let mut chars = label.chars();
+    needle
+        .chars()
+        .all(|needle_char| chars.any(|label_char| label_char == needle_char))
 }
 
 /// Wire name for a thinking level.
@@ -4836,14 +4919,25 @@ mod tests {
     }
 
     #[test]
+    fn fuzzy_matches_admits_subsequences_but_not_gaps() {
+        // Substring still works.
+        assert!(fuzzy_matches("新会话", "会话"));
+        // Subsequence: every character in order.
+        assert!(fuzzy_matches("新会话", "新话"));
+        assert!(fuzzy_matches("DeepSeek V4 Pro", "dvp"));
+        // Order matters: no match when a character is missing or reversed.
+        assert!(!fuzzy_matches("新会话", "话新"));
+        assert!(!fuzzy_matches("DeepSeek V4 Pro", "zz"));
+    }
+
+    #[test]
     fn palette_items_filter_cap_and_order() {
         let mut state = empty_state();
         state.commands = vec![pi_rpc::protocol::CommandInfo {
             name: "review-pr".into(),
             description: None,
             source: None,
-            location: None,
-            path: None,
+            source_info: None,
         }];
         state.models = vec![pi_rpc::protocol::Model {
             id: "gpt".into(),
@@ -4864,8 +4958,8 @@ mod tests {
         }];
         let actions = vec![("New chat".to_string(), PaletteAction::NewChat)];
 
-        // Order: command, model, thinking, session, action.
-        let items = state.palette_items("", &actions);
+        // Order: file, command, model, thinking, session, action.
+        let items = state.palette_items("", &[], &actions);
         let kinds: Vec<PaletteKind> = items.iter().map(|item| item.kind).collect();
         assert_eq!(
             kinds,
@@ -4877,21 +4971,29 @@ mod tests {
                 PaletteKind::Action,
             ]
         );
+        // Workspace files lead the list when provided.
+        state.workspace_files = vec!["src/main.rs".to_string()];
+        let kinds: Vec<PaletteKind> = state
+            .palette_items("", &state.workspace_files, &actions)
+            .iter()
+            .map(|item| item.kind)
+            .collect();
+        assert_eq!(kinds[0], PaletteKind::File);
 
         // The query filters across every kind.
         let kinds: Vec<PaletteKind> = state
-            .palette_items("gpt", &actions)
+            .palette_items("gpt", &[], &actions)
             .iter()
             .map(|item| item.kind)
             .collect();
         assert_eq!(kinds, [PaletteKind::Model]);
         let kinds: Vec<PaletteKind> = state
-            .palette_items("session s1", &actions)
+            .palette_items("session s1", &[], &actions)
             .iter()
             .map(|item| item.kind)
             .collect();
         assert_eq!(kinds, [PaletteKind::Session]);
-        assert!(state.palette_items("zzz", &actions).is_empty());
+        assert!(state.palette_items("zzz", &[], &actions).is_empty());
     }
 
     #[test]

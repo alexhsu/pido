@@ -406,7 +406,7 @@ pub fn render_transcript(
                     )
                 })
                 .when_some(app.find.clone(), |this, find| {
-                    this.child(render_find_bar(view, &find, cx))
+                    this.child(render_find_bar(state, view, &find, cx))
                 })
                 .into_any_element()
         })
@@ -416,6 +416,7 @@ pub fn render_transcript(
 /// field's Enter steps forward (subscribed at open); the arrows step either
 /// way and the jump reveals the match's row.
 fn render_find_bar(
+    state: &Entity<AppState>,
     view: &Entity<crate::ui::app::PidoApp>,
     find: &crate::ui::app::FindState,
     cx: &App,
@@ -427,7 +428,29 @@ fn render_find_bar(
     } else if find.matches.is_empty() {
         Some(i18n::t(cx, "find_none").to_string())
     } else {
-        Some(format!("{}/{}", find.current + 1, find.matches.len()))
+        // The current match's row kind and a leading excerpt, so a jump to
+        // a long row is recognizable before it lands.
+        let context =
+            crate::state::row_context(&state.read(cx).transcript, find.matches[find.current]);
+        Some(match context {
+            Some((kind, excerpt)) => {
+                let kind_label = match kind {
+                    crate::state::RowKind::User => i18n::t(cx, "kind_user"),
+                    crate::state::RowKind::Assistant => i18n::t(cx, "kind_pi"),
+                    crate::state::RowKind::Tool => i18n::t(cx, "kind_tool"),
+                    crate::state::RowKind::Notice => i18n::t(cx, "kind_notice"),
+                    crate::state::RowKind::Shell => i18n::t(cx, "kind_shell"),
+                };
+                format!(
+                    "{}/{} · {} · {}",
+                    find.current + 1,
+                    find.matches.len(),
+                    kind_label,
+                    excerpt
+                )
+            }
+            None => format!("{}/{}", find.current + 1, find.matches.len()),
+        })
     };
     let (prev_view, next_view, close_view) = (view.clone(), view.clone(), view.clone());
     div()
@@ -443,7 +466,7 @@ fn render_find_bar(
         .border_1()
         .border_color(theme.colors.border)
         .bg(theme.colors.surface)
-        .child(div().w(gpui::px(220.)).child(find.field.clone()))
+        .child(div().w(gpui::px(260.)).child(find.field.clone()))
         .when_some(counter, |this, counter| {
             this.child(
                 div()

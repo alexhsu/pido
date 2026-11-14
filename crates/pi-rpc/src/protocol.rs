@@ -1115,11 +1115,24 @@ pub struct CommandInfo {
     /// `extension`, `prompt` or `skill`.
     #[serde(default)]
     pub source: Option<String>,
-    /// `user`, `project` or `path`, for non-extension commands.
+    /// Metadata for the resource that registered the command; absent for
+    /// extension commands.
     #[serde(default)]
-    pub location: Option<String>,
+    pub source_info: Option<CommandSourceInfo>,
+}
+
+/// Where a prompt/skill command came from.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CommandSourceInfo {
     #[serde(default)]
     pub path: Option<String>,
+    /// How pi discovered it: `local`, `auto`, `cli`, …
+    #[serde(default)]
+    pub source: Option<String>,
+    /// `user`, `project` or `temporary`.
+    #[serde(default)]
+    pub scope: Option<String>,
 }
 
 /// `get_messages` payload.
