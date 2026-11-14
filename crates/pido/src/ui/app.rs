@@ -77,6 +77,15 @@ pub struct PidoApp {
     right_open: bool,
     /// The panel's terminal, spawned on first use and kept while the app runs.
     pub terminal: Option<gpui::Entity<ely_gpui_component::terminal::Terminal>>,
+    /// The transcript's scroll state, owned here so search can jump to a row
+    /// and the tail-follow badge survives re-renders. Rebuilt whenever
+    /// `list_epoch` falls behind the state's `session_epoch`.
+    pub transcript_list: Option<gpui::ListState>,
+    pub list_epoch: u64,
+    /// Whether the transcript is scrolled away from the bottom, and how many
+    /// rows arrived while away (the jump-to-latest badge).
+    pub transcript_away: bool,
+    pub transcript_fresh: usize,
 }
 
 /// The right panel's two tabs.
@@ -146,6 +155,10 @@ impl PidoApp {
             right_tab: RightTab::Diff,
             right_open,
             terminal: None,
+            transcript_list: None,
+            list_epoch: 0,
+            transcript_away: false,
+            transcript_fresh: 0,
         };
         app.observe_window_for_quit(cx);
         app
@@ -236,56 +249,53 @@ impl Render for PidoApp {
             self.composer_focused = false;
         }
 
-        let main: gpui::AnyElement = if live {
-            div()
-                .flex_1()
-                .min_w_0()
-                .h_full()
-                .min_h_0()
-                .flex()
-                .flex_col()
-                .child(div().flex_none().child(chat::render_header(
-                    &state,
-                    &cx.entity(),
-                    window,
-                    cx,
-                )))
-                .child(
-                    div()
-                        .flex_1()
-                        .min_h_0()
-                        .overflow_hidden()
-                        .child(chat::render_transcript(&state, cx)),
-                )
-                .child(
-                    // The composer sits in the same centered column as the
-                    // transcript, so the field lines up with the messages.
-                    div()
-                        .flex_none()
-                        .w_full()
-                        .flex()
-                        .justify_center()
-                        .px_4()
-                        .pt_2()
-                        .pb_2()
-                        .child(
-                            div()
-                                .w_full()
-                                .max_w(column)
-                                .min_w_0()
-                                .child(composer::render(&state, self, cx)),
-                        ),
-                )
-                .into_any_element()
-        } else {
-            div()
-                .flex_1()
-                .min_w_0()
-                .h_full()
-                .min_h_0()
-                .child(welcome::render(&state, self, window, cx))
-                .into_any_element()
-        };
+        let main: gpui::AnyElement =
+            if live {
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .h_full()
+                    .min_h_0()
+                    .flex()
+                    .flex_col()
+                    .child(div().flex_none().child(chat::render_header(
+                        &state,
+                        &cx.entity(),
+                        window,
+                        cx,
+                    )))
+                    .child(div().flex_1().min_h_0().overflow_hidden().child(
+                        chat::render_transcript(&state, &cx.entity(), self, window, cx),
+                    ))
+                    .child(
+                        // The composer sits in the same centered column as the
+                        // transcript, so the field lines up with the messages.
+                        div()
+                            .flex_none()
+                            .w_full()
+                            .flex()
+                            .justify_center()
+                            .px_4()
+                            .pt_2()
+                            .pb_2()
+                            .child(
+                                div()
+                                    .w_full()
+                                    .max_w(column)
+                                    .min_w_0()
+                                    .child(composer::render(&state, self, cx)),
+                            ),
+                    )
+                    .into_any_element()
+            } else {
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .h_full()
+                    .min_h_0()
+                    .child(welcome::render(&state, self, window, cx))
+                    .into_any_element()
+            };
 
         // Extension and rename dialogs ride at the root, above every pane;
         // the remove-project confirmation joins them.

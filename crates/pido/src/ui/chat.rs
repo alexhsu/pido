@@ -2,7 +2,7 @@
 //! cards, and the session header (model / thinking / stats pickers).
 
 use ely_gpui_component::agent::ToolCallCard;
-use ely_gpui_component::chat::{MessageBubble, MessageList, Role, StepState, ThinkingBlock};
+use ely_gpui_component::chat::{MessageBubble, Role, StepState, ThinkingBlock};
 
 use ely_gpui_component::theme::{ActiveTheme, ControlSize, IconSize, TextSize};
 use ely_gpui_component::typography::{Caption, Paragraph};
@@ -180,16 +180,21 @@ pub fn render_header(
 
 /// The scrollable transcript area with the notice banner and empty state.
 /// The message column mirrors the composer: centered, `px_4`, capped at the
-/// theme's medium container width.
-pub fn render_transcript(state: &Entity<AppState>, cx: &App) -> impl IntoElement + use<> {
+/// theme's medium container width. The scroll state is owned by the view so
+/// search can jump to a row and the tail-follow badge survives re-renders.
+pub fn render_transcript(
+    state: &Entity<AppState>,
+    view: &Entity<crate::ui::app::PidoApp>,
+    app: &mut crate::ui::app::PidoApp,
+    window: &mut Window,
+    cx: &mut App,
+) -> impl IntoElement + use<> {
     let s = state.read(cx);
     let empty = s.transcript.is_empty();
-    let app = state.clone();
-    let list_epoch = s.session_epoch;
     let notice = s
         .notice
         .clone()
-        .map(|(kind, text)| render_notice(kind, text, app.clone(), cx));
+        .map(|(kind, text)| render_notice(kind, text, state.clone(), cx));
 
     // Folded content must not exist in the list at all: an empty row would
     // still hold its slot, so the hidden tool calls would keep their space.
@@ -213,10 +218,49 @@ pub fn render_transcript(state: &Entity<AppState>, cx: &App) -> impl IntoElement
         .collect();
     let count = visible.len();
 
-    // MessageList is rendered as the direct child of ChatContainer's
-    // messages slot: it needs that flex height to resolve its 100%. The
-    // centered column is applied per row instead, so the list itself stays
-    // full-bleed and scrolls correctly.
+    // Own the scroll state: rebuilt when the conversation was replaced, kept
+    // (with its measured heights and away badge) across re-renders.
+    if app.list_epoch != s.session_epoch || app.transcript_list.is_none() {
+        let overdraw = cx.theme().list_overdraw().to_pixels(window.rem_size());
+        let list = gpui::ListState::new(count, gpui::ListAlignment::Bottom, overdraw);
+        let watcher = view.downgrade();
+        list.set_scroll_handler(move |event, _, cx| {
+            let away = event.is_scrolled;
+            watcher
+                .update(cx, |app, cx| {
+                    if app.transcript_away != away {
+                        app.transcript_away = away;
+                        if away {
+                            app.transcript_fresh = 0;
+                        }
+                        cx.notify();
+                    }
+                })
+                .ok();
+        });
+        app.transcript_list = Some(list);
+        app.list_epoch = s.session_epoch;
+        app.transcript_away = false;
+        app.transcript_fresh = 0;
+    }
+    let list = app.transcript_list.clone().expect("transcript list");
+    let feed_count = list.item_count();
+    if feed_count != count {
+        // Rows arriving while scrolled away count for the jump badge; at the
+        // bottom, Bottom alignment pins to the newest row for free.
+        if count > feed_count && app.transcript_away {
+            app.transcript_fresh += count - feed_count;
+        }
+        if count >= feed_count {
+            list.splice(feed_count..feed_count, count - feed_count);
+        } else {
+            list.splice(count..feed_count, 0);
+        }
+    }
+
+    // The list is the direct child of the transcript's flex slot: it needs
+    // that height to resolve its 100%. The centered column is applied per
+    // row instead, so the list stays full-bleed and scrolls correctly.
     div()
         .relative()
         .size_full()
@@ -236,39 +280,109 @@ pub fn render_transcript(state: &Entity<AppState>, cx: &App) -> impl IntoElement
                 .child(Caption::new(i18n::t(cx, "empty_transcript")))
                 .into_any_element()
         } else {
+            let visible = std::rc::Rc::new(visible);
             div()
                 .flex_1()
                 .w_full()
                 .min_h_0()
                 .overflow_hidden()
-                .child(MessageList::new(
-                    ("transcript", list_epoch),
-                    count,
-                    move |pos, _window, cx| {
-                        let s = app.read(cx);
-                        let ix = visible[pos];
-                        let column = cx
-                            .theme()
-                            .container_width(ely_gpui_component::theme::ContainerSize::Md);
-                        // A finished turn folds its tool calls and thinking
-                        // away until its status line is clicked.
-                        let folded =
-                            crate::state::turn_folded_for(&s.transcript, ix, &s.expanded_turns);
+                .relative()
+                .child(
+                    gpui::list(list.clone(), {
+                        let visible = visible.clone();
+                        let app = state.clone();
+                        move |pos, _window, cx| {
+                            let s = app.read(cx);
+                            let ix = visible[pos];
+                            let column = cx
+                                .theme()
+                                .container_width(ely_gpui_component::theme::ContainerSize::Md);
+                            // A finished turn folds its tool calls and thinking
+                            // away until its status line is clicked.
+                            let folded =
+                                crate::state::turn_folded_for(&s.transcript, ix, &s.expanded_turns);
+                            div()
+                                .w_full()
+                                .flex()
+                                .justify_center()
+                                .px_4()
+                                .child(div().w_full().max_w(column).min_w_0().child(render_item(
+                                    &app,
+                                    &s.transcript[ix],
+                                    folded,
+                                    ix,
+                                    cx,
+                                )))
+                                .into_any_element()
+                        }
+                    })
+                    .size_full(),
+                )
+                // Scrollbar drags to the bottom never fire the scroll handler;
+                // a paint pass re-checks engagement so the badge retires itself.
+                .child(
+                    gpui::canvas(
+                        {
+                            let view = view.downgrade();
+                            let list = list.clone();
+                            move |_, window, cx| {
+                                let held = list.logical_scroll_top().item_ix >= list.item_count();
+                                let away = view
+                                    .upgrade()
+                                    .is_some_and(|app| app.read(cx).transcript_away);
+                                if away && held {
+                                    if let Some(view) = view.upgrade() {
+                                        view.update(cx, |app, cx| {
+                                            app.transcript_away = false;
+                                            app.transcript_fresh = 0;
+                                            cx.notify();
+                                        });
+                                    }
+                                    window.request_animation_frame();
+                                }
+                            }
+                        },
+                        |_, _, _, _| {},
+                    )
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .size_full(),
+                )
+                .when(app.transcript_away, |this| {
+                    this.child(
                         div()
-                            .w_full()
+                            .absolute()
+                            .bottom_4()
+                            .left_0()
+                            .right_0()
                             .flex()
                             .justify_center()
-                            .px_4()
-                            .child(div().w_full().max_w(column).min_w_0().child(render_item(
-                                &app,
-                                &s.transcript[ix],
-                                folded,
-                                ix,
-                                cx,
-                            )))
-                            .into_any_element()
-                    },
-                ))
+                            .child({
+                                let view = view.downgrade();
+                                ely_gpui_component::chat::ScrollToBottomButton::new(
+                                    ("transcript-jump", app.list_epoch),
+                                    app.transcript_fresh,
+                                    move |_, cx| {
+                                        if let Some(view) = view.upgrade() {
+                                            view.update(cx, |app, cx| {
+                                                if let Some(list) = &app.transcript_list {
+                                                    let end = list.item_count();
+                                                    list.scroll_to(gpui::ListOffset {
+                                                        item_ix: end,
+                                                        offset_in_item: gpui::px(0.),
+                                                    });
+                                                }
+                                                app.transcript_away = false;
+                                                app.transcript_fresh = 0;
+                                                cx.notify();
+                                            });
+                                        }
+                                    },
+                                )
+                            }),
+                    )
+                })
                 .into_any_element()
         })
 }
