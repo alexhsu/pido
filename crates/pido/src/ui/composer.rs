@@ -201,6 +201,41 @@ pub fn render(state: &Entity<AppState>, app: &mut PidoApp, cx: &App) -> impl Int
             QueueChoice::Steer => i18n::t(cx, "queued_steer"),
             QueueChoice::FollowUp => i18n::t(cx, "queued_follow_up"),
         };
+        // Delivery granularity for the queue pi already holds: all at
+        // once, or one message per turn.
+        let (all_label, one_label) = (
+            i18n::t(cx, "deliver_all").to_string(),
+            i18n::t(cx, "deliver_one").to_string(),
+        );
+        let delivery_all_state = state.clone();
+        let delivery_one_state = state.clone();
+        let delivery_menu = ely_gpui_component::menus::Menu::new()
+            .item(
+                ely_gpui_component::menus::MenuItem::radio(
+                    all_label,
+                    s.steer_mode != Some(pi_rpc::protocol::QueueMode::OneAtATime),
+                )
+                .on_click(move |_, cx| {
+                    delivery_all_state.update(cx, |s, cx| {
+                        s.set_queue_delivery(true, pi_rpc::protocol::QueueMode::All, cx)
+                    });
+                }),
+            )
+            .item(
+                ely_gpui_component::menus::MenuItem::radio(
+                    one_label,
+                    s.steer_mode == Some(pi_rpc::protocol::QueueMode::OneAtATime),
+                )
+                .on_click(move |_, cx| {
+                    delivery_one_state.update(cx, |s, cx| {
+                        s.set_queue_delivery(true, pi_rpc::protocol::QueueMode::OneAtATime, cx)
+                    });
+                }),
+            );
+        let menu = menu.item(ely_gpui_component::menus::MenuItem::submenu(
+            i18n::t(cx, "delivery"),
+            delivery_menu,
+        ));
         Some(
             ely_gpui_component::menus::DropdownMenu::new("composer-queue", label, menu)
                 .variant(ButtonVariant::Ghost),

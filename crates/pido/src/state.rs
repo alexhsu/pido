@@ -141,6 +141,9 @@ pub struct AssistantView {
     pub took: Option<Duration>,
     /// Provider error text for a failed assistant message, when any.
     pub error: Option<String>,
+    /// pi's cumulative token count for the streaming message, from
+    /// `message_update`; cleared when the finished message carries its own.
+    pub live_tokens: Option<u64>,
     /// Wall-clock stamp of the finished message, unix seconds.
     pub time: Option<i64>,
     /// Tokens the message's turn reported, from its usage.
@@ -174,6 +177,7 @@ impl AssistantView {
             started: Instant::now(),
             took: None,
             error: None,
+            live_tokens: None,
             time: None,
             tokens: None,
             geometry_cache: std::cell::RefCell::new(None),
@@ -883,6 +887,10 @@ pub struct AppState {
     pub user_projects: Vec<String>,
     /// Sidebar labels the user gave projects, keyed like pin/archive sets.
     pub project_labels: HashMap<String, String>,
+    /// How pi delivers queued steers/follow-ups: all at once, or one per
+    /// turn. Two independent switches, defaults reported by pi.
+    pub steer_mode: Option<pi_rpc::protocol::QueueMode>,
+    pub follow_up_mode: Option<pi_rpc::protocol::QueueMode>,
     /// The sidebar's session search: the trimmed query (empty when off) and
     /// a generation that retires stale background content searches.
     search_query: String,
@@ -1053,6 +1061,8 @@ impl AppState {
                 pending_writes: HashMap::new(),
                 pending_composer_text: None,
                 search_query: String::new(),
+                steer_mode: None,
+                follow_up_mode: None,
                 search_gen: 0,
                 content_hits: Vec::new(),
                 session_scan: Arc::new(Mutex::new(sessions::SessionScanner::default())),
@@ -3183,6 +3193,70 @@ impl AppState {
         .detach();
     }
 
+    /// Set how pi delivers queued messages: `all` flushes everything at
+    /// once, `one_at_a_time` releases one per turn. `steering` picks which
+    /// queue's mode to set.
+    pub fn set_queue_delivery(
+        &mut self,
+        steering: bool,
+        mode: pi_rpc::protocol::QueueMode,
+        cx: &mut Context<Self>,
+    ) {
+        let (previous, set) = if steering {
+            (self.steer_mode, Command::SetSteeringMode { mode })
+        } else {
+            (self.follow_up_mode, Command::SetFollowUpMode { mode })
+        };
+        if previous == Some(mode) {
+            return;
+        }
+        let Some(client) = self.client() else { return };
+        if steering {
+            self.steer_mode = Some(mode);
+        } else {
+            self.follow_up_mode = Some(mode);
+        }
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { client.request(set) })
+                .await;
+            this.update(cx, |s, cx| {
+                let failed = match &result {
+                    Ok(response) => !response.success,
+                    Err(_) => true,
+                };
+                if failed {
+                    if steering {
+                        s.steer_mode = previous;
+                    } else {
+                        s.follow_up_mode = previous;
+                    }
+                    let detail = match &result {
+                        Ok(response) => response.error.clone().unwrap_or_default(),
+                        Err(error) => error.to_string(),
+                    };
+                    s.push_notice(NoticeKind::Error, detail);
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+        cx.notify();
+    }
+
+    /// The text of the newest assistant message in the open transcript, for
+    /// a one-click copy of the last answer.
+    pub fn last_answer_text(&self) -> Option<String> {
+        self.transcript.iter().rev().find_map(|item| match item {
+            TranscriptItem::Assistant(view) if !view.text().is_empty() => {
+                Some(view.text().to_string())
+            }
+            _ => None,
+        })
+    }
+
     /// Flip pi's auto-compaction switch. Optimistic, like the model pick:
     /// a failed round trip restores the previous value.
     pub fn set_auto_compaction(&mut self, enabled: bool, cx: &mut Context<Self>) {
@@ -3265,6 +3339,8 @@ impl AppState {
                     s.session_name = payload.session_name;
                     s.session_id = payload.session_id;
                     s.auto_compaction = Some(payload.auto_compaction_enabled);
+                    s.steer_mode = payload.steering_mode;
+                    s.follow_up_mode = payload.follow_up_mode;
                     let file = payload.session_file;
                     s.remember_session_file(file.as_deref());
                     // `new_chat` waits for this round trip to learn the file
@@ -3502,9 +3578,22 @@ impl AppState {
                 }
             }
             Event::MessageUpdate {
+                usage,
                 assistant_message_event,
-                ..
-            } => self.apply_delta(assistant_message_event),
+            } => {
+                self.apply_delta(assistant_message_event);
+                // pi's cumulative usage for the streaming message: a live
+                // ticker without waiting for the run to finish.
+                if let Some(usage) = usage
+                    && let Some(TranscriptItem::Assistant(view)) =
+                        self.transcript.iter_mut().rev().find_map(|item| {
+                            matches!(item, TranscriptItem::Assistant(_)).then_some(item)
+                        })
+                    && let Some(latest) = usage.total_tokens
+                {
+                    view.live_tokens = Some(latest);
+                }
+            }
             Event::MessageEnd { message } => {
                 if let AgentMessage::Assistant(assistant) = &message {
                     let view = AssistantView::from_message(assistant);
@@ -4492,6 +4581,8 @@ mod tests {
             pending_writes: HashMap::new(),
             pending_composer_text: None,
             search_query: String::new(),
+            steer_mode: None,
+            follow_up_mode: None,
             search_gen: 0,
             content_hits: Vec::new(),
             session_scan: Arc::new(Mutex::new(sessions::SessionScanner::default())),
@@ -4587,6 +4678,7 @@ mod tests {
                 TranscriptItem::Tool(card) => {
                     format!("tool:{}:{:?}", card.name, card.result.as_deref())
                 }
+                TranscriptItem::Shell { .. } => "shell".to_string(),
                 TranscriptItem::Notice { text, .. } => format!("notice:{text}"),
             })
             .collect::<Vec<_>>();

@@ -130,6 +130,25 @@ pub fn render_header(
         .child({
             let app = app.clone();
             ely_gpui_component::buttons::IconButton::new(
+                "copy-last-answer",
+                ely_gpui_component::primitives::IconName::Copy,
+            )
+            .variant(ely_gpui_component::buttons::ButtonVariant::Ghost)
+            .tooltip(i18n::t(cx, "copy_last_answer"))
+            .on_click(move |_, _, cx| {
+                app.update(cx, |s, cx| {
+                    let text = s.last_answer_text().unwrap_or_default();
+                    if !text.is_empty() {
+                        cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
+                        s.push_notice(NoticeKind::Info, i18n::t(cx, "copied_answer").to_string());
+                    }
+                    cx.notify();
+                });
+            })
+        })
+        .child({
+            let app = app.clone();
+            ely_gpui_component::buttons::IconButton::new(
                 "export-html",
                 ely_gpui_component::primitives::IconName::ExternalLink,
             )
@@ -672,11 +691,27 @@ fn render_item(
             }
             let wrapper = div().group(group(ix)).flex().flex_col().child(bubble);
             // A finished message shows its actions on hover; a streaming one
-            // has nothing stable to copy yet.
+            // shows just the live token count, always visible so the cost of
+            // a long stream is watchable as it grows.
             if view.finished {
                 wrapper
                     .child(assistant_footer(ix, view, cx))
                     .into_any_element()
+            } else if let Some(tokens) = view.live_tokens {
+                div()
+                    .flex_none()
+                    .flex()
+                    .justify_end()
+                    .pt_0p5()
+                    .text_size(theme.text_size(TextSize::Xs))
+                    .text_color(theme.colors.fg_subtle)
+                    .child(format!(
+                        "{} {}",
+                        i18n::t(cx, "usage"),
+                        compact_tokens(tokens)
+                    ))
+                    .into_any_element()
+                    .into()
             } else {
                 wrapper.into_any_element()
             }
@@ -859,9 +894,15 @@ fn group(ix: usize) -> SharedString {
 fn assistant_footer(ix: usize, view: &AssistantView, cx: &App) -> AnyElement {
     let theme = cx.theme();
     let copy = view.text();
+    // A finished message shows its total; a streaming one ticks pi's
+    // cumulative count so the cost is visible while it works.
     let usage = view
         .tokens
-        .map(|tokens| format!("{} {}", i18n::t(cx, "usage"), compact_tokens(tokens)));
+        .map(|tokens| format!("{} {}", i18n::t(cx, "usage"), compact_tokens(tokens)))
+        .or_else(|| {
+            view.live_tokens
+                .map(|tokens| format!("{} {}", i18n::t(cx, "usage"), compact_tokens(tokens)))
+        });
     div()
         .flex_none()
         .invisible()
