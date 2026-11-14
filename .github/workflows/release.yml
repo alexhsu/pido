@@ -1,7 +1,9 @@
 name: Release
 
-# A version tag builds all three platforms and publishes a GitHub Release
-# with the packaged artifacts. Requires `pido.desktop` in the repo root and
+# A version tag builds the Linux AppImage and publishes a GitHub Release.
+# Windows and macOS packaging stays out until signing certificates are in
+# place; their recipes are kept below, commented, to restore then.
+# Requires `pido.desktop` in the repo root and
 # `crates/pido/assets/pido-mark-512.png` (the icon source).
 on:
   push:
@@ -21,10 +23,12 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: windows-latest
-            target: windows-x64
-          - os: macos-latest
-            target: macos-aarch64
+          # Signing certificates are missing; Windows/macOS packages are
+          # disabled (see the commented recipes at the bottom).
+          # - os: windows-latest
+          #   target: windows-x64
+          # - os: macos-latest
+          #   target: macos-aarch64
           - os: ubuntu-latest
             target: linux-x64
 
@@ -53,63 +57,65 @@ jobs:
         shell: bash
         run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
 
-      # --- Windows: the exe carries its icon; zip it with the license.
-      - name: Package (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          $stage = "stage/pido-${{ steps.version.outputs.version }}-windows-x64"
-          New-Item -ItemType Directory -Force -Path $stage | Out-Null
-          Copy-Item target/release/pido.exe $stage/
-          Copy-Item LICENSE $stage/
-          Compress-Archive -Path $stage -DestinationPath `
-            "pido-${{ steps.version.outputs.version }}-windows-x64.zip"
+      # --- Windows: signing certificate missing; restore with the macOS
+      # job when packaging resumes. The exe carries its icon; zip it with
+      # the license.
+      # - name: Package (Windows)
+      #   if: runner.os == 'Windows'
+      #   shell: pwsh
+      #   run: |
+      #     $stage = "stage/pido-${{ steps.version.outputs.version }}-windows-x64"
+      #     New-Item -ItemType Directory -Force -Path $stage | Out-Null
+      #     Copy-Item target/release/pido.exe $stage/
+      #     Copy-Item LICENSE $stage/
+      #     Compress-Archive -Path $stage -DestinationPath `
+      #       "pido-${{ steps.version.outputs.version }}-windows-x64.zip"
 
-      # --- macOS: a real .app bundle with an icns built from the mark.
-      - name: Package (macOS)
-        if: runner.os == 'macOS'
-        shell: bash
-        run: |
-          VERSION="${{ steps.version.outputs.version }}"
-          APP="stage/pido-${VERSION}-macos-aarch64/pido.app"
-          mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
-          cp target/release/pido "$APP/Contents/MacOS/"
-          cp LICENSE "$APP/Contents/"
-
-          # The icon set needs every size, plus the @2x pairs.
-          mkdir -p pido.iconset
-          for size in 16 32 64 128 256 512; do
-            sips -z $size $size crates/pido/assets/pido-mark-512.png \
-              --out "pido.iconset/icon_${size}x${size}.png" >/dev/null
-            double=$((size * 2))
-            sips -z $double $double crates/pido/assets/pido-mark-512.png \
-              --out "pido.iconset/icon_${size}x${size}@2x.png" >/dev/null
-          done
-          iconutil -c icns pido.iconset \
-            --output "$APP/Contents/Resources/pido.icns"
-
-          cat > "$APP/Contents/Info.plist" <<PLIST
-          <?xml version="1.0" encoding="UTF-8"?>
-          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-          <plist version="1.0">
-          <dict>
-            <key>CFBundleExecutable</key><string>pido</string>
-            <key>CFBundleIconFile</key><string>pido</string>
-            <key>CFBundleIdentifier</key><string>dev.alexhsu.pido</string>
-            <key>CFBundleName</key><string>pido</string>
-            <key>CFBundlePackageType</key><string>APPL</string>
-            <key>CFBundleShortVersionString</key><string>${VERSION}</string>
-            <key>CFBundleVersion</key><string>${VERSION}</string>
-            <key>NSHighResolutionCapable</key><true/>
-            <key>LSMinimumSystemVersion</key><string>10.15</string>
-          </dict>
-          </plist>
-          PLIST
-
-          cd stage
-          zip -qry "pido-${VERSION}-macos-aarch64.zip" \
-            "pido-${VERSION}-macos-aarch64"
-          cd ..
+      # --- macOS: signing certificate missing; a real .app bundle with an
+      # icns built from the mark, zipped unsigned.
+      # - name: Package (macOS)
+      #   if: runner.os == 'macOS'
+      #   shell: bash
+      #   run: |
+      #     VERSION="${{ steps.version.outputs.version }}"
+      #     APP="stage/pido-${VERSION}-macos-aarch64/pido.app"
+      #     mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+      #     cp target/release/pido "$APP/Contents/MacOS/"
+      #     cp LICENSE "$APP/Contents/"
+      #
+      #     mkdir -p pido.iconset
+      #     for size in 16 32 64 128 256 512; do
+      #       sips -z $size $size crates/pido/assets/pido-mark-512.png \
+      #         --out "pido.iconset/icon_${size}x${size}.png" >/dev/null
+      #       double=$((size * 2))
+      #       sips -z $double $double crates/pido/assets/pido-mark-512.png \
+      #         --out "pido.iconset/icon_${size}x${size}@2x.png" >/dev/null
+      #     done
+      #     iconutil -c icns pido.iconset \
+      #       --output "$APP/Contents/Resources/pido.icns"
+      #
+      #     cat > "$APP/Contents/Info.plist" <<PLIST
+      #     <?xml version="1.0" encoding="UTF-8"?>
+      #     <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+      #     <plist version="1.0">
+      #     <dict>
+      #       <key>CFBundleExecutable</key><string>pido</string>
+      #       <key>CFBundleIconFile</key><string>pido</string>
+      #       <key>CFBundleIdentifier</key><string>dev.alexhsu.pido</string>
+      #       <key>CFBundleName</key><string>pido</string>
+      #       <key>CFBundlePackageType</key><string>APPL</string>
+      #       <key>CFBundleShortVersionString</key><string>${VERSION}</string>
+      #       <key>CFBundleVersion</key><string>${VERSION}</string>
+      #       <key>NSHighResolutionCapable</key><true/>
+      #       <key>LSMinimumSystemVersion</key><string>10.15</string>
+      #     </dict>
+      #     </plist>
+      #     PLIST
+      #
+      #     cd stage
+      #     zip -qry "pido-${VERSION}-macos-aarch64.zip" \
+      #       "pido-${VERSION}-macos-aarch64"
+      #     cd ..
 
       # --- Linux: an AppImage with a desktop entry and the icon.
       - name: Package (Linux)

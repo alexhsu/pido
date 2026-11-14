@@ -45,15 +45,15 @@ A native desktop client for the [Pi coding agent](https://github.com/earendil-wo
 
 ## 下载 / Download
 
-打 `v*` 标签会触发三平台构建并发布 GitHub Release,附件:
+打 `v*` 标签会构建并发布 GitHub Release。**当前仅发布 Linux AppImage**(Windows/macOS 的打包在签名证书就绪后恢复):
 
-- `pido-x.y.z-windows-x64.zip` — 解压运行 `pido.exe`
-- `pido-x.y.z-macos-aarch64.zip` — 解压得到 `pido.app`,拖进「应用程序」
 - `pido-x.y.z-linux-x64.AppImage` — `chmod +x` 后直接运行
 
-English: a `v*` tag builds all three platforms and publishes a GitHub
-Release with a Windows zip, a macOS `.app` bundle (Apple silicon), and a
-Linux AppImage.
+Windows 与 macOS 用户请暂从源码构建(`cargo run --release -p pido`)。
+
+English: a `v*` tag currently publishes a **Linux AppImage only** — the
+Windows zip and the macOS `.app` bundle return once signing certificates
+are in place; build from source meanwhile.
 
 ## 运行 / Run
 
