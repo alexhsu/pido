@@ -6,11 +6,11 @@ use ely_gpui_component::primitives::FocusScope;
 use ely_gpui_component::theme::{ActiveTheme, ContainerSize, Mode, Theme};
 use gpui::{
     App, AppContext, Context, FocusHandle, InteractiveElement, IntoElement, ParentElement, Render,
-    Styled, Window, actions, div,
+    StatefulInteractiveElement, Styled, Window, actions, div,
 };
 
 use crate::i18n;
-use crate::state::{AppState, Conn, PaletteAction, PaletteKind, TranscriptItem};
+use crate::state::{AppState, Conn, PaletteAction, PaletteItem, PaletteKind, TranscriptItem};
 use crate::ui::{chat, composer, sidebar, welcome};
 
 actions!(
@@ -101,6 +101,8 @@ pub struct PidoApp {
     /// Bumped each time the palette opens; keys its picker state so a stale
     /// dismissal never sticks.
     palette_gen: u64,
+    /// The palette's highlighted row, over the filtered list.
+    palette_selected: usize,
     /// The sidebar's session-search field, created once in setup.
     pub search_field: Option<gpui::Entity<TextInput>>,
 }
@@ -205,6 +207,7 @@ impl PidoApp {
             find: None,
             palette: None,
             palette_gen: 0,
+            palette_selected: 0,
             search_field: None,
         };
         app.observe_window_for_quit(cx);
@@ -689,6 +692,7 @@ impl PidoApp {
     pub fn open_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         log::info!("open_palette: enter");
         self.palette_gen = self.palette_gen.wrapping_add(1);
+        self.palette_selected = 0;
         let field = cx.new(|cx| TextInput::new(window, cx).placeholder_key("palette_placeholder"));
         let focus = field.read(cx).focus().clone();
         window.focus(&focus, cx);
@@ -707,11 +711,10 @@ impl PidoApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<gpui::AnyElement> {
-        use ely_gpui_component::forms::{Choice, Suggestions};
+        use ely_gpui_component::forms::{Choice, Down, Enter, Up, marked_row};
         use ely_gpui_component::primitives::IconName;
 
         let palette = self.palette.as_ref()?;
-        log::info!("palette_overlay: rendering");
         let field = palette.field.clone();
         let gen_id = palette.open_gen;
         let query = field.read(cx).text().to_string();
@@ -730,7 +733,7 @@ impl PidoApp {
             (i18n::t(cx, "theme").to_string(), PaletteAction::ToggleTheme),
         ];
         let state = self.state.clone();
-        let pick_items = state.read(cx).palette_items(&query, &actions);
+        let items = state.read(cx).palette_items(&query, &actions);
         let kind_label = |kind: PaletteKind| -> gpui::SharedString {
             i18n::t(
                 cx,
@@ -752,82 +755,110 @@ impl PidoApp {
                 PaletteKind::Action => IconName::Zap,
             }
         };
-        let choices = pick_items
-            .iter()
-            .enumerate()
-            .map(|(ix, item)| {
-                Choice::new(format!("{gen_id}:{ix}"), item.label.clone())
-                    .icon(kind_icon(item.kind))
-                    .note(kind_label(item.kind))
-            })
-            .collect::<Vec<_>>();
+
+        // The highlighted row, clamped to the filtered list.
+        let selected = if items.is_empty() {
+            0
+        } else {
+            self.palette_selected.min(items.len() - 1)
+        };
 
         let view = cx.entity();
-        let pick_view = view.clone();
-        let pick = std::rc::Rc::new(move |at: usize, window: &mut Window, cx: &mut App| {
-            let Some(item) = pick_items.get(at) else {
-                return;
+        let run_view = view.clone();
+        let run_item = move |this: &mut PidoApp,
+                             item: &PaletteItem,
+                             window: &mut Window,
+                             cx: &mut Context<PidoApp>| {
+            let is_command = matches!(item.action, PaletteAction::RunCommand(_));
+            let composer_focus = if is_command {
+                this.draft
+                    .as_ref()
+                    .map(|draft| draft.read(cx).focus().clone())
+            } else {
+                None
             };
-            let item = item.clone();
-            pick_view.update(cx, |this, cx| {
-                let is_command = matches!(item.action, PaletteAction::RunCommand(_));
-                let composer_focus = if is_command {
-                    this.draft
-                        .as_ref()
-                        .map(|draft| draft.read(cx).focus().clone())
-                } else {
-                    None
-                };
-                this.close_palette(cx);
-                match &item.action {
-                    PaletteAction::SwitchSession(path) => this
-                        .state
-                        .update(cx, |s, cx| s.switch_session(path.clone(), cx)),
-                    PaletteAction::SetModel { provider, model_id } => this
-                        .state
-                        .update(cx, |s, cx| s.set_model(provider, model_id, cx)),
-                    PaletteAction::SetThinking(level) => {
-                        this.state.update(cx, |s, cx| s.set_thinking(*level, cx))
-                    }
-                    PaletteAction::RunCommand(command) => {
-                        if let Some(draft) = &this.draft {
-                            draft.update(cx, |field, cx| field.set_text(format!("{command} "), cx));
-                        }
-                    }
-                    PaletteAction::NewChat => {
-                        this.state.update(cx, |s, cx| s.new_chat(cx));
-                    }
-                    PaletteAction::ExportHtml => {
-                        this.state.update(cx, |s, cx| s.export_html(cx));
-                    }
-                    PaletteAction::Compact => {
-                        this.state.update(cx, |s, cx| s.compact_now(cx));
-                    }
-                    PaletteAction::ToggleTheme => toggle_theme(cx),
+            this.close_palette(cx);
+            match &item.action {
+                PaletteAction::SwitchSession(path) => this
+                    .state
+                    .update(cx, |s, cx| s.switch_session(path.clone(), cx)),
+                PaletteAction::SetModel { provider, model_id } => this
+                    .state
+                    .update(cx, |s, cx| s.set_model(provider, model_id, cx)),
+                PaletteAction::SetThinking(level) => {
+                    this.state.update(cx, |s, cx| s.set_thinking(*level, cx))
                 }
-                // A picked command lands in the composer for editing; pi
-                // expands it on send.
-                if let (Some(draft), Some(focus)) = (&this.draft, composer_focus) {
-                    window.focus(&draft.read(cx).focus().clone(), cx);
-                    let _ = focus;
+                PaletteAction::RunCommand(command) => {
+                    if let Some(draft) = &this.draft {
+                        draft.update(cx, |field, cx| field.set_text(format!("{command} "), cx));
+                    }
                 }
-            });
-        });
-
-        let suggestions = Suggestions {
-            id: ("palette-suggest", gen_id).into(),
-            state: field.clone(),
-            trigger: Some(0),
-            rows: choices,
-            pick,
+                PaletteAction::NewChat => {
+                    this.state.update(cx, |s, cx| s.new_chat(cx));
+                }
+                PaletteAction::ExportHtml => {
+                    this.state.update(cx, |s, cx| s.export_html(cx));
+                }
+                PaletteAction::Compact => {
+                    this.state.update(cx, |s, cx| s.compact_now(cx));
+                }
+                PaletteAction::ToggleTheme => toggle_theme(cx),
+            }
+            // A picked command lands in the composer for editing; pi expands
+            // it on send.
+            if let (Some(draft), Some(focus)) = (&this.draft, composer_focus) {
+                window.focus(&draft.read(cx).focus().clone(), cx);
+                let _ = focus;
+            }
         };
+
+        // Rows: the picker's own row styling, with a click to run.
+        let mut rows: Vec<gpui::AnyElement> = Vec::new();
+        if items.is_empty() {
+            rows.push(
+                div()
+                    .px_3()
+                    .py_3()
+                    .text_color(theme.colors.fg_subtle)
+                    .child(i18n::t(cx, "find_none"))
+                    .into_any_element(),
+            );
+        }
+        for (ix, item) in items.iter().enumerate() {
+            let row_view = view.clone();
+            let row_item = item.clone();
+            let choice = Choice::new(format!("{gen_id}:{ix}"), item.label.clone())
+                .icon(kind_icon(item.kind))
+                .note(kind_label(item.kind));
+            rows.push(
+                marked_row(
+                    format!("palette-row-{gen_id}-{ix}"),
+                    &choice,
+                    None,
+                    ix == selected,
+                    None,
+                    cx,
+                )
+                .on_click(move |_, window, cx| {
+                    row_view.update(cx, |this, cx| {
+                        let item = row_item.clone();
+                        this.close_palette(cx);
+                        run_item(this, &item, window, cx);
+                    });
+                })
+                .into_any_element(),
+            );
+        }
+
+        let items_run = items.clone();
+        let items_len = items.len();
         Some(
             div()
                 .id("palette-overlay")
                 .absolute()
                 .inset_0()
                 .occlude()
-                .bg(gpui::rgba(0x00000040))
+                .bg(gpui::rgba(0x00000059))
                 .on_mouse_down(gpui::MouseButton::Left, {
                     let view = view.downgrade();
                     move |_, _, cx| {
@@ -842,17 +873,84 @@ impl PidoApp {
                         .right_0()
                         .flex()
                         .justify_center()
+                        // Clicks on the card must not fall through to the
+                        // scrim's close.
                         .child(
-                            // No overflow_hidden here: the picker's popup
-                            // extends below the card and would be clipped.
                             div()
-                                .w(gpui::px(560.))
+                                .id("palette-card")
+                                .w(gpui::px(640.))
+                                .flex()
+                                .flex_col()
                                 .rounded_lg()
                                 .border_1()
                                 .border_color(theme.colors.border)
                                 .bg(theme.colors.surface)
                                 .shadow_lg()
-                                .child(suggestions.wrap(field, window, cx)),
+                                .overflow_hidden()
+                                .on_mouse_down(gpui::MouseButton::Left, |_, _, _| {})
+                                // Arrows and Enter steer the palette before
+                                // they reach the input's own bindings.
+                                .capture_action({
+                                    let view = view.clone();
+                                    let items = items.clone();
+                                    move |_: &Up, _, cx| {
+                                        cx.stop_propagation();
+                                        view.update(cx, |this, cx| {
+                                            if this.palette_selected > 0 {
+                                                this.palette_selected -= 1;
+                                                cx.notify();
+                                            }
+                                        });
+                                        let _ = (&items, items_len);
+                                    }
+                                })
+                                .capture_action({
+                                    let view = view.clone();
+                                    move |_: &Down, _, cx| {
+                                        cx.stop_propagation();
+                                        view.update(cx, |this, cx| {
+                                            if this.palette_selected + 1 < items_len {
+                                                this.palette_selected += 1;
+                                                cx.notify();
+                                            }
+                                        });
+                                    }
+                                })
+                                .capture_action({
+                                    let view = view.clone();
+                                    let items = items_run.clone();
+                                    move |_: &Enter, window, cx| {
+                                        cx.stop_propagation();
+                                        view.update(cx, |this, cx| {
+                                            let Some(item) = items.get(this.palette_selected)
+                                            else {
+                                                return;
+                                            };
+                                            let item = item.clone();
+                                            run_item(this, &item, window, cx);
+                                        });
+                                    }
+                                })
+                                .child(
+                                    div()
+                                        .flex_none()
+                                        .px_3()
+                                        .py_2()
+                                        .border_b_1()
+                                        .border_color(theme.colors.border)
+                                        .child(field),
+                                )
+                                .child(
+                                    div()
+                                        .id("palette-list")
+                                        .flex_1()
+                                        .min_h_0()
+                                        .max_h(gpui::px(400.))
+                                        .overflow_y_scroll()
+                                        .flex()
+                                        .flex_col()
+                                        .children(rows),
+                                ),
                         ),
                 )
                 .into_any_element(),
