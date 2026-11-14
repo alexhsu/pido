@@ -57,8 +57,15 @@ pub fn render(state: &Entity<AppState>, app: &mut PidoApp, cx: &App) -> impl Int
         .iter()
         .map(|command| {
             let slash = format!("/{}", command.name);
+            // The picker's popup sizes to its widest row, so a full
+            // description would stretch it across the window; keep the hint
+            // to one short clause.
             let label = match command.description.as_deref() {
-                Some(note) if !note.is_empty() => format!("{slash} — {note}"),
+                Some(note) if !note.is_empty() => {
+                    let hint: String = note.chars().take(40).collect();
+                    let ellipsis = if note.chars().count() > 40 { "…" } else { "" };
+                    format!("{slash} — {hint}{ellipsis}")
+                }
                 _ => slash.clone(),
             };
             Choice::new(slash, label)
