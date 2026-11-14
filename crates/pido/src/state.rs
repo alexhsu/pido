@@ -80,6 +80,14 @@ pub enum TranscriptItem {
     },
     Assistant(Box<AssistantView>),
     Tool(ToolView),
+    /// A direct shell command (`bash` RPC): its output streamed in while
+    /// `running`; the id keys aborts and streamed deltas.
+    Shell {
+        id: String,
+        command: String,
+        output: String,
+        running: bool,
+    },
     Notice {
         kind: NoticeKind,
         text: String,
@@ -822,9 +830,15 @@ pub enum PaletteKind {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PaletteAction {
     SwitchSession(PathBuf),
-    SetModel { provider: String, model_id: String },
+    SetModel {
+        provider: String,
+        model_id: String,
+    },
     SetThinking(ThinkingLevel),
     RunCommand(String),
+    /// Insert a `!` prefix into the composer; typing after it runs the
+    /// rest as a shell command.
+    ShellTemplate,
     NewChat,
     ExportHtml,
     Compact,
@@ -916,6 +930,8 @@ pub struct AppState {
     pub last_project: Option<String>,
     /// Counter for staging image keys.
     next_image_key: u64,
+    /// Counter for direct shell command ids.
+    next_shell_id: u64,
     /// Extension commands, prompt templates and skills pi offers at `/`.
     pub commands: Vec<pi_rpc::protocol::CommandInfo>,
     /// Workspace files offered at `@`, as project-relative paths.
@@ -1016,6 +1032,7 @@ impl AppState {
                 notice: None,
                 last_project,
                 next_image_key: 1,
+                next_shell_id: 1,
                 commands: Vec::new(),
                 workspace_files: Vec::new(),
                 pending_images: Vec::new(),
@@ -2570,6 +2587,19 @@ impl AppState {
     /// appears immediately; on rejection it is removed and its text restored
     /// to the composer.
     pub fn send_text(&mut self, text: String, cx: &mut Context<Self>) {
+        // `!cmd` runs a shell command instead of prompting; `!!cmd` sends
+        // the literal text with one bang.
+        if let Some(rest) = text.strip_prefix('!') {
+            if let Some(literal) = rest.strip_prefix('!') {
+                if !literal.trim().is_empty() {
+                    self.send_text(literal.trim().to_string(), cx);
+                    return;
+                }
+            } else if !rest.trim().is_empty() {
+                self.run_shell_command(rest.trim(), false, cx);
+                return;
+            }
+        }
         if (text.trim().is_empty() && self.pending_images.is_empty()) || self.conn != Conn::Live {
             return;
         }
@@ -3015,6 +3045,90 @@ impl AppState {
         }
         self.queue_mode = mode;
         crate::settings::save_setting(|s| s.queue_mode = Some(mode.key().to_string()));
+        cx.notify();
+    }
+
+    /// Run a shell command directly (pi's `bash` command). Its output
+    /// streams into a transcript row while it runs, and joins the model's
+    /// context on the next prompt unless `exclude_from_context`.
+    pub fn run_shell_command(
+        &mut self,
+        command: &str,
+        exclude_from_context: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if self.conn != Conn::Live || command.trim().is_empty() {
+            return;
+        }
+        let Some(client) = self.client() else { return };
+        let id = format!("shell-{}", self.next_shell_id);
+        self.next_shell_id += 1;
+        self.transcript.push(TranscriptItem::Shell {
+            id: id.clone(),
+            command: command.to_string(),
+            output: String::new(),
+            running: true,
+        });
+        cx.notify();
+
+        let command = command.to_string();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    client.request(Command::Bash {
+                        command,
+                        exclude_from_context: exclude_from_context.then_some(true),
+                    })
+                })
+                .await;
+            this.update(cx, |s, cx| {
+                s.finish_shell(&id, result.err().map(|e| e.to_string()), cx);
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Abort a running shell command.
+    pub fn abort_shell(&mut self, id: &str, cx: &mut Context<Self>) {
+        let Some(client) = self.client() else { return };
+        let id = id.to_string();
+        cx.spawn(async move |this, cx| {
+            let _ = cx
+                .background_executor()
+                .spawn(async move { client.request(Command::AbortBash) })
+                .await;
+            this.update(cx, |s, cx| {
+                s.finish_shell(&id, Some("aborted".into()), cx);
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Mark a shell row finished; `error` explains an abnormal end.
+    fn finish_shell(&mut self, id: &str, error: Option<String>, cx: &mut Context<Self>) {
+        for item in self.transcript.iter_mut().rev() {
+            if let TranscriptItem::Shell {
+                id: row_id,
+                output,
+                running,
+                ..
+            } = item
+            {
+                if row_id == id && *running {
+                    if let Some(error) = error {
+                        output.push_str(&format!(
+                            "
+[{error}]"
+                        ));
+                    }
+                    *running = false;
+                    break;
+                }
+            }
+        }
         cx.notify();
     }
 
@@ -3906,6 +4020,9 @@ pub(crate) fn find_matches(items: &[TranscriptItem], query: &str) -> Vec<usize> 
                         card.result.as_deref().unwrap_or_default()
                     )
                 }
+                TranscriptItem::Shell {
+                    command, output, ..
+                } => format!("{command} {output}"),
                 TranscriptItem::Notice { text, .. } => text.to_string(),
                 TranscriptItem::Turn { .. } => String::new(),
             };
@@ -4307,6 +4424,7 @@ mod tests {
             pending_dialog: None,
             pending_images: Vec::new(),
             next_image_key: 1,
+            next_shell_id: 1,
             session_epoch: 0,
             pending_steers: Vec::new(),
             pending_follow_ups: Vec::new(),

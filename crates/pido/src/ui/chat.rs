@@ -720,6 +720,84 @@ fn render_item(
                 .child(Caption::new(text.clone()))
                 .into_any_element()
         }
+        // A direct shell command: `$ cmd` and its streamed output, mono, a
+        // stop button while it runs.
+        TranscriptItem::Shell {
+            id,
+            command,
+            output,
+            running,
+        } => {
+            let colors = cx.theme().colors.clone();
+            let stop_state = app.clone();
+            let stop_id = id.clone();
+            div()
+                .w_full()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .px_3()
+                .py_2()
+                .rounded_md()
+                .border_1()
+                .border_color(colors.border)
+                .bg(colors.surface)
+                .child(
+                    div().flex().items_center().gap_2().child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .font_family("monospace")
+                            .text_size(theme.text_size(TextSize::Sm))
+                            .child(ely_gpui_component::typography::SelectableText::new(
+                                ("shell-cmd", ix),
+                                gpui::SharedString::from(format!("$ {command}")),
+                            )),
+                    ),
+                )
+                .when(!output.is_empty(), |this| {
+                    this.child(
+                        div()
+                            .w_full()
+                            .max_h(gpui::px(280.))
+                            .overflow_hidden()
+                            .font_family("monospace")
+                            .text_size(theme.text_size(TextSize::Sm))
+                            .text_color(colors.fg_muted)
+                            .child(ely_gpui_component::typography::SelectableText::new(
+                                ("shell-out", ix),
+                                gpui::SharedString::from(output.clone()),
+                            )),
+                    )
+                })
+                .when(*running, |this| {
+                    this.child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(ely_gpui_component::chat::ThinkingIndicator::new((
+                                "shell-run",
+                                ix,
+                            )))
+                            .child({
+                                let stop_state = stop_state.clone();
+                                let stop_id = stop_id.clone();
+                                ely_gpui_component::buttons::Button::new(
+                                    ("shell-stop", ix),
+                                    i18n::t(cx, "stop"),
+                                )
+                                .variant(ely_gpui_component::buttons::ButtonVariant::Ghost)
+                                .size(ely_gpui_component::theme::ControlSize::Sm)
+                                .on_click(move |_, _, cx| {
+                                    let id = stop_id.clone();
+                                    stop_state.update(cx, |s, cx| s.abort_shell(&id, cx));
+                                })
+                            }),
+                    )
+                })
+                .into_any_element()
+        }
     }
 }
 

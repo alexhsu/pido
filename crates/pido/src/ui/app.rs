@@ -701,6 +701,10 @@ impl PidoApp {
                 PaletteAction::Compact,
             ),
             (i18n::t(cx, "theme").to_string(), PaletteAction::ToggleTheme),
+            (
+                i18n::t(cx, "shell_template").to_string(),
+                PaletteAction::ShellTemplate,
+            ),
         ];
         let state = self.state.clone();
         let items = state.read(cx).palette_items(&query, &actions);
@@ -760,6 +764,11 @@ impl PidoApp {
                 PaletteAction::RunCommand(command) => {
                     if let Some(draft) = &this.draft {
                         draft.update(cx, |field, cx| field.set_text(format!("{command} "), cx));
+                    }
+                }
+                PaletteAction::ShellTemplate => {
+                    if let Some(draft) = &this.draft {
+                        draft.update(cx, |field, cx| field.set_text("!", cx));
                     }
                 }
                 PaletteAction::NewChat => {

@@ -167,8 +167,13 @@ pub enum Command {
     /// Run a shell command now; output joins the LLM context on the next
     /// prompt. Streamed chunks arrive as `bash_execution_update` events
     /// carrying this command's id.
+    /// Run a shell command; output streams as `bash_execution_update` and
+    /// joins the conversation context unless `exclude_from_context` is set.
+    #[serde(rename_all = "camelCase")]
     Bash {
         command: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        exclude_from_context: Option<bool>,
     },
     AbortBash,
     GetSessionStats,
