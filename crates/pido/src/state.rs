@@ -2255,11 +2255,12 @@ impl AppState {
                             payload.leaf_id
                         );
                         let compacted = i18n::t(cx, "context_compacted").to_string();
+                        let branch = i18n::t(cx, "branch_left").to_string();
                         s.load_entries(
                             &payload.entries,
                             payload.leaf_id.as_deref(),
                             &compacted,
-                            &i18n::t(cx, "branch_left").to_string(),
+                            &branch,
                         );
                     }
                     Ok(None) => {}

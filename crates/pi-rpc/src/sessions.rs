@@ -442,21 +442,20 @@ pub fn search_content(root: &Path, query: &str) -> Vec<(PathBuf, String)> {
             let Ok(entry) = serde_json::from_str::<EntryTail>(line.trim_end()) else {
                 continue;
             };
-            if let Some(message) = &entry.message {
-                if let Some(text) = user_message_preview(message) {
-                    let lower = text.to_lowercase();
-                    if let Some(at) = lower.find(&needle) {
-                        let start = lower
-                            .char_indices()
-                            .map(|(ix, _)| ix)
-                            .filter(|ix| *ix <= at)
-                            .next_back()
-                            .unwrap_or(0);
-                        let snippet: String = lower[start..].chars().take(120).collect();
-                        hits.push((path.clone(), snippet));
-                        break;
-                    }
-                }
+            if let Some(text) = entry.message.as_ref().and_then(user_message_preview)
+                && let Some(at) = text.to_lowercase().find(&needle)
+            {
+                let lower = text.to_lowercase();
+                // Char boundary at or before the match; plain byte
+                // arithmetic would risk splitting a char.
+                let start = lower[..at]
+                    .char_indices()
+                    .map(|(ix, _)| ix)
+                    .rfind(|_| true)
+                    .unwrap_or(0);
+                let snippet: String = lower[start..].chars().take(120).collect();
+                hits.push((path.clone(), snippet));
+                break;
             }
         }
     }
