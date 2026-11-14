@@ -287,7 +287,6 @@ pub fn render_transcript(
                     gpui::list(list.clone(), {
                         let visible = visible.clone();
                         let app = state.clone();
-                        let hit_ix = hit_ix;
                         move |pos, _window, cx| {
                             let s = app.read(cx);
                             let ix = visible[pos];
