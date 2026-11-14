@@ -530,10 +530,10 @@ fn render_item(
                 .child(text)
                 .when(!running, |this| {
                     this.child(
-                        // The reference shows the down chevron while folded.
+                        // Open points down; folded points right.
                         ely_gpui_component::primitives::Disclosure::new(
                             ("turn-chevron", ix),
-                            !expanded,
+                            expanded,
                         )
                         .size(ely_gpui_component::theme::IconSize::Xs),
                     )
