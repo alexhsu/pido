@@ -343,12 +343,16 @@ pub fn render_transcript(
                                 .justify_center()
                                 .px_4()
                                 .child(
+                                    // The current match's row carries a left
+                                    // accent bar, never a full tint: matched
+                                    // rows can span the whole viewport, and a
+                                    // background would paint the screen.
                                     div()
                                         .w_full()
                                         .max_w(column)
                                         .min_w_0()
                                         .when(hit, |row| {
-                                            row.rounded_sm().bg(cx.theme().colors.info_subtle)
+                                            row.border_l_2().border_color(cx.theme().colors.info)
                                         })
                                         .child(render_item(
                                             &app,
