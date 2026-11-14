@@ -136,53 +136,6 @@ pub fn render(
                     ),
             )
         })
-        .child({
-            // TEMP v0.2 debug: drive find/palette by mouse.
-            let view_dbg_find = view.clone();
-            let view_dbg_pal = view.clone();
-            div()
-                .flex_none()
-                .px_4()
-                .pb_2()
-                .flex()
-                .gap_2()
-                .child(
-                    div()
-                        .id("debug-find")
-                        .cursor_pointer()
-                        .px_2()
-                        .py_1()
-                        .rounded_sm()
-                        .bg(colors.surface)
-                        .border_1()
-                        .border_color(colors.border)
-                        .child("DBG find")
-                        .on_click(move |_, window, cx| {
-                            view_dbg_find.update(cx, |this, cx| this.debug_find(window, cx));
-                        }),
-                )
-                .child(
-                    div()
-                        .id("debug-pal")
-                        .cursor_pointer()
-                        .px_2()
-                        .py_1()
-                        .rounded_sm()
-                        .bg(colors.surface)
-                        .border_1()
-                        .border_color(colors.border)
-                        .child("DBG pal")
-                        .on_click(move |_, window, cx| {
-                            view_dbg_pal.update(cx, |this, cx| {
-                                if this.palette.is_some() {
-                                    this.close_palette(cx);
-                                } else {
-                                    this.open_palette(window, cx);
-                                }
-                            });
-                        }),
-                )
-        })
         .when_some(search_field, |this, field| {
             // The session search: titles filter as you type, content matches
             // join in from the background pass.

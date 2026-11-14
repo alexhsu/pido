@@ -127,36 +127,6 @@ pub fn render_header(
                 ely_gpui_component::i18n::I18n::set_locale(next_locale, cx);
             }),
         )
-        // TEMP v0.2 debug: drive find/palette by mouse (keyboard injection
-        // is unavailable in the automation environment).
-        .child({
-            let view = view.clone();
-            ely_gpui_component::buttons::IconButton::new(
-                "debug-find",
-                ely_gpui_component::primitives::IconName::Search,
-            )
-            .variant(ely_gpui_component::buttons::ButtonVariant::Ghost)
-            .on_click(move |_, window, cx| {
-                view.update(cx, |this, cx| this.debug_find(window, cx));
-            })
-        })
-        .child({
-            let view = view.clone();
-            ely_gpui_component::buttons::IconButton::new(
-                "debug-palette",
-                ely_gpui_component::primitives::IconName::Command,
-            )
-            .variant(ely_gpui_component::buttons::ButtonVariant::Ghost)
-            .on_click(move |_, window, cx| {
-                view.update(cx, |this, cx| {
-                    if this.palette.is_some() {
-                        this.close_palette(cx);
-                    } else {
-                        this.open_palette(window, cx);
-                    }
-                });
-            })
-        })
         .child({
             let app = app.clone();
             ely_gpui_component::buttons::IconButton::new(
@@ -258,14 +228,6 @@ pub fn render_transcript(
     }
     let list = app.transcript_list.clone().expect("transcript list");
     let scroll = app.transcript_scroll.clone().expect("transcript scroll");
-    if app.find.is_some() {
-        log::info!(
-            "render_transcript: find active, top={:?} items={} visible={}",
-            list.logical_scroll_top(),
-            list.item_count(),
-            count
-        );
-    }
     let feed_count = list.item_count();
     let (away, fresh) = {
         let scroll = scroll.read(cx);

@@ -379,7 +379,7 @@ impl Render for PidoApp {
             .extension_dialog_overlay(&state, window, cx)
             .or_else(|| self.rename_dialog(cx))
             .or_else(|| self.remove_project_dialog(cx))
-            .or_else(|| self.palette_overlay(window, cx));
+            .or_else(|| self.palette_overlay(cx));
         // The right panel mounts into the split when open; closing drops the
         // pane, so the two-pane layout gets the full width back.
         let right = self
@@ -644,21 +644,12 @@ impl PidoApp {
             }
         }
         let pos = visible.iter().position(|&row| row == ix);
-        log::info!(
-            "find_step: ix={ix} pos={pos:?} list={}",
-            self.transcript_list.is_some()
-        );
         if let (Some(list), Some(pos)) = (&self.transcript_list, pos) {
             // Rows far from the viewport were never painted, so their cached
             // heights are estimates; remeasure before seeking or the jump
             // lands on a garbage offset.
             list.remeasure();
             list.scroll_to_reveal_item(pos);
-            log::info!(
-                "find_step: after scroll top={:?} count={}",
-                list.logical_scroll_top(),
-                list.item_count()
-            );
         }
         cx.notify();
     }
@@ -668,23 +659,6 @@ impl PidoApp {
         if self.palette.take().is_some() {
             cx.notify();
         }
-    }
-
-    /// TEMP v0.2 debug: open the find bar with a canned query and step twice.
-    pub fn debug_find(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        log::info!("debug_find: enter");
-        if self.find.is_none() {
-            self.toggle_find(window, cx);
-        }
-        if let Some(find) = &self.find {
-            let query = "的".to_string();
-            find.field.update(cx, |field, cx| field.set_text(query, cx));
-        }
-        log::info!("debug_find: step 1");
-        self.find_step(true, cx);
-        log::info!("debug_find: step 2");
-        self.find_step(true, cx);
-        log::info!("debug_find: done");
     }
 
     /// Open the command palette (Ctrl+K); it closes via the scrim, a pick,
@@ -706,11 +680,7 @@ impl PidoApp {
     /// The floating command palette: a query over sessions, models, thinking
     /// levels, pi commands and app actions, with the picker's own keyboard
     /// handling (arrows, Enter, Escape).
-    fn palette_overlay(
-        &mut self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Option<gpui::AnyElement> {
+    fn palette_overlay(&mut self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
         use ely_gpui_component::forms::{Choice, Down, Enter, Up, marked_row};
         use ely_gpui_component::primitives::IconName;
 
@@ -764,7 +734,6 @@ impl PidoApp {
         };
 
         let view = cx.entity();
-        let run_view = view.clone();
         let run_item = move |this: &mut PidoApp,
                              item: &PaletteItem,
                              window: &mut Window,
