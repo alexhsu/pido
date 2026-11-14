@@ -136,6 +136,37 @@ pub fn render(
                     ),
             )
         })
+        .child({
+            // TEMP v0.2 debug: drive find/palette by mouse.
+            let view_dbg_find = view.clone();
+            let view_dbg_pal = view.clone();
+            div()
+                .flex_none()
+                .px_4()
+                .pb_2()
+                .flex()
+                .gap_2()
+                .child(
+                    ely_gpui_component::buttons::Button::new("debug-find", "DBG find").on_click(
+                        move |_, window, cx| {
+                            view_dbg_find.update(cx, |this, cx| this.debug_find(window, cx));
+                        },
+                    ),
+                )
+                .child(
+                    ely_gpui_component::buttons::Button::new("debug-pal", "DBG pal").on_click(
+                        move |_, window, cx| {
+                            view_dbg_pal.update(cx, |this, cx| {
+                                if this.palette.is_some() {
+                                    this.close_palette(cx);
+                                } else {
+                                    this.open_palette(window, cx);
+                                }
+                            });
+                        },
+                    ),
+                )
+        })
         .when_some(search_field, |this, field| {
             // The session search: titles filter as you type, content matches
             // join in from the background pass.

@@ -625,8 +625,21 @@ impl PidoApp {
             .visible_rows()
             .iter()
             .position(|&row| row == ix);
+        log::info!(
+            "find_step: ix={ix} pos={pos:?} list={}",
+            self.transcript_list.is_some()
+        );
         if let (Some(list), Some(pos)) = (&self.transcript_list, pos) {
+            // Rows far from the viewport were never painted, so their cached
+            // heights are estimates; remeasure before seeking or the jump
+            // lands on a garbage offset.
+            list.remeasure();
             list.scroll_to_reveal_item(pos);
+            log::info!(
+                "find_step: after scroll top={:?} count={}",
+                list.logical_scroll_top(),
+                list.item_count()
+            );
         }
         cx.notify();
     }
@@ -638,9 +651,27 @@ impl PidoApp {
         }
     }
 
+    /// TEMP v0.2 debug: open the find bar with a canned query and step twice.
+    pub fn debug_find(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        log::info!("debug_find: enter");
+        if self.find.is_none() {
+            self.toggle_find(window, cx);
+        }
+        if let Some(find) = &self.find {
+            let query = "的".to_string();
+            find.field.update(cx, |field, cx| field.set_text(query, cx));
+        }
+        log::info!("debug_find: step 1");
+        self.find_step(true, cx);
+        log::info!("debug_find: step 2");
+        self.find_step(true, cx);
+        log::info!("debug_find: done");
+    }
+
     /// Open the command palette (Ctrl+K); it closes via the scrim, a pick,
     /// or Ctrl+K again.
     pub fn open_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        log::info!("open_palette: enter");
         self.palette_gen = self.palette_gen.wrapping_add(1);
         let field = cx.new(|cx| TextInput::new(window, cx).placeholder_key("palette_placeholder"));
         let focus = field.read(cx).focus().clone();
@@ -664,6 +695,7 @@ impl PidoApp {
         use ely_gpui_component::primitives::IconName;
 
         let palette = self.palette.as_ref()?;
+        log::info!("palette_overlay: rendering");
         let field = palette.field.clone();
         let gen_id = palette.open_gen;
         let query = field.read(cx).text().to_string();
@@ -795,6 +827,8 @@ impl PidoApp {
                         .flex()
                         .justify_center()
                         .child(
+                            // No overflow_hidden here: the picker's popup
+                            // extends below the card and would be clipped.
                             div()
                                 .w(gpui::px(560.))
                                 .rounded_lg()
@@ -802,7 +836,6 @@ impl PidoApp {
                                 .border_color(theme.colors.border)
                                 .bg(theme.colors.surface)
                                 .shadow_lg()
-                                .overflow_hidden()
                                 .child(suggestions.wrap(field, window, cx)),
                         ),
                 )
