@@ -754,6 +754,9 @@ pub struct ToolView {
     pub running: bool,
     pub failed: bool,
     pub result: Option<gpui::SharedString>,
+    /// Images the tool returned (read on a screenshot, most often), as
+    /// (base64 payload, mime); rendered under the text when the card opens.
+    pub images: Vec<(String, String)>,
     pub started: Instant,
     pub took: Option<Duration>,
 }
@@ -3579,6 +3582,7 @@ impl AppState {
                     card.took = Some(card.started.elapsed());
                     if let Some(result) = result.as_ref() {
                         card.result = Some(truncate_for_display(&result.text(), 2000).into());
+                        card.images = tool_images(result);
                     }
                 }
                 if is_error {
@@ -3836,6 +3840,7 @@ impl AppState {
                 running: false,
                 failed: false,
                 result: None,
+                images: Vec::new(),
                 started: Instant::now(),
                 took: None,
             }),
@@ -3964,10 +3969,21 @@ impl AppState {
                 }
                 AgentMessage::ToolResult(result) => {
                     let text = result.text();
+                    let images = result
+                        .content
+                        .iter()
+                        .filter_map(|block| match block {
+                            pi_rpc::protocol::ToolResultBlock::Image { data, mime_type } => {
+                                Some((data.clone(), mime_type.clone()))
+                            }
+                            _ => None,
+                        })
+                        .collect();
                     if let Some(card) = self.tool_card_mut(&result.tool_call_id) {
                         card.running = false;
                         card.failed = result.is_error;
                         card.result = Some(truncate_for_display(&text, 2000).into());
+                        card.images = images;
                     } else {
                         self.transcript.push(TranscriptItem::Tool(ToolView {
                             call_id: result.tool_call_id.clone(),
@@ -3976,6 +3992,7 @@ impl AppState {
                             running: false,
                             failed: result.is_error,
                             result: Some(truncate_for_display(&text, 2000).into()),
+                            images,
                             started: Instant::now(),
                             took: None,
                         }));
@@ -4136,6 +4153,20 @@ fn compaction_tokens(result: &serde_json::Value) -> Option<(u64, u64)> {
     let before = result.get("tokensBefore")?.as_u64()?;
     let after = result.get("estimatedTokensAfter")?.as_u64()?;
     Some((before, after))
+}
+
+/// The images a tool result carries, as (base64, mime) pairs.
+fn tool_images(result: &pi_rpc::protocol::ToolResultContent) -> Vec<(String, String)> {
+    result
+        .content
+        .iter()
+        .filter_map(|block| match block {
+            pi_rpc::protocol::ToolResultBlock::Image { data, mime_type } => {
+                Some((data.clone(), mime_type.clone()))
+            }
+            _ => None,
+        })
+        .collect()
 }
 
 /// `1_234_567` → `1.2M`, `15_000` → `15.0k` — a compact label for the
@@ -4370,6 +4401,29 @@ mod tests {
     }
 
     #[test]
+    fn tool_images_extracts_only_image_blocks() {
+        use pi_rpc::protocol::{ToolResultBlock, ToolResultContent};
+        let result = ToolResultContent {
+            content: vec![
+                ToolResultBlock::Text {
+                    text: "screenshot:".into(),
+                },
+                ToolResultBlock::Image {
+                    data: "aGVsbG8=".into(),
+                    mime_type: "image/png".into(),
+                },
+                ToolResultBlock::Unknown,
+            ],
+            details: None,
+        };
+        let images = tool_images(&result);
+        assert_eq!(
+            images,
+            vec![("aGVsbG8=".to_string(), "image/png".to_string())]
+        );
+    }
+
+    #[test]
     fn compact_tokens_label_scales() {
         assert_eq!(compact_tokens_label(900), "900");
         assert_eq!(compact_tokens_label(15_000), "15.0k");
@@ -4599,6 +4653,7 @@ mod tests {
                 running: false,
                 failed: false,
                 result: None,
+                images: Vec::new(),
                 started: Instant::now(),
                 took: None,
             }),
@@ -4781,6 +4836,7 @@ mod tests {
                 running: false,
                 failed: false,
                 result: Some("ls -la".into()),
+                images: Vec::new(),
                 started: Instant::now(),
                 took: None,
             }),

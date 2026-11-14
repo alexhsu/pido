@@ -702,7 +702,55 @@ fn render_item(
             if let Some(took) = card.took {
                 rendered = rendered.took(took);
             }
-            div().px_1().child(rendered).into_any_element()
+            // Tool-returned images (a screenshot read, most often) render
+            // under the card; base64 payloads get stable ids so gpui caches
+            // their decode.
+            let image_elements: Vec<_> = card
+                .images
+                .iter()
+                .enumerate()
+                .map(|(image_ix, (data, mime))| {
+                    let format = if mime.contains("jpeg") || mime.contains("jpg") {
+                        gpui::ImageFormat::Jpeg
+                    } else {
+                        gpui::ImageFormat::Png
+                    };
+                    gpui::img(gpui::ImageSource::Image(std::sync::Arc::new(gpui::Image {
+                        format,
+                        bytes: data.clone().into_bytes(),
+                        id: image_ix as u64 + 1,
+                    })))
+                    .max_h(gpui::px(220.))
+                    .rounded_sm()
+                })
+                .collect::<Vec<_>>();
+            let wrap = div().px_1().child(rendered);
+            let with_copy = if card.result.is_some() {
+                let copy = card.result.clone().unwrap_or_default();
+                wrap.child(
+                    div().flex().justify_end().child(
+                        ely_gpui_component::buttons::IconButton::new(
+                            ("tool-copy", ix),
+                            ely_gpui_component::primitives::IconName::Copy,
+                        )
+                        .variant(ely_gpui_component::buttons::ButtonVariant::Ghost)
+                        .size(ely_gpui_component::theme::ControlSize::Sm)
+                        .tooltip(i18n::t(cx, "copy_message"))
+                        .on_click(move |_, _, cx| {
+                            cx.write_to_clipboard(gpui::ClipboardItem::new_string(
+                                copy.to_string(),
+                            ));
+                        }),
+                    ),
+                )
+            } else {
+                wrap
+            };
+            if image_elements.is_empty() {
+                with_copy.into_any_element()
+            } else {
+                with_copy.children(image_elements).into_any_element()
+            }
         }
         TranscriptItem::Notice { .. } if folded => div().into_any_element(),
         TranscriptItem::Notice { kind, text } => {
