@@ -9,7 +9,8 @@ use gpui::{
     Styled, Window, actions, div,
 };
 
-use crate::state::{AppState, Conn};
+use crate::i18n;
+use crate::state::{AppState, Conn, PaletteAction, PaletteKind};
 use crate::ui::{chat, composer, sidebar, welcome};
 
 actions!(
@@ -98,6 +99,9 @@ pub struct PidoApp {
     pub find: Option<FindState>,
     /// The command palette, while Ctrl+K has it open.
     pub palette: Option<PaletteState>,
+    /// Bumped each time the palette opens; keys its picker state so a stale
+    /// dismissal never sticks.
+    palette_gen: u64,
 }
 
 /// The transcript find bar: the query field, the rows that match and which
@@ -191,6 +195,7 @@ impl PidoApp {
             transcript_fresh: 0,
             find: None,
             palette: None,
+            palette_gen: 0,
         };
         app.observe_window_for_quit(cx);
         app
@@ -349,7 +354,8 @@ impl Render for PidoApp {
         let overlay = self
             .extension_dialog_overlay(&state, window, cx)
             .or_else(|| self.rename_dialog(cx))
-            .or_else(|| self.remove_project_dialog(cx));
+            .or_else(|| self.remove_project_dialog(cx))
+            .or_else(|| self.palette_overlay(window, cx));
         // The right panel mounts into the split when open; closing drops the
         // pane, so the two-pane layout gets the full width back.
         let right = self
@@ -462,6 +468,13 @@ impl Render for PidoApp {
                     }))
                     .on_action(cx.listener(|this, _: &Find, window, cx| {
                         this.toggle_find(window, cx);
+                    }))
+                    .on_action(cx.listener(|this, _: &Palette, window, cx| {
+                        if this.palette.is_some() {
+                            this.close_palette(cx);
+                        } else {
+                            this.open_palette(window, cx);
+                        }
                     }))
                     .on_action(cx.listener(|this, _: &PinSession, _window, cx| {
                         if let Some(file) = this.state.read(cx).session_file.clone() {
@@ -596,6 +609,178 @@ impl PidoApp {
         if self.palette.take().is_some() {
             cx.notify();
         }
+    }
+
+    /// Open the command palette (Ctrl+K); it closes via the scrim, a pick,
+    /// or Ctrl+K again.
+    pub fn open_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.palette_gen = self.palette_gen.wrapping_add(1);
+        let field = cx.new(|cx| TextInput::new(window, cx).placeholder_key("palette_placeholder"));
+        let focus = field.read(cx).focus().clone();
+        window.focus(&focus, cx);
+        self.palette = Some(PaletteState {
+            field,
+            open_gen: self.palette_gen,
+        });
+        cx.notify();
+    }
+
+    /// The floating command palette: a query over sessions, models, thinking
+    /// levels, pi commands and app actions, with the picker's own keyboard
+    /// handling (arrows, Enter, Escape).
+    fn palette_overlay(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui::AnyElement> {
+        use ely_gpui_component::forms::{Choice, Suggestions};
+        use ely_gpui_component::primitives::IconName;
+
+        let palette = self.palette.as_ref()?;
+        let field = palette.field.clone();
+        let gen_id = palette.open_gen;
+        let query = field.read(cx).text().to_string();
+        let theme = cx.theme();
+
+        let actions: Vec<(String, PaletteAction)> = vec![
+            (i18n::t(cx, "new_chat").to_string(), PaletteAction::NewChat),
+            (
+                i18n::t(cx, "export_html").to_string(),
+                PaletteAction::ExportHtml,
+            ),
+            (
+                i18n::t(cx, "compact_now").to_string(),
+                PaletteAction::Compact,
+            ),
+            (i18n::t(cx, "theme").to_string(), PaletteAction::ToggleTheme),
+        ];
+        let state = self.state.clone();
+        let pick_items = state.read(cx).palette_items(&query, &actions);
+        let kind_label = |kind: PaletteKind| -> gpui::SharedString {
+            i18n::t(
+                cx,
+                match kind {
+                    PaletteKind::Command => "kind_command",
+                    PaletteKind::Model => "kind_model",
+                    PaletteKind::Thinking => "kind_thinking",
+                    PaletteKind::Session => "kind_session",
+                    PaletteKind::Action => "kind_action",
+                },
+            )
+        };
+        let kind_icon = |kind: PaletteKind| -> IconName {
+            match kind {
+                PaletteKind::Command => IconName::Terminal,
+                PaletteKind::Model => IconName::Cpu,
+                PaletteKind::Thinking => IconName::Lightbulb,
+                PaletteKind::Session => IconName::MessageSquareDiff,
+                PaletteKind::Action => IconName::Zap,
+            }
+        };
+        let choices = pick_items
+            .iter()
+            .enumerate()
+            .map(|(ix, item)| {
+                Choice::new(format!("{gen_id}:{ix}"), item.label.clone())
+                    .icon(kind_icon(item.kind))
+                    .note(kind_label(item.kind))
+            })
+            .collect::<Vec<_>>();
+
+        let view = cx.entity();
+        let pick_view = view.clone();
+        let pick = std::rc::Rc::new(move |at: usize, window: &mut Window, cx: &mut App| {
+            let Some(item) = pick_items.get(at) else {
+                return;
+            };
+            let item = item.clone();
+            pick_view.update(cx, |this, cx| {
+                let is_command = matches!(item.action, PaletteAction::RunCommand(_));
+                let composer_focus = if is_command {
+                    this.draft
+                        .as_ref()
+                        .map(|draft| draft.read(cx).focus().clone())
+                } else {
+                    None
+                };
+                this.close_palette(cx);
+                match &item.action {
+                    PaletteAction::SwitchSession(path) => this
+                        .state
+                        .update(cx, |s, cx| s.switch_session(path.clone(), cx)),
+                    PaletteAction::SetModel { provider, model_id } => this
+                        .state
+                        .update(cx, |s, cx| s.set_model(provider, model_id, cx)),
+                    PaletteAction::SetThinking(level) => {
+                        this.state.update(cx, |s, cx| s.set_thinking(*level, cx))
+                    }
+                    PaletteAction::RunCommand(command) => {
+                        if let Some(draft) = &this.draft {
+                            draft.update(cx, |field, cx| field.set_text(format!("{command} "), cx));
+                        }
+                    }
+                    PaletteAction::NewChat => {
+                        this.state.update(cx, |s, cx| s.new_chat(cx));
+                    }
+                    PaletteAction::ExportHtml => {
+                        this.state.update(cx, |s, cx| s.export_html(cx));
+                    }
+                    PaletteAction::Compact => {
+                        this.state.update(cx, |s, cx| s.compact_now(cx));
+                    }
+                    PaletteAction::ToggleTheme => toggle_theme(cx),
+                }
+                // A picked command lands in the composer for editing; pi
+                // expands it on send.
+                if let (Some(draft), Some(focus)) = (&this.draft, composer_focus) {
+                    window.focus(&draft.read(cx).focus().clone(), cx);
+                    let _ = focus;
+                }
+            });
+        });
+
+        let suggestions = Suggestions {
+            id: ("palette-suggest", gen_id).into(),
+            state: field.clone(),
+            trigger: Some(0),
+            rows: choices,
+            pick,
+        };
+        Some(
+            div()
+                .id("palette-overlay")
+                .absolute()
+                .inset_0()
+                .occlude()
+                .bg(gpui::rgba(0x00000040))
+                .on_mouse_down(gpui::MouseButton::Left, {
+                    let view = view.downgrade();
+                    move |_, _, cx| {
+                        view.update(cx, |this, cx| this.close_palette(cx)).ok();
+                    }
+                })
+                .child(
+                    div()
+                        .absolute()
+                        .top_10()
+                        .left_0()
+                        .right_0()
+                        .flex()
+                        .justify_center()
+                        .child(
+                            div()
+                                .w(gpui::px(560.))
+                                .rounded_lg()
+                                .border_1()
+                                .border_color(theme.colors.border)
+                                .bg(theme.colors.surface)
+                                .shadow_lg()
+                                .overflow_hidden()
+                                .child(suggestions.wrap(field, window, cx)),
+                        ),
+                )
+                .into_any_element(),
+        )
     }
 
     /// The panel's shell, spawned on first use; a dead one spawns again.

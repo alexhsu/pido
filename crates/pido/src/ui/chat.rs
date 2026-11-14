@@ -10,7 +10,6 @@ use gpui::{
     AnyElement, App, Entity, InteractiveElement, IntoElement, ParentElement, SharedString,
     StatefulInteractiveElement, Styled, Window, div, prelude::FluentBuilder,
 };
-use pi_rpc::protocol::ThinkingLevel;
 
 use crate::i18n;
 use crate::state::{AppState, AssistantView, NoticeKind, TranscriptItem};
@@ -817,20 +816,6 @@ pub fn render_notice(
             ely_gpui_component::buttons::Button::new("dismiss", i18n::t(cx, "dismiss"))
                 .on_click(move |_, _, cx| app.update(cx, |s, cx| s.dismiss_notice(cx))),
         )
-}
-
-/// Wire name for a thinking level.
-pub fn level_slug(level: ThinkingLevel) -> &'static str {
-    match level {
-        ThinkingLevel::Off => "off",
-        ThinkingLevel::Minimal => "minimal",
-        ThinkingLevel::Low => "low",
-        ThinkingLevel::Medium => "medium",
-        ThinkingLevel::High => "high",
-        ThinkingLevel::Xhigh => "xhigh",
-        ThinkingLevel::Max => "max",
-        ThinkingLevel::Unknown => "unknown",
-    }
 }
 
 #[cfg(test)]

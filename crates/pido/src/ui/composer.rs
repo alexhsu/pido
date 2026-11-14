@@ -16,9 +16,9 @@ use gpui::{
 };
 
 use crate::i18n;
+use crate::state::level_slug;
 use crate::state::{AppState, QueueChoice};
 use crate::ui::app::PidoApp;
-use crate::ui::chat::level_slug;
 
 /// Render the composer block. While the agent runs, Enter sends a steering
 /// message and a separate stop button aborts the run.

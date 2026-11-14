@@ -793,6 +793,41 @@ impl QueueChoice {
     }
 }
 
+/// The command palette's entry categories; the view maps these to icons and
+/// localized labels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PaletteKind {
+    Command,
+    Model,
+    Thinking,
+    Session,
+    Action,
+}
+
+/// What running a palette entry does.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PaletteAction {
+    SwitchSession(PathBuf),
+    SetModel { provider: String, model_id: String },
+    SetThinking(ThinkingLevel),
+    RunCommand(String),
+    NewChat,
+    ExportHtml,
+    Compact,
+    ToggleTheme,
+}
+
+/// One command-palette entry, as plain data so the list stays testable. The
+/// view supplies icons and the category's localized label.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PaletteItem {
+    pub kind: PaletteKind,
+    /// A stable row value; the picker keys rows by it.
+    pub value: String,
+    pub label: String,
+    pub action: PaletteAction,
+}
+
 pub struct AppState {
     pub conn: Conn,
     pub environment: Environment,
@@ -1431,6 +1466,86 @@ impl AppState {
             })
             .map(|(ix, _)| ix)
             .collect()
+    }
+
+    /// The palette's entries for `query`, in pick order: pi commands, models,
+    /// thinking levels, sessions, then app actions — lowercase substring
+    /// filter, capped. The four app actions carry their labels from the
+    /// caller (they are localized there).
+    pub fn palette_items(
+        &self,
+        query: &str,
+        actions: &[(String, PaletteAction)],
+    ) -> Vec<PaletteItem> {
+        const CAP: usize = 15;
+        let needle = query.trim().to_lowercase();
+        let mut items: Vec<PaletteItem> = Vec::new();
+        let fits = |len: usize, label: &str| {
+            len < CAP && (needle.is_empty() || label.to_lowercase().contains(&needle))
+        };
+        for command in &self.commands {
+            let label = format!("/{}", command.name);
+            if fits(items.len(), &label) {
+                items.push(PaletteItem {
+                    kind: PaletteKind::Command,
+                    value: format!("command:{}", command.name),
+                    label,
+                    action: PaletteAction::RunCommand(format!("/{}", command.name)),
+                });
+            }
+        }
+        for model in &self.models {
+            if fits(items.len(), &model.name) {
+                items.push(PaletteItem {
+                    kind: PaletteKind::Model,
+                    value: format!("model:{}", model.id),
+                    label: model.name.clone(),
+                    action: PaletteAction::SetModel {
+                        provider: model.provider.clone().unwrap_or_default(),
+                        model_id: model.id.clone(),
+                    },
+                });
+            }
+        }
+        for &level in &self.thinking_levels {
+            let label = level_slug(level).to_string();
+            if fits(items.len(), &label) {
+                items.push(PaletteItem {
+                    kind: PaletteKind::Thinking,
+                    value: format!("thinking:{label}"),
+                    label,
+                    action: PaletteAction::SetThinking(level),
+                });
+            }
+        }
+        for group in &self.session_groups {
+            for session in &group.sessions {
+                let label = session
+                    .name
+                    .clone()
+                    .or_else(|| session.preview.clone())
+                    .unwrap_or_else(|| session.session_id.clone());
+                if fits(items.len(), &label) {
+                    items.push(PaletteItem {
+                        kind: PaletteKind::Session,
+                        value: format!("session:{}", session.session_id),
+                        label,
+                        action: PaletteAction::SwitchSession(session.path.clone()),
+                    });
+                }
+            }
+        }
+        for (label, action) in actions {
+            if fits(items.len(), label) {
+                items.push(PaletteItem {
+                    kind: PaletteKind::Action,
+                    value: format!("action:{label}"),
+                    label: label.clone(),
+                    action: action.clone(),
+                });
+            }
+        }
+        items
     }
 
     /// The draft row for the session `new_chat` just opened: pi already knows
@@ -3640,6 +3755,20 @@ pub(crate) fn find_matches(items: &[TranscriptItem], query: &str) -> Vec<usize> 
         .collect()
 }
 
+/// Wire name for a thinking level.
+pub fn level_slug(level: ThinkingLevel) -> &'static str {
+    match level {
+        ThinkingLevel::Off => "off",
+        ThinkingLevel::Minimal => "minimal",
+        ThinkingLevel::Low => "low",
+        ThinkingLevel::Medium => "medium",
+        ThinkingLevel::High => "high",
+        ThinkingLevel::Xhigh => "xhigh",
+        ThinkingLevel::Max => "max",
+        ThinkingLevel::Unknown => "unknown",
+    }
+}
+
 /// The fork point of the row at `ix`: the text of the user prompt it hangs
 /// from, and which occurrence of that text it is, so duplicate prompts land
 /// on the right entry. Hovering a user prompt forks from itself; hovering an
@@ -4276,6 +4405,65 @@ mod tests {
             !turn_folded_for(&state.transcript, 0, &none),
             "the prompt itself never folds"
         );
+    }
+
+    #[test]
+    fn palette_items_filter_cap_and_order() {
+        let mut state = empty_state();
+        state.commands = vec![pi_rpc::protocol::CommandInfo {
+            name: "review-pr".into(),
+            description: None,
+            source: None,
+            location: None,
+            path: None,
+        }];
+        state.models = vec![pi_rpc::protocol::Model {
+            id: "gpt".into(),
+            name: "GPT-5".into(),
+            api: None,
+            provider: Some("openai".into()),
+            base_url: None,
+            reasoning: false,
+            input: Vec::new(),
+            context_window: None,
+            max_tokens: None,
+            cost: None,
+        }];
+        state.thinking_levels = vec![ThinkingLevel::High];
+        state.session_groups = vec![SessionGroup {
+            cwd: "D:/a".into(),
+            sessions: vec![super::tests::summary("D:/a", "s1", "D:/a/s1.jsonl")],
+        }];
+        let actions = vec![("New chat".to_string(), PaletteAction::NewChat)];
+
+        // Order: command, model, thinking, session, action.
+        let items = state.palette_items("", &actions);
+        let kinds: Vec<PaletteKind> = items.iter().map(|item| item.kind).collect();
+        assert_eq!(
+            kinds,
+            [
+                PaletteKind::Command,
+                PaletteKind::Model,
+                PaletteKind::Thinking,
+                PaletteKind::Session,
+                PaletteKind::Action,
+            ]
+        );
+
+        // The query filters across every kind.
+        let kinds: Vec<PaletteKind> = state
+            .palette_items("gpt", &actions)
+            .iter()
+            .map(|item| item.kind)
+            .collect();
+        assert_eq!(kinds, [PaletteKind::Model]);
+        let kinds: Vec<PaletteKind> = state
+            .palette_items("session s1", &actions)
+            .iter()
+            .map(|item| item.kind)
+            .collect();
+        assert_eq!(kinds, [PaletteKind::Session]);
+        assert!(state.palette_items("zzz", &actions).is_empty());
     }
 
     #[test]
