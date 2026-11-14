@@ -26,6 +26,8 @@ fn main() {
                 gpui::KeyBinding::new("ctrl-alt-g", ui::app::RenameSession, None),
                 gpui::KeyBinding::new("ctrl-alt-f", ui::app::ForkSession, None),
                 gpui::KeyBinding::new("ctrl-shift-a", ui::app::ArchiveSession, None),
+                gpui::KeyBinding::new("ctrl-f", ui::app::Find, None),
+                gpui::KeyBinding::new("ctrl-k", ui::app::Palette, None),
             ]);
             // The terminal's own chords (copy/paste/clear/find) are scoped to
             // the terminal's focus, so they sit alongside the app's.

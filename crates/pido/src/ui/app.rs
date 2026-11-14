@@ -14,7 +14,15 @@ use crate::ui::{chat, composer, sidebar, welcome};
 
 actions!(
     pido,
-    [Stop, PinSession, RenameSession, ForkSession, ArchiveSession]
+    [
+        Stop,
+        PinSession,
+        RenameSession,
+        ForkSession,
+        ArchiveSession,
+        Find,
+        Palette
+    ]
 );
 
 pub const HEADER_HEIGHT: f32 = 52.;
@@ -86,6 +94,28 @@ pub struct PidoApp {
     /// rows arrived while away (the jump-to-latest badge).
     pub transcript_away: bool,
     pub transcript_fresh: usize,
+    /// The transcript find bar, while Ctrl+F has it open.
+    pub find: Option<FindState>,
+    /// The command palette, while Ctrl+K has it open.
+    pub palette: Option<PaletteState>,
+}
+
+/// The transcript find bar: the query field, the rows that match and which
+/// match is current. Matches recompute every render.
+#[derive(Clone)]
+pub struct FindState {
+    pub field: gpui::Entity<TextInput>,
+    pub query: String,
+    pub matches: Vec<usize>,
+    pub current: usize,
+}
+
+/// The command palette: its query field and an id generation that resets
+/// the suggestion picker each time it opens.
+#[derive(Clone)]
+pub struct PaletteState {
+    pub field: gpui::Entity<TextInput>,
+    pub open_gen: u64,
 }
 
 /// The right panel's two tabs.
@@ -159,6 +189,8 @@ impl PidoApp {
             list_epoch: 0,
             transcript_away: false,
             transcript_fresh: 0,
+            find: None,
+            palette: None,
         };
         app.observe_window_for_quit(cx);
         app
@@ -238,6 +270,21 @@ impl Render for PidoApp {
         self.window_size = Some((f32::from(bounds.size.width), f32::from(bounds.size.height)));
         let state = self.state.clone();
         let live = matches!(state.read(cx).conn, Conn::Live | Conn::Reconnecting { .. });
+
+        // The find bar's matches track its query and the live transcript.
+        if let Some(find) = &mut self.find {
+            let query = find.field.read(cx).text().trim().to_string();
+            if query != find.query {
+                find.query = query.clone();
+                find.current = 0;
+            }
+            find.matches = crate::state::find_matches(state.read(cx).transcript.as_slice(), &query);
+            find.current = if find.matches.is_empty() {
+                0
+            } else {
+                find.current.min(find.matches.len() - 1)
+            };
+        }
 
         if live && !self.composer_focused {
             if let Some(draft) = &self.draft {
@@ -395,8 +442,16 @@ impl Render for PidoApp {
                     // consume Escape, so this also works while the composer is
                     // focused.
                     .on_action(cx.listener(|this, _: &Stop, _window, cx| {
-                        // Esc backs out of the right panel before it stops a
-                        // run.
+                        // Esc backs out of the palette, the find bar and the
+                        // right panel before it stops a run.
+                        if this.palette.is_some() {
+                            this.close_palette(cx);
+                            return;
+                        }
+                        if this.find.is_some() {
+                            this.close_find(cx);
+                            return;
+                        }
                         if this.right_open {
                             this.close_right(cx);
                             return;
@@ -404,6 +459,9 @@ impl Render for PidoApp {
                         if this.state.read(cx).streaming {
                             this.state.update(cx, |s, cx| s.stop(cx));
                         }
+                    }))
+                    .on_action(cx.listener(|this, _: &Find, window, cx| {
+                        this.toggle_find(window, cx);
                     }))
                     .on_action(cx.listener(|this, _: &PinSession, _window, cx| {
                         if let Some(file) = this.state.read(cx).session_file.clone() {
@@ -469,6 +527,75 @@ impl PidoApp {
             s.right_open = Some(false);
         });
         cx.notify();
+    }
+
+    /// Open the transcript find bar, or refocus it when already open.
+    pub fn toggle_find(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(find) = &self.find {
+            let focus = find.field.read(cx).focus().clone();
+            window.focus(&focus, cx);
+            cx.notify();
+            return;
+        }
+        if self.state.read(cx).transcript.is_empty() {
+            return;
+        }
+        let field = cx.new(|cx| TextInput::new(window, cx).placeholder_key("find_placeholder"));
+        cx.subscribe(&field, move |this, _, event: &InputEvent, cx| {
+            if *event == InputEvent::Submit {
+                this.find_step(true, cx);
+            }
+        })
+        .detach();
+        let focus = field.read(cx).focus().clone();
+        window.focus(&focus, cx);
+        self.find = Some(FindState {
+            field,
+            query: String::new(),
+            matches: Vec::new(),
+            current: 0,
+        });
+        cx.notify();
+    }
+
+    pub fn close_find(&mut self, cx: &mut Context<Self>) {
+        if self.find.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    /// Step to the next (or previous) match and reveal its row.
+    pub fn find_step(&mut self, forward: bool, cx: &mut Context<Self>) {
+        let Some(find) = &mut self.find else {
+            return;
+        };
+        if find.matches.is_empty() {
+            return;
+        }
+        let len = find.matches.len();
+        find.current = if forward {
+            (find.current + 1) % len
+        } else {
+            (find.current + len - 1) % len
+        };
+        let ix = find.matches[find.current];
+        let pos = self
+            .state
+            .read(cx)
+            .visible_rows()
+            .iter()
+            .position(|&row| row == ix);
+        if let (Some(list), Some(pos)) = (&self.transcript_list, pos) {
+            list.scroll_to_reveal_item(pos);
+        }
+        cx.notify();
+    }
+
+    /// Close the command palette.
+    pub fn close_palette(&mut self, cx: &mut Context<Self>) {
+        if self.palette.take().is_some() {
+            cx.notify();
+        }
     }
 
     /// The panel's shell, spawned on first use; a dead one spawns again.

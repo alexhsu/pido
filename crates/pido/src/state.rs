@@ -1411,6 +1411,28 @@ impl AppState {
         )
     }
 
+    /// The transcript indices that render right now: folded tool rows and
+    /// folded content-less assistant rows stay out of the list entirely, so
+    /// hidden content keeps no slot. List rows address this order.
+    pub fn visible_rows(&self) -> Vec<usize> {
+        self.transcript
+            .iter()
+            .enumerate()
+            .filter(|(ix, item)| match item {
+                TranscriptItem::Tool(_) => {
+                    !turn_folded_for(&self.transcript, *ix, &self.expanded_turns)
+                }
+                TranscriptItem::Assistant(view) => {
+                    !(turn_folded_for(&self.transcript, *ix, &self.expanded_turns)
+                        && view.text().is_empty()
+                        && view.error.is_none())
+                }
+                _ => true,
+            })
+            .map(|(ix, _)| ix)
+            .collect()
+    }
+
     /// The draft row for the session `new_chat` just opened: pi already knows
     /// the file path but has not written the file, so a scan cannot list it.
     /// None once the scan holds that path.
@@ -3587,6 +3609,37 @@ impl AppState {
     }
 }
 
+/// The transcript rows whose visible text contains `query`, case-
+/// insensitively — user prompts, assistant text, tool cards (name and
+/// result) and notices. Status lines carry nothing to find.
+pub(crate) fn find_matches(items: &[TranscriptItem], query: &str) -> Vec<usize> {
+    let needle = query.trim().to_lowercase();
+    if needle.is_empty() {
+        return Vec::new();
+    }
+    items
+        .iter()
+        .enumerate()
+        .filter(|(_, item)| {
+            let haystack = match item {
+                TranscriptItem::User { text, .. } => text.to_string(),
+                TranscriptItem::Assistant(view) => view.text().to_string(),
+                TranscriptItem::Tool(card) => {
+                    format!(
+                        "{} {}",
+                        card.name,
+                        card.result.as_deref().unwrap_or_default()
+                    )
+                }
+                TranscriptItem::Notice { text, .. } => text.to_string(),
+                TranscriptItem::Turn { .. } => String::new(),
+            };
+            haystack.to_lowercase().contains(&needle)
+        })
+        .map(|(ix, _)| ix)
+        .collect()
+}
+
 /// The fork point of the row at `ix`: the text of the user prompt it hangs
 /// from, and which occurrence of that text it is, so duplicate prompts land
 /// on the right entry. Hovering a user prompt forks from itself; hovering an
@@ -4223,6 +4276,56 @@ mod tests {
             !turn_folded_for(&state.transcript, 0, &none),
             "the prompt itself never folds"
         );
+    }
+
+    #[test]
+    fn find_matches_scans_visible_text_case_insensitively() {
+        let user = |text: &'static str| TranscriptItem::User {
+            text: text.into(),
+            time: None,
+        };
+        let assistant = |text: &'static str| {
+            TranscriptItem::Assistant(Box::new(AssistantView::from_message(
+                &pi_rpc::protocol::AssistantMessage {
+                    content: vec![pi_rpc::protocol::AssistantContent::Text { text: text.into() }],
+                    api: None,
+                    provider: None,
+                    model: None,
+                    usage: None,
+                    stop_reason: None,
+                    error_message: None,
+                    timestamp: 1.0,
+                },
+            )))
+        };
+        let items = vec![
+            user("Rust async pinning"),
+            TranscriptItem::Turn {
+                started: Instant::now(),
+                took: None,
+            },
+            assistant("the pin stays"),
+            TranscriptItem::Tool(ToolView {
+                call_id: "c".into(),
+                name: "bash".into(),
+                args: None,
+                running: false,
+                failed: false,
+                result: Some("ls -la".into()),
+                started: Instant::now(),
+                took: None,
+            }),
+            TranscriptItem::Notice {
+                kind: NoticeKind::Info,
+                text: "reconnected".into(),
+            },
+        ];
+        assert_eq!(find_matches(&items, "RUST"), vec![0], "user text");
+        assert_eq!(find_matches(&items, "PIN"), vec![0, 2], "case folds");
+        assert_eq!(find_matches(&items, "ls -la"), vec![3], "tool results");
+        assert_eq!(find_matches(&items, "connect"), vec![4], "notices");
+        assert!(find_matches(&items, "  ").is_empty(), "blank query");
+        assert!(find_matches(&items, "zzz").is_empty());
     }
 
     #[test]

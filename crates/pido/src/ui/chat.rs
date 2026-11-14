@@ -198,24 +198,7 @@ pub fn render_transcript(
 
     // Folded content must not exist in the list at all: an empty row would
     // still hold its slot, so the hidden tool calls would keep their space.
-    // Rows that show something map back to their transcript index. A folded
-    // assistant row whose thinking is away and that carries no text or error
-    // (pi's tool-call-only messages) shows nothing but its hover footer —
-    // out it goes, same as the tools.
-    let folded_at = |ix: usize| crate::state::turn_folded_for(&s.transcript, ix, &s.expanded_turns);
-    let visible: Vec<usize> = s
-        .transcript
-        .iter()
-        .enumerate()
-        .filter(|(ix, item)| match item {
-            TranscriptItem::Tool(_) => !folded_at(*ix),
-            TranscriptItem::Assistant(view) => {
-                !(folded_at(*ix) && view.text().is_empty() && view.error.is_none())
-            }
-            _ => true,
-        })
-        .map(|(ix, _)| ix)
-        .collect();
+    let visible: Vec<usize> = s.visible_rows();
     let count = visible.len();
 
     // Own the scroll state: rebuilt when the conversation was replaced, kept
@@ -281,6 +264,11 @@ pub fn render_transcript(
                 .into_any_element()
         } else {
             let visible = std::rc::Rc::new(visible);
+            // The current find match's transcript index, for the row tint.
+            let hit_ix = app
+                .find
+                .as_ref()
+                .and_then(|find| find.matches.get(find.current).copied());
             div()
                 .flex_1()
                 .w_full()
@@ -291,6 +279,7 @@ pub fn render_transcript(
                     gpui::list(list.clone(), {
                         let visible = visible.clone();
                         let app = state.clone();
+                        let hit_ix = hit_ix;
                         move |pos, _window, cx| {
                             let s = app.read(cx);
                             let ix = visible[pos];
@@ -301,18 +290,28 @@ pub fn render_transcript(
                             // away until its status line is clicked.
                             let folded =
                                 crate::state::turn_folded_for(&s.transcript, ix, &s.expanded_turns);
+                            let hit = hit_ix == Some(ix);
                             div()
                                 .w_full()
                                 .flex()
                                 .justify_center()
                                 .px_4()
-                                .child(div().w_full().max_w(column).min_w_0().child(render_item(
-                                    &app,
-                                    &s.transcript[ix],
-                                    folded,
-                                    ix,
-                                    cx,
-                                )))
+                                .child(
+                                    div()
+                                        .w_full()
+                                        .max_w(column)
+                                        .min_w_0()
+                                        .when(hit, |row| {
+                                            row.rounded_sm().bg(cx.theme().colors.info_subtle)
+                                        })
+                                        .child(render_item(
+                                            &app,
+                                            &s.transcript[ix],
+                                            folded,
+                                            ix,
+                                            cx,
+                                        )),
+                                )
                                 .into_any_element()
                         }
                     })
@@ -383,11 +382,91 @@ pub fn render_transcript(
                             }),
                     )
                 })
+                .when_some(app.find.clone(), |this, find| {
+                    this.child(render_find_bar(view, &find, cx))
+                })
                 .into_any_element()
         })
 }
 
-/// One transcript row. `ix` keys element ids so streaming text is stable.
+/// The floating find bar: query, match counter, stepping and close. The
+/// field's Enter steps forward (subscribed at open); the arrows step either
+/// way and the jump reveals the match's row.
+fn render_find_bar(
+    view: &Entity<crate::ui::app::PidoApp>,
+    find: &crate::ui::app::FindState,
+    cx: &App,
+) -> impl IntoElement + use<> {
+    let theme = cx.theme();
+    let query = find.field.read(cx).text().to_string();
+    let counter = if query.trim().is_empty() {
+        None
+    } else if find.matches.is_empty() {
+        Some(i18n::t(cx, "find_none").to_string())
+    } else {
+        Some(format!("{}/{}", find.current + 1, find.matches.len()))
+    };
+    let (prev_view, next_view, close_view) = (view.clone(), view.clone(), view.clone());
+    div()
+        .absolute()
+        .top_2()
+        .right_4()
+        .flex()
+        .items_center()
+        .gap_1()
+        .px_2()
+        .py_1()
+        .rounded_md()
+        .border_1()
+        .border_color(theme.colors.border)
+        .bg(theme.colors.surface)
+        .child(div().w(gpui::px(220.)).child(find.field.clone()))
+        .when_some(counter, |this, counter| {
+            this.child(
+                div()
+                    .text_size(theme.text_size(TextSize::Xs))
+                    .text_color(theme.colors.fg_subtle)
+                    .child(counter),
+            )
+        })
+        .child({
+            let empty = find.matches.is_empty();
+            ely_gpui_component::buttons::IconButton::new(
+                "find-prev",
+                ely_gpui_component::primitives::IconName::ArrowUp,
+            )
+            .variant(ely_gpui_component::buttons::ButtonVariant::Ghost)
+            .size(ely_gpui_component::theme::ControlSize::Sm)
+            .when(empty, |button| button.disabled(true))
+            .on_click(move |_, _, cx| {
+                prev_view.update(cx, |this, cx| this.find_step(false, cx));
+            })
+        })
+        .child({
+            let empty = find.matches.is_empty();
+            ely_gpui_component::buttons::IconButton::new(
+                "find-next",
+                ely_gpui_component::primitives::IconName::ArrowDown,
+            )
+            .variant(ely_gpui_component::buttons::ButtonVariant::Ghost)
+            .size(ely_gpui_component::theme::ControlSize::Sm)
+            .when(empty, |button| button.disabled(true))
+            .on_click(move |_, _, cx| {
+                next_view.update(cx, |this, cx| this.find_step(true, cx));
+            })
+        })
+        .child({
+            ely_gpui_component::buttons::IconButton::new(
+                "find-close",
+                ely_gpui_component::primitives::IconName::X,
+            )
+            .variant(ely_gpui_component::buttons::ButtonVariant::Ghost)
+            .size(ely_gpui_component::theme::ControlSize::Sm)
+            .on_click(move |_, _, cx| {
+                close_view.update(cx, |this, cx| this.close_find(cx));
+            })
+        })
+}
 fn render_item(
     app: &Entity<AppState>,
     item: &TranscriptItem,
