@@ -193,18 +193,19 @@ pub fn render_transcript(state: &Entity<AppState>, cx: &App) -> impl IntoElement
 
     // Folded content must not exist in the list at all: an empty row would
     // still hold its slot, so the hidden tool calls would keep their space.
-    // Rows that show something map back to their transcript index.
+    // Rows that show something map back to their transcript index. A folded
+    // assistant row whose thinking is away and that carries no text or error
+    // (pi's tool-call-only messages) shows nothing but its hover footer —
+    // out it goes, same as the tools.
+    let folded_at = |ix: usize| crate::state::turn_folded_for(&s.transcript, ix, &s.expanded_turns);
     let visible: Vec<usize> = s
         .transcript
         .iter()
         .enumerate()
         .filter(|(ix, item)| match item {
-            TranscriptItem::Tool(_) => {
-                !crate::state::turn_folded_for(&s.transcript, *ix, &s.expanded_turns)
-            }
+            TranscriptItem::Tool(_) => !folded_at(*ix),
             TranscriptItem::Assistant(view) => {
-                let empty_view = view.text().is_empty() && view.thinking().is_empty();
-                !empty_view || !crate::state::turn_folded_for(&s.transcript, *ix, &s.expanded_turns)
+                !(folded_at(*ix) && view.text().is_empty() && view.error.is_none())
             }
             _ => true,
         })
