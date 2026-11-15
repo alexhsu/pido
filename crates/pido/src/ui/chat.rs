@@ -207,14 +207,24 @@ pub fn render_transcript(
     window: &mut Window,
     cx: &mut App,
 ) -> impl IntoElement + use<> {
-    let (empty, notice, visible, epoch) = {
+    let (empty, notices, visible, epoch) = {
         let s = state.read(cx);
         let empty = s.transcript.is_empty();
-        let notice = s
-            .notice
-            .clone()
-            .map(|(kind, text)| render_notice(kind, text, state.clone(), cx).into_any_element());
-        (empty, notice, s.visible_rows(), s.session_epoch)
+        let notices = s
+            .notices
+            .iter()
+            .cloned()
+            .enumerate()
+            .map(|(index, (kind, text))| {
+                div()
+                    .flex_none()
+                    .px_4()
+                    .pt_2()
+                    .child(render_notice(index, kind, text, state.clone(), cx))
+                    .into_any_element()
+            })
+            .collect::<Vec<_>>();
+        (empty, notices, s.visible_rows(), s.session_epoch)
     };
     let count = visible.len();
 
@@ -278,9 +288,7 @@ pub fn render_transcript(
         .overflow_hidden()
         .flex()
         .flex_col()
-        .when_some(notice, |this, banner| {
-            this.child(div().flex_none().px_4().pt_2().child(banner))
-        })
+        .children(notices)
         .child(if empty {
             div()
                 .flex_1()
@@ -991,6 +999,7 @@ fn compact_tokens(tokens: u64) -> String {
 /// The dismissible banner above the transcript (also used by the welcome
 /// screen for connection errors).
 pub fn render_notice(
+    index: usize,
     kind: NoticeKind,
     text: String,
     app: Entity<AppState>,
@@ -1013,8 +1022,8 @@ pub fn render_notice(
         .text_color(ink)
         .child(Paragraph::new(text))
         .child(
-            ely_gpui_component::buttons::Button::new("dismiss", i18n::t(cx, "dismiss"))
-                .on_click(move |_, _, cx| app.update(cx, |s, cx| s.dismiss_notice(cx))),
+            ely_gpui_component::buttons::Button::new(("dismiss", index), i18n::t(cx, "dismiss"))
+                .on_click(move |_, _, cx| app.update(cx, |s, cx| s.dismiss_notice(index, cx))),
         )
 }
 

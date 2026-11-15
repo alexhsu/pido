@@ -187,10 +187,15 @@ pub fn append_session_name(path: &Path, name: &str) -> std::io::Result<()> {
         "name": name,
     });
     let mut file = std::fs::OpenOptions::new().append(true).open(path)?;
+    // One write keeps our newline and entry from interleaving with a
+    // concurrent pi append (the read/write race itself remains unavoidable).
+    let mut payload = String::new();
     if !text.ends_with('\n') {
-        file.write_all(b"\n")?;
+        payload.push('\n');
     }
-    writeln!(file, "{entry}")
+    payload.push_str(&entry.to_string());
+    payload.push('\n');
+    file.write_all(payload.as_bytes())
 }
 
 /// An id Pi's session tree has not used yet: eight hex digits, like its own.
@@ -350,17 +355,40 @@ fn walk_dirs(root: &Path) -> anyhow::Result<Vec<PathBuf>> {
 /// Parse one session file into a summary. `None` when the header line is
 /// missing or malformed (not a session file).
 fn parse_session_file(path: &Path) -> Option<SessionSummary> {
-    let content = std::fs::read_to_string(path).ok()?;
-    let mut lines = content.lines();
+    // Summary scanning must not load a multi-megabyte transcript (base64
+    // tool images can make a single line huge). Read line by line and cap
+    // the buffer; oversized lines are skipped.
+    const MAX_LINE: usize = 4 * 1024 * 1024;
+    let file = std::fs::File::open(path).ok()?;
+    let mut reader = BufReader::new(file);
+    let mut buf = Vec::new();
 
-    let header: SessionHeader = serde_json::from_str(lines.next()?).ok()?;
+    let header_len = read_line_capped(&mut reader, &mut buf, MAX_LINE).ok()?;
+    if header_len == 0 || header_len > MAX_LINE {
+        return None;
+    }
+    let header_text = std::str::from_utf8(&buf).ok()?;
+    let header: SessionHeader =
+        serde_json::from_str(header_text.trim_end_matches(['\r', '\n'])).ok()?;
     let session_id = header.id?;
     let cwd = header.cwd.unwrap_or_default();
 
     let mut name: Option<String> = None;
     let mut preview: Option<String> = None;
     let mut message_count = 0usize;
-    for line in lines {
+    loop {
+        let len = read_line_capped(&mut reader, &mut buf, MAX_LINE).ok()?;
+        if len == 0 {
+            break;
+        }
+        if len > MAX_LINE {
+            log::warn!("session {}: skipped an oversized line", path.display());
+            continue;
+        }
+        let Ok(line) = std::str::from_utf8(&buf) else {
+            continue;
+        };
+        let line = line.trim_end_matches(['\r', '\n']);
         if line.trim().is_empty() {
             continue;
         }
@@ -397,6 +425,35 @@ fn parse_session_file(path: &Path) -> Option<SessionSummary> {
         message_count,
         parent_session: header.parent_session,
     })
+}
+
+/// Read one line into `buf`, keeping at most `cap` bytes. Returns the line's
+/// full byte length; a value above `cap` means it was truncated. Consumes the
+/// rest of the line without buffering it.
+fn read_line_capped<R: BufRead>(
+    reader: &mut R,
+    buf: &mut Vec<u8>,
+    cap: usize,
+) -> std::io::Result<usize> {
+    buf.clear();
+    let mut total = 0usize;
+    loop {
+        let available = reader.fill_buf()?;
+        if available.is_empty() {
+            return Ok(total);
+        }
+        let newline = available.iter().position(|byte| *byte == b'\n');
+        let take = newline.map_or(available.len(), |index| index + 1);
+        if buf.len() < cap {
+            let room = cap - buf.len();
+            buf.extend_from_slice(&available[..take.min(room)]);
+        }
+        reader.consume(take);
+        total += take;
+        if newline.is_some() {
+            return Ok(total);
+        }
+    }
 }
 
 /// The file's last modification time, as unix seconds; None when unknown.
@@ -696,6 +753,18 @@ mod tests {
             10,
         );
         assert_eq!(read_session_cwd(&path).as_deref(), Some("C:\\one"));
+    }
+
+    #[test]
+    fn capped_line_reader_keeps_only_the_prefix() {
+        let input = b"aaaaaaaaaa\nshort\n";
+        let mut reader: &[u8] = input;
+        let mut buf = Vec::new();
+        assert_eq!(read_line_capped(&mut reader, &mut buf, 5).unwrap(), 11);
+        assert_eq!(buf, b"aaaaa");
+        assert_eq!(read_line_capped(&mut reader, &mut buf, 5).unwrap(), 6);
+        assert_eq!(buf, b"short");
+        assert_eq!(read_line_capped(&mut reader, &mut buf, 5).unwrap(), 0);
     }
 
     #[test]

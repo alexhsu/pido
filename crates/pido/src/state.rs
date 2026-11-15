@@ -7,7 +7,7 @@
 //! the client and folds every record into the transcript.
 
 use base64::Engine as _;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -944,8 +944,9 @@ pub struct AppState {
     /// Pi's auto-compaction switch, as `get_state` last reported it. `None`
     /// before the first round trip.
     pub auto_compaction: Option<bool>,
-    /// A dismissible banner over the transcript.
-    pub notice: Option<(NoticeKind, String)>,
+    /// Dismissible banners over the transcript, oldest first. A queue keeps
+    /// retry/compaction/error notices from silently replacing each other.
+    pub notices: VecDeque<(NoticeKind, String)>,
     /// The last-used project directory, to prefill the welcome picker.
     pub last_project: Option<String>,
     /// Counter for staging image keys.
@@ -1052,7 +1053,7 @@ impl AppState {
                 last_session_loaded: false,
                 stats: None,
                 auto_compaction: None,
-                notice: None,
+                notices: VecDeque::new(),
                 last_project,
                 next_image_key: 1,
                 next_shell_id: 1,
@@ -1155,7 +1156,7 @@ impl AppState {
         cx: &mut Context<Self>,
     ) {
         if !cwd.is_dir() {
-            self.notice = Some((NoticeKind::Error, i18n::t(cx, "dir_invalid").to_string()));
+            self.push_notice(NoticeKind::Error, i18n::t(cx, "dir_invalid").to_string());
             cx.notify();
             return;
         }
@@ -1182,7 +1183,7 @@ impl AppState {
             self.expanded_turns.clear();
             self.turn_running = false;
             self.clear_changes();
-            self.notice = None;
+            self.notices.clear();
             self.session_epoch += 1;
             self.pending_steers.clear();
             self.pending_follow_ups.clear();
@@ -1297,7 +1298,7 @@ impl AppState {
                             None => {
                                 s.conn = Conn::Live;
                                 s.recovering = None;
-                                s.notice = None;
+                                s.notices.clear();
                                 if let Ok(Ok(Some(payload))) =
                                     state_result.map(|r| r.data_as::<SessionState>())
                                 {
@@ -1450,7 +1451,7 @@ impl AppState {
                 Conn::Dead(reason)
             };
             self.recovering = None;
-            self.notice = None;
+            self.notices.clear();
             cx.notify();
             return;
         }
@@ -2601,6 +2602,7 @@ impl AppState {
         self.queued_follow_ups.clear();
         self.pending_dialog = None;
         self.pending_composer_text = None;
+        self.notices.clear();
         cx.notify();
     }
 
@@ -3633,14 +3635,31 @@ impl AppState {
         .detach();
     }
 
-    pub fn dismiss_notice(&mut self, cx: &mut Context<Self>) {
-        self.notice = None;
-        cx.notify();
+    /// Dismiss one banner, addressed by its position in the rendered stack.
+    pub fn dismiss_notice(&mut self, index: usize, cx: &mut Context<Self>) {
+        if index < self.notices.len() {
+            self.notices.remove(index);
+            cx.notify();
+        }
     }
 
     pub fn push_notice(&mut self, kind: NoticeKind, text: String) {
         log::info!("notice: {text}");
-        self.notice = Some((kind, text));
+        // Repeating the same banner (a retry loop, most often) should not
+        // stack; keep a short queue so different notices stay visible.
+        if self.notices.back().is_some_and(|(_, last)| last == &text) {
+            return;
+        }
+        self.notices.push_back((kind, text));
+        while self.notices.len() > 5 {
+            self.notices.pop_front();
+        }
+    }
+
+    /// Remove a banner by its text, e.g. the transient retrying/compacting
+    /// note once the operation ends.
+    fn remove_notice_text(&mut self, text: &str) {
+        self.notices.retain(|(_, existing)| existing != text);
     }
 
     // -- event reduction ----------------------------------------------------
@@ -3944,6 +3963,8 @@ impl AppState {
                 error_message,
                 ..
             } => {
+                let transient = i18n::t(cx, "compacting").to_string();
+                self.remove_notice_text(&transient);
                 if aborted {
                     self.push_notice(
                         NoticeKind::Warn,
@@ -3994,6 +4015,8 @@ impl AppState {
                 final_error,
                 ..
             } => {
+                let transient = i18n::t(cx, "retrying").to_string();
+                self.remove_notice_text(&transient);
                 if success {
                     self.push_notice(NoticeKind::Info, i18n::t(cx, "retry_succeeded").to_string());
                 } else {
@@ -4867,7 +4890,7 @@ mod tests {
             last_session_loaded: false,
             stats: None,
             auto_compaction: None,
-            notice: None,
+            notices: VecDeque::new(),
             last_project: None,
             commands: Vec::new(),
             workspace_files: Vec::new(),
@@ -4922,6 +4945,20 @@ mod tests {
             message: Some(message),
             summary: None,
         }
+    }
+
+    #[test]
+    fn notices_queue_without_losing_distinct_messages() {
+        let mut state = empty_state();
+        state.push_notice(NoticeKind::Info, "compacting".into());
+        state.push_notice(NoticeKind::Warn, "retrying".into());
+        // A repeated banner is not stacked twice.
+        state.push_notice(NoticeKind::Warn, "retrying".into());
+        assert_eq!(state.notices.len(), 2);
+
+        state.remove_notice_text("retrying");
+        assert_eq!(state.notices.len(), 1);
+        assert_eq!(state.notices[0].1, "compacting");
     }
 
     #[test]

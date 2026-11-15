@@ -28,7 +28,7 @@ pub fn render(
 ) -> impl IntoElement + use<> {
     let theme = cx.theme();
     let (danger_fill, danger_ink) = (theme.colors.danger_subtle, theme.colors.danger);
-    let (connecting, dead_reason, last_project, notice) = {
+    let (connecting, dead_reason, last_project, notices) = {
         let s = state.read(cx);
         (
             s.conn == Conn::Connecting,
@@ -37,7 +37,7 @@ pub fn render(
                 _ => None,
             },
             s.last_project.clone(),
-            s.notice.clone(),
+            s.notices.iter().cloned().collect::<Vec<_>>(),
         )
     };
 
@@ -147,9 +147,14 @@ pub fn render(
                         .w_full()
                         .child(Caption::new(i18n::t(cx, "welcome_desc")))
                         .child(render_environment(state, cx))
-                        .when_some(notice, |this, (kind, text)| {
-                            this.child(chat::render_notice(kind, text, state.clone(), cx))
-                        })
+                        .children(
+                            notices
+                                .into_iter()
+                                .enumerate()
+                                .map(|(index, (kind, text))| {
+                                    chat::render_notice(index, kind, text, state.clone(), cx)
+                                }),
+                        )
                         .child(
                             div()
                                 .flex()

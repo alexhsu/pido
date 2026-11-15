@@ -275,32 +275,40 @@ impl PiClient {
             std::thread::Builder::new()
                 .name("pi-rpc-reader".into())
                 .spawn(move || {
-                    let reader = BufReader::new(stdout);
-                    for line in reader.split(b'\n') {
-                        match line {
-                            Ok(bytes) => {
-                                if bytes.is_empty() {
-                                    continue;
-                                }
-                                let Ok(text) = String::from_utf8(bytes) else {
-                                    log::warn!("pi emitted non-utf8 record, skipping");
-                                    continue;
-                                };
-                                let text = text.strip_suffix('\r').unwrap_or(&text);
-                                match parse_record(text) {
-                                    Ok(record) => {
-                                        if raw_tx.send(ClientEvent::Record(record)).is_err() {
-                                            return;
-                                        }
-                                    }
-                                    Err(err) => {
-                                        log::error!("unparseable record from pi: {err}");
-                                    }
-                                }
-                            }
+                    const MAX_RECORD_BYTES: usize = 64 * 1024 * 1024;
+                    let mut reader = BufReader::new(stdout);
+                    let mut buf = Vec::new();
+                    loop {
+                        let len = match read_line_capped(&mut reader, &mut buf, MAX_RECORD_BYTES) {
+                            Ok(0) => break,
+                            Ok(len) => len,
                             Err(err) => {
                                 log::error!("reading pi stdout failed: {err}");
                                 return;
+                            }
+                        };
+                        if len > MAX_RECORD_BYTES {
+                            log::error!(
+                                "pi record of {len} bytes exceeds the {MAX_RECORD_BYTES}-byte cap; skipping"
+                            );
+                            continue;
+                        }
+                        let Ok(text) = std::str::from_utf8(&buf) else {
+                            log::warn!("pi emitted non-utf8 record, skipping");
+                            continue;
+                        };
+                        let text = text.trim_end_matches(['\r', '\n']);
+                        if text.is_empty() {
+                            continue;
+                        }
+                        match parse_record(text) {
+                            Ok(record) => {
+                                if raw_tx.send(ClientEvent::Record(record)).is_err() {
+                                    return;
+                                }
+                            }
+                            Err(err) => {
+                                log::error!("unparseable record from pi: {err}");
                             }
                         }
                     }
@@ -590,6 +598,35 @@ impl PiClient {
     }
 }
 
+/// Read one `\n`-terminated record, buffering at most `cap` bytes. The full
+/// length is returned so oversize records can be skipped without allocating
+/// them.
+fn read_line_capped<R: BufRead>(
+    reader: &mut R,
+    buf: &mut Vec<u8>,
+    cap: usize,
+) -> std::io::Result<usize> {
+    buf.clear();
+    let mut total = 0usize;
+    loop {
+        let available = reader.fill_buf()?;
+        if available.is_empty() {
+            return Ok(total);
+        }
+        let newline = available.iter().position(|byte| *byte == b'\n');
+        let take = newline.map_or(available.len(), |index| index + 1);
+        if buf.len() < cap {
+            let room = cap - buf.len();
+            buf.extend_from_slice(&available[..take.min(room)]);
+        }
+        reader.consume(take);
+        total += take;
+        if newline.is_some() {
+            return Ok(total);
+        }
+    }
+}
+
 /// Forward an event to every live subscriber; dead receivers are dropped.
 fn fan_out(inner: &Inner, event: ClientEvent) {
     let mut subscribers = inner.subscribers.lock().unwrap();
@@ -640,6 +677,18 @@ pub fn probe_auth(provider: &str, pi_path: Option<&PathBuf>) -> anyhow::Result<b
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn capped_reader_skips_the_rest_of_an_oversize_line() {
+        let input = b"1234567890\nok\n";
+        let mut reader: &[u8] = input;
+        let mut buf = Vec::new();
+        assert_eq!(read_line_capped(&mut reader, &mut buf, 4).unwrap(), 11);
+        assert_eq!(buf, b"1234");
+        assert_eq!(read_line_capped(&mut reader, &mut buf, 4).unwrap(), 3);
+        assert_eq!(buf, b"ok\n");
+        assert_eq!(read_line_capped(&mut reader, &mut buf, 4).unwrap(), 0);
+    }
 
     #[test]
     fn request_ids_increase() {

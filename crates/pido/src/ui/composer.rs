@@ -30,6 +30,7 @@ pub fn render(state: &Entity<AppState>, app: &mut PidoApp, cx: &App) -> impl Int
     let Some(draft) = app.draft.clone() else {
         return div().into_any_element();
     };
+    let image_only = !s.pending_images.is_empty() && draft.read(cx).text().trim().is_empty();
 
     let send_state = state.clone();
     let paste_state = state.clone();
@@ -227,6 +228,15 @@ pub fn render(state: &Entity<AppState>, app: &mut PidoApp, cx: &App) -> impl Int
     } else {
         None
     };
+    // PromptInput disables its own send button without text; give an
+    // image-only message an explicit send affordance too.
+    let image_send = image_only.then(|| {
+        let send_state = state.clone();
+        IconButton::new("composer-send-image", IconName::ArrowUp)
+            .variant(ButtonVariant::Primary)
+            .tooltip(i18n::t(cx, "send"))
+            .on_click(move |_, _, cx| send_state.update(cx, |s, cx| s.send_text(String::new(), cx)))
+    });
     let stop = if streaming {
         let stop_state = state.clone();
         Some(
@@ -282,6 +292,7 @@ pub fn render(state: &Entity<AppState>, app: &mut PidoApp, cx: &App) -> impl Int
                     .justify_end()
                     .gap_1()
                     .children(queue_pick)
+                    .children(image_send)
                     .children(stop)
                     .child(pill),
             ),
