@@ -235,6 +235,12 @@ impl AssistantView {
         cache.clone()
     }
 
+    /// Whether any text block has content; cheaper than `text()` for folded
+    /// rows, which never render and so never fill the text cache.
+    pub fn has_text(&self) -> bool {
+        self.text_blocks.values().any(|text| !text.is_empty())
+    }
+
     pub fn thinking(&self) -> gpui::SharedString {
         let cached = self.thinking_cache.borrow().clone();
         match cached {
@@ -958,6 +964,9 @@ pub struct AppState {
     /// Bumped whenever the conversation is replaced, so the message list gets
     /// a fresh scroll/away state instead of reusing the old session's.
     pub session_epoch: u64,
+    /// Bumped when a session action (connect/new/switch/fork/disconnect)
+    /// starts; its async callbacks compare this and drop stale results.
+    session_gen: u64,
     /// Steer messages queued by the UI that pi has not delivered yet.
     pending_steers: Vec<String>,
     /// Follow-up messages queued by the UI that pi has not delivered yet.
@@ -1052,6 +1061,7 @@ impl AppState {
                 pending_images: Vec::new(),
                 pending_dialog: None,
                 session_epoch: 0,
+                session_gen: 0,
                 pending_steers: Vec::new(),
                 pending_follow_ups: Vec::new(),
                 queue_mode,
@@ -1152,7 +1162,20 @@ impl AppState {
         // A recovery spawn keeps the frozen transcript on screen, keeps the
         // Reconnecting state, and leaves the recovery bookkeeping alone; a
         // fresh connect wipes everything and cancels any recovery in flight.
+        self.session_gen += 1;
+        let session_gen = self.session_gen;
         let recovery = self.recovering.clone();
+        // Replacing a live pi: shut the old one down deliberately. Without
+        // `stopping`, its Disconnected event would read as a crash and
+        // trigger a spurious recovery; without the generation bump, its
+        // remaining events would bleed into the new session.
+        if recovery.is_none()
+            && let Some(old) = self.client.take()
+        {
+            self.stopping = true;
+            old.shutdown();
+        }
+        self.conn_gen += 1;
         if recovery.is_none() {
             self.conn = Conn::Connecting;
             self.transcript.clear();
@@ -1160,12 +1183,6 @@ impl AppState {
             self.turn_running = false;
             self.clear_changes();
             self.notice = None;
-        }
-        self.cwd = Some(cwd.clone());
-        self.streaming = false;
-        self.stats = None;
-        self.session_name = None;
-        if recovery.is_none() {
             self.session_epoch += 1;
             self.pending_steers.clear();
             self.pending_follow_ups.clear();
@@ -1173,13 +1190,14 @@ impl AppState {
             self.queued_follow_ups.clear();
             self.pending_composer_text = None;
             self.last_project = Some(cwd.to_string_lossy().into_owned());
-            if recovery.is_none() {
-                self.last_project = Some(cwd.to_string_lossy().into_owned());
-                crate::settings::save_setting(|s| {
-                    s.last_project = self.last_project.clone();
-                });
-            }
+            crate::settings::save_setting(|s| {
+                s.last_project = self.last_project.clone();
+            });
         }
+        self.cwd = Some(cwd.clone());
+        self.streaming = false;
+        self.stats = None;
+        self.session_name = None;
         cx.notify();
 
         // A stale session file must not break the spawn; fall back to fresh.
@@ -1207,43 +1225,59 @@ impl AppState {
                 Ok(client) => {
                     log::info!("state: pi spawned, running init requests");
                     // Run the three independent round trips in parallel, each
-                    // with a short timeout. Sequentially they could stall the
-                    // UI behind 3 x 120s if Pi is wedged.
-                    let (state_result, models_result, levels_result) =
-                        std::thread::scope(|scope| {
-                            let state_client = client.clone();
-                            let models_client = client.clone();
-                            let levels_client = client.clone();
-                            let state = scope.spawn(move || {
-                                state_client.request_with_timeout(Command::GetState, INIT_TIMEOUT)
-                            });
-                            let models = scope.spawn(move || {
-                                models_client
-                                    .request_with_timeout(Command::GetAvailableModels, INIT_TIMEOUT)
-                            });
-                            let levels = scope.spawn(move || {
-                                levels_client.request_with_timeout(
-                                    Command::GetAvailableThinkingLevels,
-                                    INIT_TIMEOUT,
+                    // with a short timeout — off the foreground executor, so a
+                    // wedged pi cannot freeze the window.
+                    let init_client = client.clone();
+                    let (state_result, models_result, levels_result) = cx
+                        .background_executor()
+                        .spawn(async move {
+                            std::thread::scope(|scope| {
+                                let state_client = init_client.clone();
+                                let models_client = init_client.clone();
+                                let levels_client = init_client.clone();
+                                let state = scope.spawn(move || {
+                                    state_client
+                                        .request_with_timeout(Command::GetState, INIT_TIMEOUT)
+                                });
+                                let models = scope.spawn(move || {
+                                    models_client.request_with_timeout(
+                                        Command::GetAvailableModels,
+                                        INIT_TIMEOUT,
+                                    )
+                                });
+                                let levels = scope.spawn(move || {
+                                    levels_client.request_with_timeout(
+                                        Command::GetAvailableThinkingLevels,
+                                        INIT_TIMEOUT,
+                                    )
+                                });
+                                (
+                                    state.join().unwrap_or_else(|_| {
+                                        Err(anyhow::anyhow!("get_state panicked"))
+                                    }),
+                                    models.join().unwrap_or_else(|_| {
+                                        Err(anyhow::anyhow!("get_available_models panicked"))
+                                    }),
+                                    levels.join().unwrap_or_else(|_| {
+                                        Err(anyhow::anyhow!(
+                                            "get_available_thinking_levels panicked"
+                                        ))
+                                    }),
                                 )
-                            });
-                            (
-                                state
-                                    .join()
-                                    .unwrap_or_else(|_| Err(anyhow::anyhow!("get_state panicked"))),
-                                models.join().unwrap_or_else(|_| {
-                                    Err(anyhow::anyhow!("get_available_models panicked"))
-                                }),
-                                levels.join().unwrap_or_else(|_| {
-                                    Err(anyhow::anyhow!("get_available_thinking_levels panicked"))
-                                }),
-                            )
-                        });
+                            })
+                        })
+                        .await;
                     log::info!(
                         "state: init done, get_state ok={}",
                         state_result.as_ref().map(|r| r.success).unwrap_or(false)
                     );
                     this.update(cx, |s, cx| {
+                        if s.session_gen != session_gen {
+                            // Another connect/session action superseded this
+                            // one; the new client is dropped at the end of
+                            // this task and shuts itself down.
+                            return;
+                        }
                         let failed = state_result.as_ref().err().map(|e| e.to_string());
                         log::info!("state: applying connect result, failed={failed:?}");
                         s.client = Some(client.clone());
@@ -1272,6 +1306,9 @@ impl AppState {
                                     s.session_name = payload.session_name;
                                     s.session_id = payload.session_id;
                                     s.streaming = payload.is_streaming;
+                                    s.auto_compaction = Some(payload.auto_compaction_enabled);
+                                    s.steer_mode = payload.steering_mode;
+                                    s.follow_up_mode = payload.follow_up_mode;
                                     s.remember_session_file(payload.session_file.as_deref());
                                 }
                                 // A fresh pi process owns no draft session;
@@ -1290,8 +1327,10 @@ impl AppState {
                                     s.thinking_levels
                                         .retain(|level| *level != ThinkingLevel::Unknown);
                                 }
-                                s.start_pump(client.clone(), cx);
+                                s.stopping = false;
                                 s.conn_gen += 1;
+                                let generation = s.conn_gen;
+                                s.start_pump(generation, client.clone(), cx);
                                 s.probe_fail = 0;
                                 s.start_probe_loop(s.conn_gen, cx);
                                 // A resumed session opens with its history;
@@ -1312,6 +1351,9 @@ impl AppState {
                 }
                 Err(error) => {
                     this.update(cx, |s, cx| {
+                        if s.session_gen != session_gen {
+                            return;
+                        }
                         if recovery.is_some() {
                             s.schedule_reconnect(cx);
                         } else {
@@ -1475,7 +1517,7 @@ impl AppState {
             haystacks
                 .into_iter()
                 .flatten()
-                .any(|text| text.to_lowercase().contains(&needle))
+                .any(|text| fuzzy_matches(text, &needle))
         };
         let hint_for = |session: &sessions::SessionSummary| -> Option<String> {
             let key = session_key(&session.path.to_string_lossy());
@@ -1564,7 +1606,7 @@ impl AppState {
                 }
                 TranscriptItem::Assistant(view) => {
                     !(turn_folded_for(&self.transcript, *ix, &self.expanded_turns)
-                        && view.text().is_empty()
+                        && !view.has_text()
                         && view.error.is_none())
                 }
                 _ => true,
@@ -1587,7 +1629,9 @@ impl AppState {
         let needle = query.trim().to_lowercase();
         let mut items: Vec<PaletteItem> = Vec::new();
         let fits = |len: usize, label: &str| len < CAP && fuzzy_matches(label, &needle);
-        for file in files.iter().take(8) {
+        // Filter first, then cap: a file past the first eight must still be
+        // findable through the palette.
+        for file in files {
             if fits(items.len(), file) {
                 items.push(PaletteItem {
                     kind: PaletteKind::File,
@@ -1798,7 +1842,10 @@ impl AppState {
         let cwd = match path.canonicalize() {
             Ok(cwd) => cwd.to_string_lossy().into_owned(),
             Err(error) => {
-                self.push_notice(NoticeKind::Error, format!("add project: {error}"));
+                self.push_notice(
+                    NoticeKind::Error,
+                    i18n::t_arg(cx, "add_project_failed", "e", &error.to_string()).to_string(),
+                );
                 cx.notify();
                 return;
             }
@@ -2094,6 +2141,13 @@ impl AppState {
         if self.conn == Conn::Live && self.cwd.as_deref() == Some(project.as_path()) {
             self.new_chat(cx);
         } else {
+            // Swapping to another project kills the running pi mid-turn;
+            // new_chat guards this and so must the cross-project path.
+            if self.streaming {
+                self.push_notice(NoticeKind::Warn, i18n::t(cx, "agent_busy").to_string());
+                cx.notify();
+                return;
+            }
             self.connect(project, None, extra_args(), cx);
         }
     }
@@ -2233,6 +2287,7 @@ impl AppState {
     /// Fetch the `/` command list pi offers (extensions, templates, skills).
     fn load_commands(&self, cx: &Context<Self>) {
         let Some(client) = self.client() else { return };
+        let generation = self.session_gen;
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
@@ -2245,6 +2300,9 @@ impl AppState {
                 })
                 .await;
             this.update(cx, |s, cx| {
+                if s.session_gen != generation {
+                    return;
+                }
                 if let Ok(Some(payload)) = result {
                     log::info!("state: {} commands available", payload.commands.len());
                     s.commands = payload.commands;
@@ -2260,12 +2318,16 @@ impl AppState {
     /// git-aware one: it skips the heavy directories most projects have.
     fn scan_workspace_files(&self, cx: &Context<Self>) {
         let Some(root) = self.cwd.clone() else { return };
+        let generation = self.session_gen;
         cx.spawn(async move |this, cx| {
             let files = cx
                 .background_executor()
                 .spawn(async move { workspace_files(&root) })
                 .await;
             this.update(cx, |s, cx| {
+                if s.session_gen != generation {
+                    return;
+                }
                 log::info!("state: {} files indexed for @", files.len());
                 s.workspace_files = files;
                 cx.notify();
@@ -2277,6 +2339,7 @@ impl AppState {
 
     fn load_history(&self, cx: &Context<Self>) {
         let Some(client) = self.client() else { return };
+        let generation = self.session_gen;
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
@@ -2289,6 +2352,11 @@ impl AppState {
                 })
                 .await;
             this.update(cx, |s, cx| {
+                // A slow `get_entries` from an old session must not replace
+                // the transcript the user has already moved on to.
+                if s.session_gen != generation {
+                    return;
+                }
                 match result {
                     Ok(Some(payload)) => {
                         log::info!(
@@ -2318,6 +2386,7 @@ impl AppState {
     /// Everything a successful fork implies: pi has rebound, so the
     /// transcript rebuilds around the new leaf.
     fn finish_fork(&mut self, cx: &mut Context<Self>) {
+        self.session_gen += 1;
         self.transcript.clear();
         self.expanded_turns.clear();
         self.turn_running = false;
@@ -2348,6 +2417,8 @@ impl AppState {
         }
         let Some(client) = self.client() else { return };
         let user_text = user_text.to_string();
+        self.session_gen += 1;
+        let generation = self.session_gen;
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
@@ -2377,6 +2448,9 @@ impl AppState {
                 })
                 .await;
             this.update(cx, |s, cx| {
+                if s.session_gen != generation {
+                    return;
+                }
                 match result {
                     Ok(cancelled) => {
                         if cancelled {
@@ -2418,6 +2492,8 @@ impl AppState {
         let Some(client) = self.client() else { return };
         let target = path.to_string();
         let original = self.session_file.clone();
+        self.session_gen += 1;
+        let generation = self.session_gen;
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
@@ -2460,6 +2536,9 @@ impl AppState {
                 })
                 .await;
             this.update(cx, |s, cx| {
+                if s.session_gen != generation {
+                    return;
+                }
                 match result {
                     Ok(Some((active_is_original, fork_cwd))) => {
                         if active_is_original {
@@ -2498,9 +2577,13 @@ impl AppState {
 
     /// Drop the session and return to the welcome screen.
     pub fn disconnect(&mut self, cx: &mut Context<Self>) {
+        self.session_gen += 1;
         if let Some(client) = self.client.take() {
+            self.stopping = true;
             client.shutdown();
         }
+        // A pending reconnect timer must not fire after the user left.
+        self.recovering = None;
         self.conn = Conn::Idle;
         self.transcript.clear();
         self.expanded_turns.clear();
@@ -2516,6 +2599,7 @@ impl AppState {
         self.pending_follow_ups.clear();
         self.queued_steers.clear();
         self.queued_follow_ups.clear();
+        self.pending_dialog = None;
         self.pending_composer_text = None;
         cx.notify();
     }
@@ -2532,7 +2616,7 @@ impl AppState {
     }
 
     /// Consume the client's broadcast into the transcript until it ends.
-    fn start_pump(&self, client: PiClient, cx: &Context<Self>) {
+    fn start_pump(&self, generation: u64, client: PiClient, cx: &Context<Self>) {
         let events = Arc::new(client.subscribe());
         cx.spawn(async move |this, cx| {
             loop {
@@ -2543,8 +2627,22 @@ impl AppState {
                     .await;
                 match next {
                     Ok(event) => {
+                        let batch = Arc::clone(&events);
                         let keep_going = this.update(cx, |s, cx| {
+                            // Events from a replaced pi must never reach the
+                            // new session's transcript or read as a crash.
+                            if generation != s.conn_gen {
+                                return;
+                            }
                             s.on_client_event(event, cx);
+                            // Drain what queued while we waited and notify
+                            // once per burst instead of once per delta.
+                            for _ in 0..256 {
+                                match batch.try_recv() {
+                                    Ok(event) => s.on_client_event(event, cx),
+                                    Err(_) => break,
+                                }
+                            }
                             cx.notify();
                         });
                         if keep_going.is_err() {
@@ -2640,7 +2738,10 @@ impl AppState {
                 })
                 .collect::<Vec<_>>()
         });
-        let steering = self.streaming;
+        // `turn_running` is set the moment a prompt is sent, before pi's
+        // `agent_start` arrives; use it too so a fast second message steers
+        // instead of issuing a second prompt.
+        let steering = self.streaming || self.turn_running;
         let follow = steering && self.queue_mode == QueueChoice::FollowUp;
         let command = if steering {
             // Extension/prompt-template commands are not allowed through
@@ -2765,6 +2866,20 @@ impl AppState {
             .rposition(|item| matches!(item, TranscriptItem::User { text: t, .. } if t == text))
         {
             self.transcript.remove(index);
+            // Turn folds are keyed by transcript index; keep them pointing at
+            // the same rows after the removal.
+            self.expanded_turns = self
+                .expanded_turns
+                .iter()
+                .filter_map(|turn| {
+                    let turn = *turn as usize;
+                    match turn.cmp(&index) {
+                        std::cmp::Ordering::Less => Some(turn as u64),
+                        std::cmp::Ordering::Equal => None,
+                        std::cmp::Ordering::Greater => Some((turn - 1) as u64),
+                    }
+                })
+                .collect();
         }
     }
 
@@ -2783,15 +2898,22 @@ impl AppState {
     /// pi returns the cleared messages' text, and the documented Esc behavior
     /// is to put it back in the editor, so the user does not lose what they
     /// typed while the agent was running.
-    pub fn stop(&mut self, cx: &Context<Self>) {
-        let Some(client) = self.client() else { return };
+    pub fn stop(&mut self, cx: &mut Context<Self>) {
+        let Some(client) = self.client() else {
+            // No client to ask, but the UI must not keep claiming a run.
+            self.streaming = false;
+            self.finish_running_turn();
+            self.finalize_open_views();
+            cx.notify();
+            return;
+        };
         cx.spawn(async move |this, cx| {
-            let cleared = cx
+            let (cleared, aborted) = cx
                 .background_executor()
                 .spawn(async move {
                     let cleared = client.request(Command::ClearQueue);
-                    let _ = client.request(Command::Abort);
-                    cleared
+                    let aborted = client.request(Command::Abort);
+                    (cleared, aborted)
                 })
                 .await;
             this.update(cx, |s, cx| {
@@ -2815,10 +2937,32 @@ impl AppState {
                     }
                     Ok(response) => s.push_notice(
                         NoticeKind::Error,
-                        format!("clear_queue: {}", response.error.unwrap_or_default()),
+                        i18n::t_arg(
+                            cx,
+                            "clear_queue_failed",
+                            "e",
+                            &response.error.unwrap_or_default(),
+                        )
+                        .to_string(),
                     ),
                     Err(error) => s.push_notice(NoticeKind::Error, error.to_string()),
                 }
+                // Abort responds when pi is idle, so whichever way it went,
+                // converge the local run state instead of waiting forever for
+                // an `agent_settled` that may never come.
+                if let Ok(response) = &aborted
+                    && !response.success
+                {
+                    s.push_notice(
+                        NoticeKind::Error,
+                        format!("abort: {}", response.error.clone().unwrap_or_default()),
+                    );
+                } else if let Err(error) = &aborted {
+                    s.push_notice(NoticeKind::Error, error.to_string());
+                }
+                s.streaming = false;
+                s.finish_running_turn();
+                s.finalize_open_views();
                 cx.notify();
             })
             .ok();
@@ -2839,6 +2983,8 @@ impl AppState {
             return;
         }
         let Some(client) = self.client() else { return };
+        self.session_gen += 1;
+        let generation = self.session_gen;
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
@@ -2849,6 +2995,9 @@ impl AppState {
                 })
                 .await;
             this.update(cx, |s, cx| {
+                if s.session_gen != generation {
+                    return;
+                }
                 match result {
                     Ok(response) if response.success => {
                         if session_action_cancelled(&response) {
@@ -2910,6 +3059,8 @@ impl AppState {
         }
         let Some(client) = self.client() else { return };
         let session_file = path.to_string_lossy().into_owned();
+        self.session_gen += 1;
+        let generation = self.session_gen;
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
@@ -2931,6 +3082,9 @@ impl AppState {
                 })
                 .await;
             this.update(cx, |s, cx| {
+                if s.session_gen != generation {
+                    return;
+                }
                 match result {
                     Ok((cancelled, cwd)) => {
                         if cancelled {
@@ -3113,18 +3267,47 @@ impl AppState {
         cx.notify();
 
         let command = command.to_string();
+        let request_id = id.clone();
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
                 .spawn(async move {
-                    client.request(Command::Bash {
-                        command,
-                        exclude_from_context: exclude_from_context.then_some(true),
-                    })
+                    // The request id doubles as the bash-output event id, so
+                    // `bash_execution_update` chunks can find this row.
+                    client.request_with_id(
+                        request_id,
+                        Command::Bash {
+                            command,
+                            exclude_from_context: exclude_from_context.then_some(true),
+                        },
+                    )
                 })
                 .await;
-            this.update(cx, |s, cx| {
-                s.finish_shell(&id, result.err().map(|e| e.to_string()), cx);
+            this.update(cx, |s, cx| match result {
+                Ok(response) if response.success => {
+                    let data = response
+                        .data_as::<pi_rpc::protocol::BashResult>()
+                        .ok()
+                        .flatten();
+                    let output = data.as_ref().map(|data| {
+                        let mut text = data.output.clone();
+                        if data.truncated
+                            && let Some(path) = &data.full_output_path
+                        {
+                            text.push_str(&format!("\n[truncated; full output: {path}]"));
+                        }
+                        text
+                    });
+                    let error = data
+                        .as_ref()
+                        .filter(|data| data.cancelled)
+                        .map(|_| "aborted".to_string());
+                    s.finish_shell(&id, output, error, cx);
+                }
+                Ok(response) => {
+                    s.finish_shell(&id, None, Some(response.error.unwrap_or_default()), cx)
+                }
+                Err(error) => s.finish_shell(&id, None, Some(error.to_string()), cx),
             })
             .ok();
         })
@@ -3141,27 +3324,38 @@ impl AppState {
                 .spawn(async move { client.request(Command::AbortBash) })
                 .await;
             this.update(cx, |s, cx| {
-                s.finish_shell(&id, Some("aborted".into()), cx);
+                s.finish_shell(&id, None, Some("aborted".into()), cx);
             })
             .ok();
         })
         .detach();
     }
 
-    /// Mark a shell row finished; `error` explains an abnormal end.
-    fn finish_shell(&mut self, id: &str, error: Option<String>, cx: &mut Context<Self>) {
+    /// Mark a shell row finished; `output` replaces streamed chunks when the
+    /// final response carries the full result, and `error` explains an
+    /// abnormal end.
+    fn finish_shell(
+        &mut self,
+        id: &str,
+        output: Option<String>,
+        error: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
         for item in self.transcript.iter_mut().rev() {
             if let TranscriptItem::Shell {
                 id: row_id,
-                output,
+                output: row_output,
                 running,
                 ..
             } = item
                 && row_id == id
                 && *running
             {
+                if let Some(output) = output {
+                    *row_output = output;
+                }
                 if let Some(error) = error {
-                    output.push_str(&format!("\n[{error}]"));
+                    row_output.push_str(&format!("\n[{error}]"));
                 }
                 *running = false;
                 break;
@@ -3352,12 +3546,16 @@ impl AppState {
     /// Refresh model/thinking/name from a `get_state` round trip.
     fn query_state(&self, cx: &Context<Self>) {
         let Some(client) = self.client() else { return };
+        let generation = self.session_gen;
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
                 .spawn(async move { client.request(Command::GetState) })
                 .await;
             this.update(cx, |s, cx| {
+                if s.session_gen != generation {
+                    return;
+                }
                 if let Ok(Ok(Some(payload))) = result.map(|r| r.data_as::<SessionState>()) {
                     s.current_model = payload.model;
                     s.thinking_level = payload.thinking_level;
@@ -3386,12 +3584,16 @@ impl AppState {
     /// Refresh thinking levels for the current model.
     fn refresh_thinking_levels(&self, cx: &Context<Self>) {
         let Some(client) = self.client() else { return };
+        let generation = self.session_gen;
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
                 .spawn(async move { client.request(Command::GetAvailableThinkingLevels) })
                 .await;
             this.update(cx, |s, cx| {
+                if s.session_gen != generation {
+                    return;
+                }
                 if let Ok(Ok(Some(payload))) =
                     result.map(|r| r.data_as::<pi_rpc::protocol::AvailableThinkingLevels>())
                 {
@@ -3409,12 +3611,16 @@ impl AppState {
     /// Refresh session stats after a run settles.
     fn refresh_stats(&self, cx: &Context<Self>) {
         let Some(client) = self.client() else { return };
+        let generation = self.session_gen;
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
                 .spawn(async move { client.request(Command::GetSessionStats) })
                 .await;
             this.update(cx, |s, cx| {
+                if s.session_gen != generation {
+                    return;
+                }
                 if let Ok(Ok(Some(payload))) =
                     result.map(|r| r.data_as::<pi_rpc::protocol::SessionStats>())
                 {
@@ -3496,15 +3702,23 @@ impl AppState {
     /// thinking duration. Called on settle and on disconnect.
     fn finalize_open_views(&mut self) {
         for item in &mut self.transcript {
-            if let TranscriptItem::Assistant(view) = item
-                && !view.finished
-            {
-                view.finished = true;
-                view.live_text = None;
-                view.live_thinking = None;
-                if view.took.is_none() {
-                    view.took = Some(view.started.elapsed());
+            match item {
+                TranscriptItem::Assistant(view) if !view.finished => {
+                    view.finished = true;
+                    view.live_text = None;
+                    view.live_thinking = None;
+                    if view.took.is_none() {
+                        view.took = Some(view.started.elapsed());
+                    }
                 }
+                // A tool whose result never arrives (abort, crash) must not
+                // leave a spinner running forever.
+                TranscriptItem::Tool(card) if card.running => {
+                    card.running = false;
+                    card.failed = true;
+                    card.took = Some(card.started.elapsed());
+                }
+                _ => {}
             }
         }
     }
@@ -3690,14 +3904,16 @@ impl AppState {
                 is_error,
                 result,
             } => {
-                if let Some(card) = self.tool_card_mut(&tool_call_id) {
-                    card.running = false;
-                    card.failed = is_error;
-                    card.took = Some(card.started.elapsed());
-                    if let Some(result) = result.as_ref() {
-                        card.result = Some(truncate_for_display(&result.text(), 2000).into());
-                        card.images = tool_images(result);
-                    }
+                // The result can beat the assistant message_end that would
+                // create the card (or arrive after history was rebuilt).
+                // Create it here rather than dropping the payload.
+                let card = self.ensure_tool_card(tool_call_id.clone(), tool_name.clone(), None);
+                card.running = false;
+                card.failed = is_error;
+                card.took = Some(card.started.elapsed());
+                if let Some(result) = result.as_ref() {
+                    card.result = Some(truncate_for_display(&result.text(), 2000).into());
+                    card.images = tool_images(result);
                 }
                 if is_error {
                     self.pending_writes.remove(&tool_call_id);
@@ -3818,7 +4034,20 @@ impl AppState {
                 self.queued_steers = steering.into_iter().map(Into::into).collect();
                 self.queued_follow_ups = follow_up.into_iter().map(Into::into).collect();
             }
-            Event::BashExecutionUpdate { .. } => {}
+            Event::BashExecutionUpdate { id, delta } => {
+                if let Some(id) = id
+                    && let Some(TranscriptItem::Shell {
+                        running, output, ..
+                    }) = self
+                        .transcript
+                        .iter_mut()
+                        .rev()
+                        .find(|item| matches!(item, TranscriptItem::Shell { id: row_id, .. } if *row_id == id))
+                    && *running
+                {
+                    output.push_str(&delta);
+                }
+            }
             other => {
                 log::debug!("event not shown in MVP UI: {:?}", other);
             }
@@ -3909,6 +4138,9 @@ impl AppState {
             AssistantMessageEvent::ToolCallEnd { tool_call, .. } => {
                 self.ensure_tool_card(tool_call.id, tool_call.name, Some(&tool_call.arguments));
             }
+            // A delta from a newer pi. The final message_end remains
+            // authoritative, so ignoring it is safe.
+            AssistantMessageEvent::Unknown => {}
         }
     }
 
@@ -4644,6 +4876,7 @@ mod tests {
             next_image_key: 1,
             next_shell_id: 1,
             session_epoch: 0,
+            session_gen: 0,
             pending_steers: Vec::new(),
             pending_follow_ups: Vec::new(),
             queue_mode: QueueChoice::Steer,
@@ -4688,6 +4921,66 @@ mod tests {
             timestamp: None,
             message: Some(message),
             summary: None,
+        }
+    }
+
+    #[test]
+    fn removing_a_user_bubble_keeps_turn_folds_aligned() {
+        let mut state = empty_state();
+        state.transcript = vec![
+            TranscriptItem::User {
+                text: "a".into(),
+                time: None,
+            },
+            TranscriptItem::Turn {
+                started: Instant::now(),
+                took: None,
+            },
+            TranscriptItem::User {
+                text: "b".into(),
+                time: None,
+            },
+        ];
+        state.expanded_turns.insert(1);
+
+        state.remove_last_user_text("b");
+        assert_eq!(
+            state.expanded_turns,
+            [1].into(),
+            "removing the row after the turn does not move it"
+        );
+
+        state.remove_last_user_text("a");
+        assert_eq!(
+            state.expanded_turns,
+            [0].into(),
+            "removing a row before the turn shifts its index"
+        );
+    }
+
+    #[test]
+    fn finalize_stops_a_running_tool() {
+        let mut state = empty_state();
+        state.transcript.push(TranscriptItem::Tool(ToolView {
+            call_id: "call-1".into(),
+            name: "bash".into(),
+            args: None,
+            running: true,
+            failed: false,
+            result: None,
+            images: Vec::new(),
+            started: Instant::now(),
+            took: None,
+        }));
+
+        state.finalize_open_views();
+        match &state.transcript[0] {
+            TranscriptItem::Tool(card) => {
+                assert!(!card.running);
+                assert!(card.failed);
+                assert!(card.took.is_some());
+            }
+            other => panic!("expected tool card, got {other:?}"),
         }
     }
 

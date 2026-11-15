@@ -95,8 +95,9 @@ pub fn render(
                 .flex_row()
                 .child(
                     div()
-                        .flex_none()
                         .w(px(260.))
+                        .min_w(px(120.))
+                        .flex_shrink(1.)
                         .h_full()
                         .min_h_0()
                         .flex()

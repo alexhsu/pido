@@ -90,6 +90,27 @@ fn main() {
                     )
                 }
             }
+            "bash" => {
+                let record = respond(
+                    id.clone(),
+                    "bash",
+                    serde_json::json!({
+                        "output": "mock output\n",
+                        "exitCode": 0,
+                        "cancelled": false,
+                        "truncated": false,
+                    }),
+                )
+                .expect("respond always returns a record");
+                let event = serde_json::json!({
+                    "type": "bash_execution_update",
+                    "id": id,
+                    "delta": "mock output\n",
+                });
+                let _ = writeln!(stdout, "{record}");
+                let _ = writeln!(stdout, "{event}");
+                None
+            }
             other => respond_ok(id, other),
         };
         if let Some(record) = reply {

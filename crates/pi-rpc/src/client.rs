@@ -22,7 +22,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
 use std::process::{Child, ChildStdin, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -113,6 +113,8 @@ pub enum DisconnectReason {
     Exited { code: Option<i32> },
     /// The client initiated shutdown by closing stdin.
     ClosedByClient,
+    /// The client killed an unresponsive process.
+    Killed,
     /// Reading Pi's stdout failed (pipe broken).
     ReadFailed(String),
 }
@@ -152,6 +154,12 @@ struct Inner {
     /// Every record that came in from Pi, counted. A watchdog compares this
     /// across a failed probe to tell a wedged process from a busy one.
     inbound_records: AtomicU64,
+    /// Set by [`PiClient::kill`] so the reaper can distinguish a deliberate
+    /// kill from a graceful stdin close.
+    killed: AtomicBool,
+    /// The final disconnect reason, replayed to subscribers that attach after
+    /// the reaper has already fired.
+    disconnected: Mutex<Option<DisconnectReason>>,
 }
 
 /// Handle to a running Pi RPC process.
@@ -229,6 +237,8 @@ impl PiClient {
             handle_count: AtomicU64::new(1),
             inbound_records: AtomicU64::new(0),
             stderr_tail: Mutex::new(VecDeque::new()),
+            killed: AtomicBool::new(false),
+            disconnected: Mutex::new(None),
         });
 
         // stderr thread: Pi uses stderr for startup failures and provider
@@ -321,7 +331,18 @@ impl PiClient {
                                     // a `parse` error without id, still goes
                                     // to subscribers).
                                     Some(sender) => {
-                                        let _ = sender.send(response.clone());
+                                        // The waiter may have timed out between
+                                        // removing its entry and this send. In
+                                        // that case hand the payload to the
+                                        // subscribers instead of dropping it.
+                                        if let Err(error) = sender.send(response.clone()) {
+                                            fan_out(
+                                                &inner,
+                                                ClientEvent::Record(RpcRecord::Response(
+                                                    error.into_inner(),
+                                                )),
+                                            );
+                                        }
                                     }
                                     None => fan_out(&inner, event),
                                 }
@@ -346,6 +367,7 @@ impl PiClient {
                 .spawn(move || {
                     // Poll instead of holding the child lock across `wait`:
                     // the shutdown path needs that lock to kill a wedged Pi.
+                    let mut delay_ms = 20u64;
                     let code = loop {
                         let status = {
                             let mut guard = inner.child.lock().unwrap();
@@ -356,7 +378,10 @@ impl PiClient {
                         };
                         match status {
                             Ok(Some(status)) => break status.code(),
-                            Ok(None) => std::thread::sleep(Duration::from_millis(50)),
+                            Ok(None) => {
+                                std::thread::sleep(Duration::from_millis(delay_ms));
+                                delay_ms = (delay_ms * 2).min(250);
+                            }
                             Err(error) => {
                                 log::warn!("pi-rpc: waiting for pi failed: {error}");
                                 break None;
@@ -364,16 +389,20 @@ impl PiClient {
                         }
                     };
                     let shutting_down = *inner.shutdown.lock().unwrap();
+                    let killed = inner.killed.load(Ordering::Relaxed);
                     log::info!(
-                        "pi-rpc: reaper fired, exit code {code:?}, shutdown flag {shutting_down}, strong refs {}",
+                        "pi-rpc: reaper fired, exit code {code:?}, shutdown flag {shutting_down}, killed {killed}, strong refs {}",
                         Arc::strong_count(&inner)
                     );
-                    let reason = if shutting_down {
+                    let reason = if killed {
+                        DisconnectReason::Killed
+                    } else if shutting_down {
                         DisconnectReason::ClosedByClient
                     } else {
                         DisconnectReason::Exited { code }
                     };
                     fail_pending(&inner.pending);
+                    *inner.disconnected.lock().unwrap() = Some(reason.clone());
                     fan_out(&inner, ClientEvent::Disconnected(reason));
                 })
                 .expect("failed to spawn pi reaper thread");
@@ -387,6 +416,11 @@ impl PiClient {
     /// delivered to that call only.
     pub fn subscribe(&self) -> Receiver<ClientEvent> {
         let (tx, rx) = unbounded();
+        // A subscriber that arrives after the process is gone must still see
+        // the disconnect, or its pump would wait forever on an empty channel.
+        if let Some(reason) = self.inner.disconnected.lock().unwrap().clone() {
+            let _ = tx.send(ClientEvent::Disconnected(reason));
+        }
         self.inner.subscribers.lock().unwrap().push(tx);
         rx
     }
@@ -433,7 +467,22 @@ impl PiClient {
         command: Command,
         timeout: Duration,
     ) -> anyhow::Result<Response> {
-        let request = Request::new(command);
+        self.request_envelope(Request::new(command), timeout)
+    }
+
+    /// Send a command under a caller-chosen id. `bash` output events echo this
+    /// id, so a UI can stream a shell command's output into its row.
+    pub fn request_with_id(&self, id: String, command: Command) -> anyhow::Result<Response> {
+        self.request_envelope(
+            Request {
+                id: Some(id),
+                command,
+            },
+            DEFAULT_REQUEST_TIMEOUT,
+        )
+    }
+
+    fn request_envelope(&self, request: Request, timeout: Duration) -> anyhow::Result<Response> {
         let id = request
             .id
             .clone()
@@ -461,17 +510,24 @@ impl PiClient {
     /// Graceful shutdown: closing stdin tells Pi to exit cleanly. The
     /// disconnect is reported to subscribers.
     pub fn shutdown(&self) {
-        let mut shutdown = self.inner.shutdown.lock().unwrap();
-        if *shutdown {
-            return;
+        {
+            let mut shutdown = self.inner.shutdown.lock().unwrap();
+            if *shutdown {
+                return;
+            }
+            log::info!(
+                "pi-rpc: shutdown initiated (strong refs {}), closing stdin",
+                Arc::strong_count(&self.inner)
+            );
+            *shutdown = true;
         }
-        log::info!(
-            "pi-rpc: shutdown initiated (strong refs {}), closing stdin",
-            Arc::strong_count(&self.inner)
-        );
-        *shutdown = true;
-        // Dropping the stdin handle closes the pipe.
-        *self.inner.stdin.lock().unwrap() = None;
+
+        // Never wait for the stdin lock here: a blocked `write_request` holds
+        // it precisely when pi has stopped reading. Try once; the watchdog
+        // below kills the process if the pipe cannot be closed.
+        if let Ok(mut stdin) = self.inner.stdin.try_lock() {
+            *stdin = None;
+        }
 
         // Graceful shutdown is the documented path, but a wedged Pi must not
         // outlive the app. Give it three seconds, then kill it.
@@ -506,10 +562,17 @@ impl PiClient {
     /// graceful shutdown would hang; killing it surfaces the disconnect to
     /// subscribers, which is what a watchdog wants.
     pub fn kill(&self) {
+        self.inner.killed.store(true, Ordering::Relaxed);
         *self.inner.shutdown.lock().unwrap() = true;
-        *self.inner.stdin.lock().unwrap() = None;
+        // A blocked writer may hold the stdin lock. Do not wait; killing the
+        // child breaks the pipe and unblocks it.
+        if let Ok(mut stdin) = self.inner.stdin.try_lock() {
+            *stdin = None;
+        }
         let mut guard = self.inner.child.lock().unwrap();
-        if let Some(child) = guard.as_mut() {
+        if let Some(child) = guard.as_mut()
+            && matches!(child.try_wait(), Ok(None))
+        {
             log::warn!("pi-rpc: killing the unresponsive process");
             let _ = child.kill();
             let _ = child.wait();

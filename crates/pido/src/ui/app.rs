@@ -1,12 +1,12 @@
 //! The root view: Ely's FocusScope wrapping a sidebar and the session pane.
 
-use ely_gpui_component::forms::{InputEvent, TextInput};
+use ely_gpui_component::forms::{Enter, InputEvent, TextInput};
 use ely_gpui_component::layout::SplitPane;
 use ely_gpui_component::primitives::FocusScope;
 use ely_gpui_component::theme::{ActiveTheme, ContainerSize, Mode, Theme};
 use gpui::{
-    App, AppContext, Context, FocusHandle, InteractiveElement, IntoElement, ParentElement, Render,
-    StatefulInteractiveElement, Styled, Window, actions, div,
+    App, AppContext, Context, FocusHandle, Focusable, InteractiveElement, IntoElement,
+    ParentElement, Render, StatefulInteractiveElement, Styled, Window, actions, div,
 };
 
 use crate::i18n;
@@ -30,9 +30,8 @@ pub const HEADER_HEIGHT: f32 = 52.;
 
 /// The sidebar's default width, in logical pixels.
 const SIDEBAR_DEFAULT: f32 = 264.0;
-/// The sidebar may drag to 0.8x–1.5x of that default.
-const SIDEBAR_RANGE: std::ops::RangeInclusive<f32> =
-    (SIDEBAR_DEFAULT * 0.8)..=(SIDEBAR_DEFAULT * 1.5);
+/// The sidebar drags within the range the README promises.
+const SIDEBAR_RANGE: std::ops::RangeInclusive<f32> = 200.0..=480.0;
 /// The right panel's width range, in logical pixels.
 const RIGHT_RANGE: std::ops::RangeInclusive<f32> = 200.0..=900.0;
 
@@ -62,6 +61,8 @@ pub struct PidoApp {
     pub welcome_dir: Option<gpui::Entity<TextInput>>,
     /// Last observed window size, persisted on quit.
     window_size: Option<(f32, f32)>,
+    /// Throttles pane-width writes while the split is being dragged.
+    pane_save_at: std::rc::Rc<std::cell::Cell<Option<std::time::Instant>>>,
     /// Whether the composer has been focused since the session went live.
     composer_focused: bool,
     /// The dialog's text field (input/editor), per pending request id.
@@ -103,6 +104,9 @@ pub struct PidoApp {
     palette_gen: u64,
     /// The palette's highlighted row, over the filtered list.
     palette_selected: usize,
+    /// The session epoch the find bar and palette were opened for; changing
+    /// sessions drops both so their indices cannot outlive the transcript.
+    session_seen: u64,
     /// The sidebar's session-search field, created once in setup.
     pub search_field: Option<gpui::Entity<TextInput>>,
 }
@@ -115,6 +119,11 @@ pub struct FindState {
     pub query: String,
     pub matches: Vec<usize>,
     pub current: usize,
+    /// Transcript shape the matches were computed from; avoids a full rescan
+    /// on every frame while the bar is open.
+    scanned_count: usize,
+    scanned_streaming: bool,
+    scanned_at: std::time::Instant,
 }
 
 /// The command palette: its query field and an id generation that resets
@@ -150,6 +159,15 @@ impl PidoApp {
         // Re-render whenever the state entity changes, and drain any text a
         // cancelled/failed action wants restored into the composer.
         cx.observe(&state, |this, state, cx| {
+            // Find matches and palette rows carry transcript indices; a new
+            // session invalidates both.
+            let epoch = state.read(cx).session_epoch;
+            if this.session_seen != epoch {
+                this.session_seen = epoch;
+                this.find = None;
+                this.palette = None;
+                this.palette_selected = 0;
+            }
             let restored = state.update(cx, |state, _| state.take_pending_composer_text());
             if let (Some(text), Some(draft)) = (restored, this.draft.clone()) {
                 draft.update(cx, |input, cx| {
@@ -178,6 +196,7 @@ impl PidoApp {
         let snap_since = std::rc::Rc::new(std::cell::Cell::new(None));
         let snap_flip = std::rc::Rc::new(std::cell::Cell::new(0u64));
         let right_open = persisted.right_open.unwrap_or(false);
+        let session_seen = state.read(cx).session_epoch;
         let app = Self {
             left_px,
             right_px,
@@ -188,6 +207,7 @@ impl PidoApp {
             draft: None,
             welcome_dir: None,
             window_size: None,
+            pane_save_at: std::rc::Rc::new(std::cell::Cell::new(None)),
             composer_focused: false,
             dialog_field: None,
             dialog_field_for: None,
@@ -208,6 +228,7 @@ impl PidoApp {
             palette: None,
             palette_gen: 0,
             palette_selected: 0,
+            session_seen,
             search_field: None,
         };
         app.observe_window_for_quit(cx);
@@ -218,9 +239,14 @@ impl PidoApp {
     /// quits, so the window reopens where the user left it.
     fn observe_window_for_quit(&self, cx: &mut Context<Self>) {
         cx.on_app_quit(|this, _cx| {
+            let (left, right, right_open) =
+                (this.left_px.get(), this.right_px.get(), this.right_open);
             if let Some((width, height)) = this.window_size {
                 crate::settings::save_setting(|s| {
                     s.window = Some(crate::settings::WindowState { width, height });
+                    s.sidebar_width = Some(left);
+                    s.right_width = Some(right);
+                    s.right_open = Some(right_open);
                 });
             }
             async {}
@@ -300,19 +326,37 @@ impl Render for PidoApp {
         let state = self.state.clone();
         let live = matches!(state.read(cx).conn, Conn::Live | Conn::Reconnecting { .. });
 
-        // The find bar's matches track its query and the live transcript.
+        // The find bar's matches track its query and the transcript. While a
+        // stream is running the text changes every frame, so rescan at a
+        // human pace rather than on every redraw.
         if let Some(find) = &mut self.find {
             let query = find.field.read(cx).text().trim().to_string();
-            if query != find.query {
+            let s = state.read(cx);
+            let count = s.transcript.len();
+            let streaming = s.streaming;
+            let now = std::time::Instant::now();
+            let query_changed = query != find.query;
+            let due = query_changed
+                || count != find.scanned_count
+                || streaming != find.scanned_streaming
+                || (streaming
+                    && now.duration_since(find.scanned_at)
+                        >= std::time::Duration::from_millis(250));
+            if due {
+                if query_changed {
+                    find.current = 0;
+                }
                 find.query = query.clone();
-                find.current = 0;
+                find.matches = crate::state::find_matches(s.transcript.as_slice(), &query);
+                find.scanned_count = count;
+                find.scanned_streaming = streaming;
+                find.scanned_at = now;
+                find.current = if find.matches.is_empty() {
+                    0
+                } else {
+                    find.current.min(find.matches.len() - 1)
+                };
             }
-            find.matches = crate::state::find_matches(state.read(cx).transcript.as_slice(), &query);
-            find.current = if find.matches.is_empty() {
-                0
-            } else {
-                find.current.min(find.matches.len() - 1)
-            };
         }
 
         if live && !self.composer_focused {
@@ -428,6 +472,7 @@ impl Render for PidoApp {
                         let right_cell = self.right_px.clone();
                         let snap_since = self.snap_since.clone();
                         let snap_flip = self.snap_flip.clone();
+                        let pane_save_at = self.pane_save_at.clone();
                         // Dragging past a limit clamps the stored width, but
                         // the split only reseeds from it on the next render —
                         // so the handler nudges one when a drag left the range.
@@ -461,31 +506,85 @@ impl Render for PidoApp {
                                     snap_flip.set(snap_flip.get().wrapping_add(1));
                                 }
                                 let (left, right) = (left_cell.get(), right_cell.get());
-                                crate::settings::save_setting(|s| {
-                                    s.sidebar_width = Some(left);
-                                    if shares.len() > 2 {
-                                        s.right_width = Some(right);
-                                    }
+                                // Dragging emits an event per frame; save at
+                                // most a few times a second. The quit handler
+                                // stores the final widths.
+                                let now = std::time::Instant::now();
+                                let due = pane_save_at.get().is_none_or(|last| {
+                                    now.duration_since(last)
+                                        >= std::time::Duration::from_millis(250)
                                 });
+                                if due {
+                                    pane_save_at.set(Some(now));
+                                    crate::settings::save_setting(|s| {
+                                        s.sidebar_width = Some(left);
+                                        if shares.len() > 2 {
+                                            s.right_width = Some(right);
+                                        }
+                                    });
+                                }
                                 if drifted && let Err(error) = me.update(cx, |_, cx| cx.notify()) {
                                     log::debug!("split snap-back lost: {error}");
                                 }
                             })
                     })
                     .children(overlay)
+                    // PromptInput gates its Enter/send on text being
+                    // non-empty; when only images are staged, send here so an
+                    // image-only message is possible.
+                    .capture_action(cx.listener(|this, _: &Enter, window, cx| {
+                        let state = this.state.read(cx);
+                        if state.pending_images.is_empty() {
+                            return;
+                        }
+                        let Some(draft) = this.draft.clone() else {
+                            return;
+                        };
+                        if !draft.read(cx).focus().contains_focused(window, cx) {
+                            return;
+                        }
+                        if !draft.read(cx).text().trim().is_empty() {
+                            return;
+                        }
+                        this.state
+                            .update(cx, |s, cx| s.send_text(String::new(), cx));
+                        cx.stop_propagation();
+                    }))
                     // Esc stops a running agent (clear queue + abort, the
                     // protocol's recommended Esc semantics). TextInput does not
                     // consume Escape, so this also works while the composer is
                     // focused.
-                    .on_action(cx.listener(|this, _: &Stop, _window, cx| {
+                    .on_action(cx.listener(|this, _: &Stop, window, cx| {
+                        // A dialog owns Escape: cancel it instead of also
+                        // stopping the run underneath.
+                        if this.rename_open {
+                            this.close_rename(cx);
+                            return;
+                        }
+                        if let Some(dialog) = this.state.read(cx).pending_dialog.clone() {
+                            this.state
+                                .update(cx, |s, cx| s.cancel_dialog(&dialog.id, cx));
+                            return;
+                        }
+                        // The terminal consumes Escape as the \x1b key; the
+                        // global Stop action must not steal it.
+                        let terminal_focused = this.terminal.as_ref().is_some_and(|terminal| {
+                            terminal
+                                .read(cx)
+                                .focus_handle(cx)
+                                .contains_focused(window, cx)
+                        });
+                        if terminal_focused {
+                            return;
+                        }
                         // Esc backs out of the palette, the find bar and the
                         // right panel before it stops a run.
                         if this.palette.is_some() {
-                            this.close_palette(cx);
+                            this.close_palette(window, cx);
                             return;
                         }
                         if this.find.is_some() {
-                            this.close_find(cx);
+                            this.close_find(window, cx);
                             return;
                         }
                         if this.right_open {
@@ -501,7 +600,7 @@ impl Render for PidoApp {
                     }))
                     .on_action(cx.listener(|this, _: &Palette, window, cx| {
                         if this.palette.is_some() {
-                            this.close_palette(cx);
+                            this.close_palette(window, cx);
                         } else {
                             this.open_palette(window, cx);
                         }
@@ -533,12 +632,28 @@ impl Render for PidoApp {
 impl PidoApp {
     /// The split's sizes, in shares of the window, from the clamped widths.
     fn pane_sizes(&self, window_width: f32) -> Vec<f32> {
-        let left = self.left_px.get() / window_width;
+        let width = window_width.max(1.0);
+        let mut left = self.left_px.get();
         if self.right_open {
-            let right = self.right_px.get() / window_width;
-            vec![left, 1.0 - left - right, right]
+            let mut right = self.right_px.get();
+            // Never let the side panes eat the chat column: the right panel
+            // gives width back first, then the sidebar.
+            const MIN_CHAT: f32 = 360.0;
+            let over = left + right + MIN_CHAT - width;
+            if over > 0.0 {
+                let right_slack = (right - *RIGHT_RANGE.start()).max(0.0);
+                let give = over.min(right_slack);
+                right -= give;
+                let remaining = over - give;
+                if remaining > 0.0 {
+                    left = (left - remaining).max(*SIDEBAR_RANGE.start());
+                }
+            }
+            let (left, right) = (left / width, right / width);
+            vec![left, (1.0 - left - right).max(0.0), right]
         } else {
-            vec![left, 1.0 - left]
+            let left = (left / width).min(1.0);
+            vec![left, (1.0 - left).max(0.0)]
         }
     }
 
@@ -597,13 +712,25 @@ impl PidoApp {
             query: String::new(),
             matches: Vec::new(),
             current: 0,
+            scanned_count: 0,
+            scanned_streaming: false,
+            scanned_at: std::time::Instant::now(),
         });
         cx.notify();
     }
 
-    pub fn close_find(&mut self, cx: &mut Context<Self>) {
+    pub fn close_find(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.find.take().is_some() {
+            self.focus_composer(window, cx);
             cx.notify();
+        }
+    }
+
+    /// Put focus back in the composer after a transient overlay closes.
+    fn focus_composer(&self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(draft) = &self.draft {
+            let focus = draft.read(cx).focus().clone();
+            window.focus(&focus, cx);
         }
     }
 
@@ -622,7 +749,16 @@ impl PidoApp {
             (find.current + len - 1) % len
         };
         let ix = find.matches[find.current];
-        // A match can live inside a folded turn — a tool result, most often.
+        // The index was computed by an earlier frame. If the transcript
+        // shrank (a failed send removed a bubble, say), drop the search
+        // instead of slicing out of bounds.
+        let len = self.state.read(cx).transcript.len();
+        if ix >= len {
+            self.find = None;
+            cx.notify();
+            return;
+        }
+        // A match can live inside a folded turn -a tool result, most often.
         // Unfold that turn so the row exists to scroll to and tint.
         let turn_ix = self.state.read(cx).transcript[..ix]
             .iter()
@@ -655,8 +791,9 @@ impl PidoApp {
     }
 
     /// Close the command palette.
-    pub fn close_palette(&mut self, cx: &mut Context<Self>) {
+    pub fn close_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.palette.take().is_some() {
+            self.focus_composer(window, cx);
             cx.notify();
         }
     }
@@ -753,7 +890,7 @@ impl PidoApp {
             } else {
                 None
             };
-            this.close_palette(cx);
+            this.close_palette(window, cx);
             match &item.action {
                 PaletteAction::SwitchSession(path) => this
                     .state
@@ -829,7 +966,7 @@ impl PidoApp {
                 .on_click(move |_, window, cx| {
                     row_view.update(cx, |this, cx| {
                         let item = row_item.clone();
-                        this.close_palette(cx);
+                        this.close_palette(window, cx);
                         run_item(this, &item, window, cx);
                     });
                 })
@@ -848,8 +985,9 @@ impl PidoApp {
                 .bg(gpui::rgba(0x00000059))
                 .on_mouse_down(gpui::MouseButton::Left, {
                     let view = view.downgrade();
-                    move |_, _, cx| {
-                        view.update(cx, |this, cx| this.close_palette(cx)).ok();
+                    move |_, window, cx| {
+                        view.update(cx, |this, cx| this.close_palette(window, cx))
+                            .ok();
                     }
                 })
                 .child(
@@ -967,7 +1105,18 @@ impl PidoApp {
             cwd,
             env: Vec::new(),
         };
-        let spawned = cx.new(|cx| Terminal::spawn(launch, cx).expect("terminal starts"));
+        let spawned = cx.new(|cx| {
+            match Terminal::spawn(launch, cx) {
+                Ok(terminal) => terminal,
+                Err(error) => {
+                    // A deleted cwd or unavailable ConPTY must not panic the
+                    // whole app. Show the failure in a read-only terminal.
+                    log::warn!("terminal failed to start: {error}");
+                    let message = format!("pido: failed to start shell: {error}\r\n");
+                    Terminal::replay(message.as_bytes(), 80, 24, cx)
+                }
+            }
+        });
         cx.subscribe(
             &spawned,
             |this, _, event: &ely_gpui_component::terminal::TerminalEvent, cx| {

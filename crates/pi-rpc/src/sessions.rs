@@ -256,16 +256,31 @@ fn group_summaries(mut summaries: Vec<SessionSummary>) -> Vec<SessionGroup> {
 
     let mut groups: Vec<SessionGroup> = Vec::new();
     for summary in summaries {
-        if let Some(group) = groups.iter_mut().find(|g| g.cwd == summary.cwd) {
-            group.sessions.push(summary);
-        } else {
+        let key = cwd_key(&summary.cwd);
+        let Some(group) = groups.iter_mut().find(|group| cwd_key(&group.cwd) == key) else {
             groups.push(SessionGroup {
                 cwd: summary.cwd.clone(),
                 sessions: vec![summary],
             });
-        }
+            continue;
+        };
+        group.sessions.push(summary);
     }
     groups
+}
+
+/// Compare working directories without caring about slash style, a trailing
+/// separator, or (on Windows) letter case. The sidebar's project grouping and
+/// project labels use the same identity.
+fn cwd_key(cwd: &str) -> String {
+    let mut key = cwd.replace('\\', "/");
+    while key.len() > 1 && key.ends_with('/') {
+        key.pop();
+    }
+    if cfg!(windows) {
+        key.make_ascii_lowercase();
+    }
+    key
 }
 
 /// Last activity, from the file's modification time. Falls back to 0 when
@@ -296,16 +311,36 @@ fn walk_dirs(root: &Path) -> anyhow::Result<Vec<PathBuf>> {
     let mut files = Vec::new();
     let entries = std::fs::read_dir(root)
         .map_err(|err| anyhow::anyhow!("cannot read session dir {}: {err}", root.display()))?;
-    for entry in entries.flatten() {
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                log::warn!("session dir {}: {error}", root.display());
+                continue;
+            }
+        };
         let path = entry.path();
-        if path.is_dir()
-            && let Ok(children) = std::fs::read_dir(&path)
-        {
-            for child in children.flatten() {
-                let child_path = child.path();
-                if child_path.extension().is_some_and(|ext| ext == "jsonl") {
-                    files.push(child_path);
+        if !path.is_dir() {
+            continue;
+        }
+        let children = match std::fs::read_dir(&path) {
+            Ok(children) => children,
+            Err(error) => {
+                log::warn!("session dir {}: {error}", path.display());
+                continue;
+            }
+        };
+        for child in children {
+            let child = match child {
+                Ok(child) => child,
+                Err(error) => {
+                    log::warn!("session dir {}: {error}", path.display());
+                    continue;
                 }
+            };
+            let child_path = child.path();
+            if child_path.extension().is_some_and(|ext| ext == "jsonl") {
+                files.push(child_path);
             }
         }
     }
@@ -661,6 +696,13 @@ mod tests {
             10,
         );
         assert_eq!(read_session_cwd(&path).as_deref(), Some("C:\\one"));
+    }
+
+    #[test]
+    fn cwd_spellings_share_one_key() {
+        assert_eq!(cwd_key("C:\\dev\\x\\"), cwd_key("C:/dev/x"));
+        assert_eq!(cwd_key("/home/a/"), cwd_key("/home/a"));
+        assert_eq!(cwd_key("/"), "/");
     }
 
     #[test]

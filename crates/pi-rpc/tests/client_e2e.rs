@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use pi_rpc::client::{ClientEvent, DisconnectReason, PiClient, PiProcessConfig};
-use pi_rpc::protocol::{Command, Event, RpcRecord, SessionState};
+use pi_rpc::protocol::{BashResult, Command, Event, RpcRecord, SessionState};
 
 fn mock_pi_path() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_mock_pi"))
@@ -152,6 +152,84 @@ fn closing_stdin_disconnects_gracefully() {
             }
             Ok(_) => continue,
             Err(_) => panic!("timed out waiting for disconnect notification"),
+        }
+    }
+}
+
+#[test]
+fn bash_output_events_echo_the_caller_id() {
+    let client = spawn_mock();
+    let subscriber = client.subscribe();
+
+    let response = client
+        .request_with_id(
+            "shell-1".into(),
+            Command::Bash {
+                command: "echo hi".into(),
+                exclude_from_context: None,
+            },
+        )
+        .expect("bash request failed");
+    assert!(response.success);
+    let result = response
+        .data_as::<BashResult>()
+        .expect("bash payload parse failed")
+        .expect("bash payload missing");
+    assert_eq!(result.output, "mock output\n");
+    assert_eq!(result.exit_code, 0);
+
+    loop {
+        match subscriber.recv_timeout(Duration::from_secs(5)) {
+            Ok(ClientEvent::Record(RpcRecord::Event(Event::BashExecutionUpdate { id, delta }))) => {
+                assert_eq!(id.as_deref(), Some("shell-1"));
+                assert_eq!(delta, "mock output\n");
+                return;
+            }
+            Ok(ClientEvent::Disconnected(reason)) => {
+                panic!("unexpected disconnect: {reason:?}")
+            }
+            Ok(_) => {}
+            Err(_) => panic!("timed out waiting for the bash output event"),
+        }
+    }
+}
+
+#[test]
+fn a_late_subscriber_still_sees_the_disconnect() {
+    let client = spawn_mock();
+    let early = client.subscribe();
+    client.shutdown();
+    loop {
+        match early.recv_timeout(Duration::from_secs(10)) {
+            Ok(ClientEvent::Disconnected(_)) => break,
+            Ok(_) => continue,
+            Err(_) => panic!("timed out waiting for the first disconnect"),
+        }
+    }
+
+    let late = client.subscribe();
+    match late.recv_timeout(Duration::from_secs(2)) {
+        Ok(ClientEvent::Disconnected(reason)) => {
+            assert_eq!(reason, DisconnectReason::ClosedByClient)
+        }
+        Ok(_) => panic!("late subscriber received a non-disconnect event"),
+        Err(_) => panic!("late subscriber received nothing"),
+    }
+}
+
+#[test]
+fn kill_reports_a_killed_disconnect() {
+    let client = spawn_mock();
+    let subscriber = client.subscribe();
+    client.kill();
+    loop {
+        match subscriber.recv_timeout(Duration::from_secs(10)) {
+            Ok(ClientEvent::Disconnected(reason)) => {
+                assert_eq!(reason, DisconnectReason::Killed);
+                return;
+            }
+            Ok(_) => continue,
+            Err(_) => panic!("timed out waiting for the killed disconnect"),
         }
     }
 }

@@ -271,8 +271,21 @@ pub enum RpcRecord {
 /// [`RpcRecord::Unknown`] rather than failing, so a newer Pi never breaks the
 /// client. A known type that fails to parse is a real error and surfaces as
 /// `Err`.
+/// `#[serde(default)]` treats an explicit `null` as a missing field only for
+/// `Option`; vec fields need this to survive writers that send `content:
+/// null`.
+fn null_as_empty_vec<'de, D, T>(deserializer: D) -> Result<Vec<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::Deserialize<'de>,
+{
+    let value: Option<Vec<T>> = serde::Deserialize::deserialize(deserializer)?;
+    Ok(value.unwrap_or_default())
+}
+
 pub fn parse_record(line: &str) -> anyhow::Result<RpcRecord> {
-    let value: Value = serde_json::from_str(line.trim_end_matches('\r'))?;
+    let line = line.trim_end_matches('\r');
+    let value: Value = serde_json::from_str(line)?;
     let record_type = value
         .get("type")
         .and_then(Value::as_str)
@@ -282,16 +295,29 @@ pub fn parse_record(line: &str) -> anyhow::Result<RpcRecord> {
         "extension_ui_request" => Ok(RpcRecord::ExtensionUiRequest(serde_json::from_value(
             value,
         )?)),
-        _ => match serde_json::from_value::<Event>(value.clone()) {
-            Ok(event) => Ok(RpcRecord::Event(event)),
-            Err(_err) if Event::is_unknown(&value) => Ok(RpcRecord::Unknown {
-                record_type: record_type.to_string(),
-                raw: value,
-            }),
-            Err(err) => Err(anyhow::anyhow!(
-                "failed to parse {record_type} record: {err}"
-            )),
-        },
+        _ => {
+            if Event::is_unknown(&value) {
+                return Ok(RpcRecord::Unknown {
+                    record_type: record_type.to_string(),
+                    raw: value,
+                });
+            }
+            // Parse from the original text rather than cloning the Value tree:
+            // message_update is the hot path.
+            match serde_json::from_str::<Event>(line) {
+                Ok(event) => Ok(RpcRecord::Event(event)),
+                // A known type this build cannot parse (usually a field a
+                // newer pi added). Keep it opaque instead of dropping the
+                // whole record: losing one record beats losing the stream.
+                Err(err) => {
+                    log::warn!("pi record {record_type} did not parse, keeping it opaque: {err}");
+                    Ok(RpcRecord::Unknown {
+                        record_type: record_type.to_string(),
+                        raw: value,
+                    })
+                }
+            }
+        }
     }
 }
 
@@ -560,6 +586,10 @@ pub enum AssistantMessageEvent {
         content_index: u32,
         tool_call: ToolCall,
     },
+    /// A delta type a newer pi added. The streaming record must keep
+    /// parsing — losing one increment beats losing the whole message.
+    #[serde(other)]
+    Unknown,
 }
 
 // ---------------------------------------------------------------------------
@@ -680,6 +710,9 @@ pub enum UserContentBlock {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AssistantMessage {
+    /// Absent or null on some writers; an empty message beats a failed
+    /// history parse.
+    #[serde(default, deserialize_with = "null_as_empty_vec")]
     pub content: Vec<AssistantContent>,
     #[serde(default)]
     pub api: Option<String>,
@@ -1152,6 +1185,22 @@ pub struct ClearedQueue {
     pub follow_up: Vec<String>,
 }
 
+/// `bash` response payload.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BashResult {
+    #[serde(default)]
+    pub output: String,
+    #[serde(default)]
+    pub exit_code: i32,
+    #[serde(default)]
+    pub cancelled: bool,
+    #[serde(default)]
+    pub truncated: bool,
+    #[serde(default)]
+    pub full_output_path: Option<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1381,6 +1430,53 @@ mod tests {
             },
             other => panic!("expected message_end, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn unknown_streaming_delta_keeps_the_message_update() {
+        let record = parse_record(
+            r#"{"type":"message_update","usage":{"input":1,"output":1},"assistantMessageEvent":{"type":"future_delta","contentIndex":0,"payload":"x"}}"#,
+        )
+        .unwrap();
+        match record {
+            RpcRecord::Event(Event::MessageUpdate {
+                assistant_message_event,
+                ..
+            }) => assert!(matches!(
+                assistant_message_event,
+                AssistantMessageEvent::Unknown
+            )),
+            other => panic!("expected message_update, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn null_assistant_content_parses_as_empty() {
+        let record = parse_record(
+            r#"{"type":"message_end","message":{"role":"assistant","content":null,"timestamp":1}}"#,
+        )
+        .unwrap();
+        match record {
+            RpcRecord::Event(Event::MessageEnd { message }) => match message {
+                AgentMessage::Assistant(assistant) => assert!(assistant.content.is_empty()),
+                other => panic!("expected assistant message, got {other:?}"),
+            },
+            other => panic!("expected message_end, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn known_event_that_fails_to_parse_is_kept_opaque() {
+        // message_end requires a message; a newer shape without one must not
+        // drop the record (or the whole stream).
+        let record = parse_record(r#"{"type":"message_end"}"#).unwrap();
+        assert!(matches!(
+            record,
+            RpcRecord::Unknown {
+                ref record_type,
+                ..
+            } if record_type == "message_end"
+        ));
     }
 
     #[test]

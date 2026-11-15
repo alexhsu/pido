@@ -105,7 +105,8 @@ pub fn render(state: &Entity<AppState>, app: &mut PidoApp, cx: &App) -> impl Int
         };
         let remove_state = state.clone();
         let key = image.key.clone();
-        AttachmentChip::new("composer-image", attachment).on_remove(move |_, cx| {
+        let chip_id = format!("composer-image-{key}");
+        AttachmentChip::new(chip_id, attachment).on_remove(move |_, cx| {
             remove_state.update(cx, |s, cx| {
                 s.remove_image(&key);
                 cx.notify();
@@ -208,41 +209,17 @@ pub fn render(state: &Entity<AppState>, app: &mut PidoApp, cx: &App) -> impl Int
             QueueChoice::Steer => i18n::t(cx, "queued_steer"),
             QueueChoice::FollowUp => i18n::t(cx, "queued_follow_up"),
         };
-        // Delivery granularity for the queue pi already holds: all at
-        // once, or one message per turn.
-        let (all_label, one_label) = (
-            i18n::t(cx, "deliver_all").to_string(),
-            i18n::t(cx, "deliver_one").to_string(),
-        );
-        let delivery_all_state = state.clone();
-        let delivery_one_state = state.clone();
-        let delivery_menu = ely_gpui_component::menus::Menu::new()
-            .item(
-                ely_gpui_component::menus::MenuItem::radio(
-                    all_label,
-                    s.steer_mode != Some(pi_rpc::protocol::QueueMode::OneAtATime),
-                )
-                .on_click(move |_, cx| {
-                    delivery_all_state.update(cx, |s, cx| {
-                        s.set_queue_delivery(true, pi_rpc::protocol::QueueMode::All, cx)
-                    });
-                }),
-            )
-            .item(
-                ely_gpui_component::menus::MenuItem::radio(
-                    one_label,
-                    s.steer_mode == Some(pi_rpc::protocol::QueueMode::OneAtATime),
-                )
-                .on_click(move |_, cx| {
-                    delivery_one_state.update(cx, |s, cx| {
-                        s.set_queue_delivery(true, pi_rpc::protocol::QueueMode::OneAtATime, cx)
-                    });
-                }),
-            );
-        let menu = menu.item(ely_gpui_component::menus::MenuItem::submenu(
-            i18n::t(cx, "delivery"),
-            delivery_menu,
-        ));
+        // Delivery granularity for each queue pi holds: all at once, or one
+        // message per turn. Steering and follow-ups have independent modes.
+        let menu = menu
+            .item(ely_gpui_component::menus::MenuItem::submenu(
+                i18n::t(cx, "delivery_steer"),
+                delivery_menu(s.steer_mode, true, state.clone(), cx),
+            ))
+            .item(ely_gpui_component::menus::MenuItem::submenu(
+                i18n::t(cx, "delivery_follow_up"),
+                delivery_menu(s.follow_up_mode, false, state.clone(), cx),
+            ));
         Some(
             ely_gpui_component::menus::DropdownMenu::new("composer-queue", label, menu)
                 .variant(ButtonVariant::Ghost),
@@ -320,6 +297,41 @@ pub fn render(state: &Entity<AppState>, app: &mut PidoApp, cx: &App) -> impl Int
             )
         })
         .into_any_element()
+}
+
+/// Delivery granularity for one queue: all messages at once or one per turn.
+fn delivery_menu(
+    current: Option<pi_rpc::protocol::QueueMode>,
+    steering: bool,
+    state: Entity<AppState>,
+    cx: &App,
+) -> Menu {
+    use pi_rpc::protocol::QueueMode;
+    let (all_label, one_label) = (
+        i18n::t(cx, "deliver_all").to_string(),
+        i18n::t(cx, "deliver_one").to_string(),
+    );
+    let all_state = state.clone();
+    let one_state = state;
+    Menu::new()
+        .item(
+            MenuItem::radio(all_label, current != Some(QueueMode::OneAtATime)).on_click(
+                move |_, cx| {
+                    all_state.update(cx, |s, cx| {
+                        s.set_queue_delivery(steering, QueueMode::All, cx)
+                    });
+                },
+            ),
+        )
+        .item(
+            MenuItem::radio(one_label, current == Some(QueueMode::OneAtATime)).on_click(
+                move |_, cx| {
+                    one_state.update(cx, |s, cx| {
+                        s.set_queue_delivery(steering, QueueMode::OneAtATime, cx)
+                    });
+                },
+            ),
+        )
 }
 
 /// One pill reading `Model Level`, opening a two-row menu: the model list and

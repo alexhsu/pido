@@ -51,7 +51,8 @@ pub fn render(
             })
             .unwrap_or_default();
         let field = cx.new(|cx| {
-            let mut input = TextInput::new(window, cx).placeholder("D:\\develop\\my-project");
+            let mut input =
+                TextInput::new(window, cx).placeholder(i18n::t(cx, "project_placeholder"));
             input.set_text(cwd_guess, cx);
             input
         });
@@ -236,7 +237,14 @@ fn render_environment(
                 theme.colors.danger_subtle,
                 theme.colors.danger,
                 i18n::t(cx, "pi_missing"),
-                i18n::t(cx, "pi_missing_desc"),
+                i18n::t(
+                    cx,
+                    if cfg!(windows) {
+                        "pi_missing_desc_win"
+                    } else {
+                        "pi_missing_desc_unix"
+                    },
+                ),
             )
         } else if s.environment.ready_providers.is_empty() {
             (

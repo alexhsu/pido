@@ -244,62 +244,58 @@ pub fn render(
                     let view = view.clone();
                     let (text_sm, text_xs, radius_md) = (text_sm, text_xs, radius_md);
                     this.child(
-                        VirtualList::new(
-                            ("sessions", rows.len() as u64),
-                            rows.len(),
-                            move |ix, _, cx| {
-                                let row = &rows[ix];
-                                match row {
-                                    SidebarRow::Group {
-                                        label,
-                                        cwd,
-                                        folded,
-                                        sessions,
-                                        archived,
-                                    } => group_row(
-                                        cx,
-                                        ix,
-                                        &state,
-                                        &view,
-                                        label.clone(),
-                                        cwd.clone(),
-                                        *folded,
-                                        *sessions,
-                                        *archived,
-                                    ),
-                                    SidebarRow::Session {
-                                        path,
-                                        session_id,
-                                        title,
-                                        updated,
-                                        pinned,
-                                        archived,
-                                        depth,
-                                        children,
-                                        hint,
-                                    } => session_row(
-                                        cx,
-                                        ix,
-                                        &state,
-                                        &view,
-                                        path.clone(),
-                                        session_id.clone(),
-                                        title.clone(),
-                                        *updated,
-                                        *pinned,
-                                        *archived,
-                                        *depth,
-                                        *children,
-                                        hint.clone(),
-                                        control_h,
-                                        radius_md,
-                                        text_sm,
-                                        text_xs,
-                                        label_lead,
-                                    ),
-                                }
-                            },
-                        )
+                        VirtualList::new("sessions", rows.len(), move |ix, _, cx| {
+                            let row = &rows[ix];
+                            match row {
+                                SidebarRow::Group {
+                                    label,
+                                    cwd,
+                                    folded,
+                                    sessions,
+                                    archived,
+                                } => group_row(
+                                    cx,
+                                    ix,
+                                    &state,
+                                    &view,
+                                    label.clone(),
+                                    cwd.clone(),
+                                    *folded,
+                                    *sessions,
+                                    *archived,
+                                ),
+                                SidebarRow::Session {
+                                    path,
+                                    session_id,
+                                    title,
+                                    updated,
+                                    pinned,
+                                    archived,
+                                    depth,
+                                    children,
+                                    hint,
+                                } => session_row(
+                                    cx,
+                                    ix,
+                                    &state,
+                                    &view,
+                                    path.clone(),
+                                    session_id.clone(),
+                                    title.clone(),
+                                    *updated,
+                                    *pinned,
+                                    *archived,
+                                    *depth,
+                                    *children,
+                                    hint.clone(),
+                                    control_h,
+                                    radius_md,
+                                    text_sm,
+                                    text_xs,
+                                    label_lead,
+                                ),
+                            }
+                        })
                         .size_full(),
                     )
                 }),
@@ -502,7 +498,7 @@ fn session_row(
         .w_full()
         .flex()
         .flex_col()
-        .pl(px(12. + 14. * depth as f32) + label_lead)
+        .pl(px(12. + 14. * depth.min(4) as f32) + label_lead)
         .pr_0p5()
         .rounded(radius_md)
         .text_size(text_sm)

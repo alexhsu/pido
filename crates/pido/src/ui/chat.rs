@@ -508,8 +508,8 @@ fn render_find_bar(
             )
             .variant(ely_gpui_component::buttons::ButtonVariant::Ghost)
             .size(ely_gpui_component::theme::ControlSize::Sm)
-            .on_click(move |_, _, cx| {
-                close_view.update(cx, |this, cx| this.close_find(cx));
+            .on_click(move |_, window, cx| {
+                close_view.update(cx, |this, cx| this.close_find(window, cx));
             })
         })
 }
