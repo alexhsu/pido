@@ -17,6 +17,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::Deserialize;
 
+use crate::io_util::read_line_capped;
+
 /// Default session root: `$PI_CODING_AGENT_SESSION_DIR`, else
 /// `~/.pi/agent/sessions`. Pi honours the same variable.
 pub fn default_session_dir() -> Option<PathBuf> {
@@ -425,35 +427,6 @@ fn parse_session_file(path: &Path) -> Option<SessionSummary> {
         message_count,
         parent_session: header.parent_session,
     })
-}
-
-/// Read one line into `buf`, keeping at most `cap` bytes. Returns the line's
-/// full byte length; a value above `cap` means it was truncated. Consumes the
-/// rest of the line without buffering it.
-fn read_line_capped<R: BufRead>(
-    reader: &mut R,
-    buf: &mut Vec<u8>,
-    cap: usize,
-) -> std::io::Result<usize> {
-    buf.clear();
-    let mut total = 0usize;
-    loop {
-        let available = reader.fill_buf()?;
-        if available.is_empty() {
-            return Ok(total);
-        }
-        let newline = available.iter().position(|byte| *byte == b'\n');
-        let take = newline.map_or(available.len(), |index| index + 1);
-        if buf.len() < cap {
-            let room = cap - buf.len();
-            buf.extend_from_slice(&available[..take.min(room)]);
-        }
-        reader.consume(take);
-        total += take;
-        if newline.is_some() {
-            return Ok(total);
-        }
-    }
 }
 
 /// The file's last modification time, as unix seconds; None when unknown.

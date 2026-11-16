@@ -561,6 +561,11 @@ impl Render for PidoApp {
                             this.close_rename(cx);
                             return;
                         }
+                        if this.confirm_remove.is_some() {
+                            this.confirm_remove = None;
+                            cx.notify();
+                            return;
+                        }
                         if let Some(dialog) = this.state.read(cx).pending_dialog.clone() {
                             this.state
                                 .update(cx, |s, cx| s.cancel_dialog(&dialog.id, cx));
@@ -689,6 +694,9 @@ impl PidoApp {
 
     /// Open the transcript find bar, or refocus it when already open.
     pub fn toggle_find(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.modal_open(cx) {
+            return;
+        }
         if let Some(find) = &self.find {
             let focus = find.field.read(cx).focus().clone();
             window.focus(&focus, cx);
@@ -801,6 +809,9 @@ impl PidoApp {
     /// Open the command palette (Ctrl+K); it closes via the scrim, a pick,
     /// or Ctrl+K again.
     pub fn open_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.modal_open(cx) {
+            return;
+        }
         log::info!("open_palette: enter");
         self.palette_gen = self.palette_gen.wrapping_add(1);
         self.palette_selected = 0;
@@ -1112,7 +1123,10 @@ impl PidoApp {
                     // A deleted cwd or unavailable ConPTY must not panic the
                     // whole app. Show the failure in a read-only terminal.
                     log::warn!("terminal failed to start: {error}");
-                    let message = format!("pido: failed to start shell: {error}\r\n");
+                    let message = format!(
+                        "{}\r\n",
+                        crate::i18n::t_arg(cx, "terminal_failed", "e", &error.to_string())
+                    );
                     Terminal::replay(message.as_bytes(), 80, 24, cx)
                 }
             }
@@ -1297,6 +1311,14 @@ impl PidoApp {
         self.rename_target = None;
         self.rename_project = None;
         cx.notify();
+    }
+
+    /// Whether a dialog owns the keyboard right now. Overlays that open from
+    /// shortcuts must not stack themselves on top of one.
+    fn modal_open(&self, cx: &App) -> bool {
+        self.rename_open
+            || self.confirm_remove.is_some()
+            || self.state.read(cx).pending_dialog.is_some()
     }
 
     fn rename_dialog(&mut self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {

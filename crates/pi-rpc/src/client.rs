@@ -31,6 +31,7 @@ use std::os::windows::process::CommandExt;
 
 use crossbeam_channel::{Receiver, Sender, unbounded};
 
+use crate::io_util::read_line_capped;
 use crate::protocol::{Command, Request, Response, RpcRecord, parse_record};
 
 /// Generates monotonically increasing request ids. Prefixed `pido-` so they
@@ -598,35 +599,6 @@ impl PiClient {
     }
 }
 
-/// Read one `\n`-terminated record, buffering at most `cap` bytes. The full
-/// length is returned so oversize records can be skipped without allocating
-/// them.
-fn read_line_capped<R: BufRead>(
-    reader: &mut R,
-    buf: &mut Vec<u8>,
-    cap: usize,
-) -> std::io::Result<usize> {
-    buf.clear();
-    let mut total = 0usize;
-    loop {
-        let available = reader.fill_buf()?;
-        if available.is_empty() {
-            return Ok(total);
-        }
-        let newline = available.iter().position(|byte| *byte == b'\n');
-        let take = newline.map_or(available.len(), |index| index + 1);
-        if buf.len() < cap {
-            let room = cap - buf.len();
-            buf.extend_from_slice(&available[..take.min(room)]);
-        }
-        reader.consume(take);
-        total += take;
-        if newline.is_some() {
-            return Ok(total);
-        }
-    }
-}
-
 /// Forward an event to every live subscriber; dead receivers are dropped.
 fn fan_out(inner: &Inner, event: ClientEvent) {
     let mut subscribers = inner.subscribers.lock().unwrap();
@@ -677,18 +649,6 @@ pub fn probe_auth(provider: &str, pi_path: Option<&PathBuf>) -> anyhow::Result<b
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn capped_reader_skips_the_rest_of_an_oversize_line() {
-        let input = b"1234567890\nok\n";
-        let mut reader: &[u8] = input;
-        let mut buf = Vec::new();
-        assert_eq!(read_line_capped(&mut reader, &mut buf, 4).unwrap(), 11);
-        assert_eq!(buf, b"1234");
-        assert_eq!(read_line_capped(&mut reader, &mut buf, 4).unwrap(), 3);
-        assert_eq!(buf, b"ok\n");
-        assert_eq!(read_line_capped(&mut reader, &mut buf, 4).unwrap(), 0);
-    }
 
     #[test]
     fn request_ids_increase() {

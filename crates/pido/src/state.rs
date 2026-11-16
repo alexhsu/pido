@@ -71,6 +71,7 @@ pub enum TranscriptItem {
         text: gpui::SharedString,
         /// Wall-clock stamp, unix seconds; drives the hover footer.
         time: Option<i64>,
+        images: Vec<UserImage>,
     },
     /// A turn's status line, sitting between its prompt and its content.
     /// `took` None means the turn is still running (the clock ticks).
@@ -304,7 +305,10 @@ pub enum SidebarRow {
 
 /// A session path as the pin and archive sets compare it.
 pub fn session_key(path: &str) -> String {
-    let key = path.replace('\\', "/");
+    let mut key = path.replace('\\', "/");
+    while key.len() > 1 && key.ends_with('/') {
+        key.pop();
+    }
     if cfg!(windows) {
         key.to_lowercase()
     } else {
@@ -755,6 +759,20 @@ fn join_blocks(blocks: &BTreeMap<u32, String>) -> String {
         .join("\n\n")
 }
 
+/// A decoded image ready for gpui's content-addressed cache. Built once when
+/// the bytes arrive, not once per frame.
+#[derive(Clone, Debug)]
+pub struct StoredImage {
+    pub image: Arc<gpui::Image>,
+}
+
+/// An image attached to a user prompt, with the name it was staged under.
+#[derive(Clone, Debug)]
+pub struct UserImage {
+    pub name: String,
+    pub image: Arc<gpui::Image>,
+}
+
 #[derive(Debug, Clone)]
 pub struct ToolView {
     pub call_id: String,
@@ -764,9 +782,8 @@ pub struct ToolView {
     pub running: bool,
     pub failed: bool,
     pub result: Option<gpui::SharedString>,
-    /// Images the tool returned (read on a screenshot, most often), as
-    /// (base64 payload, mime); rendered under the text when the card opens.
-    pub images: Vec<(String, String)>,
+    /// Images the tool returned, decoded once and keyed by content hash.
+    pub images: Vec<StoredImage>,
     pub started: Instant,
     pub took: Option<Duration>,
 }
@@ -799,6 +816,17 @@ pub enum NoticeKind {
     Info,
     Warn,
     Error,
+}
+
+/// One banner. `id` keeps a click bound to the row it saw even if another
+/// notice arrives first; `key` lets transient status lines (retrying,
+/// compacting) replace themselves.
+#[derive(Debug, Clone)]
+pub struct Notice {
+    pub id: u64,
+    pub key: String,
+    pub kind: NoticeKind,
+    pub text: String,
 }
 
 /// How a message typed while the agent runs is delivered: steer into the
@@ -906,9 +934,6 @@ pub struct AppState {
     search_gen: u64,
     /// Content-search hits: session file path → the snippet that matched.
     content_hits: Vec<(String, String)>,
-    /// True while closing the client on purpose: the Disconnected event
-    /// must not trigger crash recovery.
-    stopping: bool,
     /// Why the client last died, for the give-up banner.
     last_error: String,
     /// Bumped on every successful connect; the liveness probe loop of an
@@ -946,7 +971,9 @@ pub struct AppState {
     pub auto_compaction: Option<bool>,
     /// Dismissible banners over the transcript, oldest first. A queue keeps
     /// retry/compaction/error notices from silently replacing each other.
-    pub notices: VecDeque<(NoticeKind, String)>,
+    pub notices: VecDeque<Notice>,
+    /// Monotonic notice id for stable dismiss targets.
+    next_notice_id: u64,
     /// The last-used project directory, to prefill the welcome picker.
     pub last_project: Option<String>,
     /// Counter for staging image keys.
@@ -981,6 +1008,9 @@ pub struct AppState {
     /// Turn status lines the user re-opened after completion, keyed by the
     /// turn item's transcript index.
     pub expanded_turns: std::collections::HashSet<u64>,
+    /// Where the assistant view currently receiving deltas lives. Cached so
+    /// every delta does not scan the whole transcript backwards.
+    open_view_ix: Option<usize>,
     /// True between a prompt and its `agent_settled`; drives the one-second
     /// ticker that keeps the working clock moving during silent stretches.
     turn_running: bool,
@@ -1042,7 +1072,6 @@ impl AppState {
                 archived_sessions,
                 session_name: None,
                 session_file: None,
-                stopping: false,
                 last_error: String::new(),
                 conn_gen: 0,
                 probe_fail: 0,
@@ -1054,6 +1083,7 @@ impl AppState {
                 stats: None,
                 auto_compaction: None,
                 notices: VecDeque::new(),
+                next_notice_id: 1,
                 last_project,
                 next_image_key: 1,
                 next_shell_id: 1,
@@ -1069,6 +1099,7 @@ impl AppState {
                 queued_steers: Vec::new(),
                 queued_follow_ups: Vec::new(),
                 expanded_turns: std::collections::HashSet::new(),
+                open_view_ix: None,
                 turn_running: false,
                 changes: Vec::new(),
                 changes_seq: 0,
@@ -1166,14 +1197,12 @@ impl AppState {
         self.session_gen += 1;
         let session_gen = self.session_gen;
         let recovery = self.recovering.clone();
-        // Replacing a live pi: shut the old one down deliberately. Without
-        // `stopping`, its Disconnected event would read as a crash and
-        // trigger a spurious recovery; without the generation bump, its
-        // remaining events would bleed into the new session.
+        // Replacing a live pi: shut the old one down deliberately. The
+        // generation bump below makes its remaining events (including the
+        // Disconnected) die at the pump.
         if recovery.is_none()
             && let Some(old) = self.client.take()
         {
-            self.stopping = true;
             old.shutdown();
         }
         self.conn_gen += 1;
@@ -1181,6 +1210,7 @@ impl AppState {
             self.conn = Conn::Connecting;
             self.transcript.clear();
             self.expanded_turns.clear();
+            self.open_view_ix = None;
             self.turn_running = false;
             self.clear_changes();
             self.notices.clear();
@@ -1328,7 +1358,6 @@ impl AppState {
                                     s.thinking_levels
                                         .retain(|level| *level != ThinkingLevel::Unknown);
                                 }
-                                s.stopping = false;
                                 s.conn_gen += 1;
                                 let generation = s.conn_gen;
                                 s.start_pump(generation, client.clone(), cx);
@@ -1973,13 +2002,32 @@ impl AppState {
         if name.is_empty() {
             return;
         }
-        match sessions::append_session_name(std::path::Path::new(path), &name) {
-            Ok(()) => {
-                patch_session_title(&mut self.sidebar_rows, path, &name);
-                self.refresh_sessions(cx);
-            }
-            Err(error) => self.push_notice(NoticeKind::Error, format!("rename: {error}")),
-        }
+        let path = path.to_string();
+        cx.spawn(async move |this, cx| {
+            let path_for_write = path.clone();
+            let name_for_write = name.clone();
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    sessions::append_session_name(
+                        std::path::Path::new(&path_for_write),
+                        &name_for_write,
+                    )
+                })
+                .await;
+            this.update(cx, |s, cx| {
+                match result {
+                    Ok(()) => {
+                        patch_session_title(&mut s.sidebar_rows, &path, &name);
+                        s.refresh_sessions(cx);
+                    }
+                    Err(error) => s.push_notice(NoticeKind::Error, format!("rename: {error}")),
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
         cx.notify();
     }
 
@@ -2144,7 +2192,7 @@ impl AppState {
         } else {
             // Swapping to another project kills the running pi mid-turn;
             // new_chat guards this and so must the cross-project path.
-            if self.streaming {
+            if self.streaming || self.turn_running {
                 self.push_notice(NoticeKind::Warn, i18n::t(cx, "agent_busy").to_string());
                 cx.notify();
                 return;
@@ -2153,23 +2201,46 @@ impl AppState {
         }
     }
 
-    /// Stage an image for the next prompt. Returns false when the bytes are
-    /// not a format pi accepts or the file is unreasonably large.
-    pub fn stage_image(&mut self, name: Option<String>, bytes: Vec<u8>) -> bool {
+    /// Stage an image for the next prompt, localizing the failure reason.
+    pub fn stage_image(&mut self, name: Option<String>, bytes: Vec<u8>, cx: &App) -> bool {
+        match self.stage_image_impl(name, bytes) {
+            Ok(()) => true,
+            Err(ImageStageError::Unsupported) => {
+                self.push_notice(
+                    NoticeKind::Error,
+                    i18n::t(cx, "image_unsupported").to_string(),
+                );
+                false
+            }
+            Err(ImageStageError::TooLarge { size, max }) => {
+                self.push_notice(
+                    NoticeKind::Error,
+                    i18n::t_arg(
+                        cx,
+                        "image_too_large",
+                        "d",
+                        &format!("{} MB > {} MB", size / 1024 / 1024, max / 1024 / 1024),
+                    )
+                    .to_string(),
+                );
+                false
+            }
+        }
+    }
+
+    fn stage_image_impl(
+        &mut self,
+        name: Option<String>,
+        bytes: Vec<u8>,
+    ) -> Result<(), ImageStageError> {
         let Some((mime, ext)) = sniff_image(&bytes) else {
-            self.push_notice(NoticeKind::Error, "unsupported image format".into());
-            return false;
+            return Err(ImageStageError::Unsupported);
         };
         if bytes.len() > MAX_IMAGE_BYTES {
-            self.push_notice(
-                NoticeKind::Error,
-                format!(
-                    "image too large ({} MB > {} MB)",
-                    bytes.len() / 1024 / 1024,
-                    MAX_IMAGE_BYTES / 1024 / 1024
-                ),
-            );
-            return false;
+            return Err(ImageStageError::TooLarge {
+                size: bytes.len(),
+                max: MAX_IMAGE_BYTES,
+            });
         }
         let key = format!("img-{}", self.next_image_key);
         self.next_image_key += 1;
@@ -2185,13 +2256,13 @@ impl AppState {
         }
 
         self.pending_images.push(PendingImage {
-            key: key.clone(),
+            key,
             name,
             mime: mime.into(),
             data: bytes,
             preview,
         });
-        true
+        Ok(())
     }
 
     pub fn remove_image(&mut self, key: &str) {
@@ -2411,7 +2482,7 @@ impl AppState {
         if self.conn != Conn::Live {
             return;
         }
-        if self.streaming {
+        if self.streaming || self.turn_running {
             self.push_notice(NoticeKind::Warn, i18n::t(cx, "agent_busy").to_string());
             cx.notify();
             return;
@@ -2485,7 +2556,7 @@ impl AppState {
         if self.conn != Conn::Live {
             return;
         }
-        if self.streaming {
+        if self.streaming || self.turn_running {
             self.push_notice(NoticeKind::Warn, i18n::t(cx, "agent_busy").to_string());
             cx.notify();
             return;
@@ -2580,7 +2651,6 @@ impl AppState {
     pub fn disconnect(&mut self, cx: &mut Context<Self>) {
         self.session_gen += 1;
         if let Some(client) = self.client.take() {
-            self.stopping = true;
             client.shutdown();
         }
         // A pending reconnect timer must not fire after the user left.
@@ -2776,11 +2846,21 @@ impl AppState {
                 streaming_behavior: None,
             }
         };
-        // The staged images leave with the message, whatever its fate.
+        // The staged images leave with the message, whatever its fate. Keep
+        // decoded copies on the transcript row so the prompt is not blank.
+        let user_images = self
+            .pending_images
+            .iter()
+            .map(|image| UserImage {
+                name: image.name.clone(),
+                image: stored_image(image.data.clone(), &image.mime).image,
+            })
+            .collect();
         self.clear_images();
         self.transcript.push(TranscriptItem::User {
             text: text.clone().into(),
             time: Some(now_secs()),
+            images: user_images,
         });
         if follow {
             self.pending_follow_ups.push(text.clone());
@@ -2868,6 +2948,7 @@ impl AppState {
             .rposition(|item| matches!(item, TranscriptItem::User { text: t, .. } if t == text))
         {
             self.transcript.remove(index);
+            self.open_view_ix = None;
             // Turn folds are keyed by transcript index; keep them pointing at
             // the same rows after the removal.
             self.expanded_turns = self
@@ -2949,22 +3030,28 @@ impl AppState {
                     ),
                     Err(error) => s.push_notice(NoticeKind::Error, error.to_string()),
                 }
-                // Abort responds when pi is idle, so whichever way it went,
-                // converge the local run state instead of waiting forever for
-                // an `agent_settled` that may never come.
-                if let Ok(response) = &aborted
-                    && !response.success
-                {
-                    s.push_notice(
-                        NoticeKind::Error,
-                        format!("abort: {}", response.error.clone().unwrap_or_default()),
-                    );
-                } else if let Err(error) = &aborted {
-                    s.push_notice(NoticeKind::Error, error.to_string());
+                // Abort responds when pi is idle. Only then may the local
+                // state stop claiming a run; a failed abort leaves pi
+                // possibly running, so keep the status live and show why.
+                let abort_ok = match &aborted {
+                    Ok(response) if response.success => true,
+                    Ok(response) => {
+                        s.push_notice(
+                            NoticeKind::Error,
+                            format!("abort: {}", response.error.clone().unwrap_or_default()),
+                        );
+                        false
+                    }
+                    Err(error) => {
+                        s.push_notice(NoticeKind::Error, error.to_string());
+                        false
+                    }
+                };
+                if abort_ok {
+                    s.streaming = false;
+                    s.finish_running_turn();
+                    s.finalize_open_views();
                 }
-                s.streaming = false;
-                s.finish_running_turn();
-                s.finalize_open_views();
                 cx.notify();
             })
             .ok();
@@ -2979,7 +3066,7 @@ impl AppState {
         if self.conn != Conn::Live {
             return;
         }
-        if self.streaming {
+        if self.streaming || self.turn_running {
             self.push_notice(NoticeKind::Warn, i18n::t(cx, "agent_busy").to_string());
             cx.notify();
             return;
@@ -3054,7 +3141,7 @@ impl AppState {
         if self.conn != Conn::Live {
             return;
         }
-        if self.streaming {
+        if self.streaming || self.turn_running {
             self.push_notice(NoticeKind::Warn, i18n::t(cx, "agent_busy").to_string());
             cx.notify();
             return;
@@ -3636,30 +3723,46 @@ impl AppState {
     }
 
     /// Dismiss one banner, addressed by its position in the rendered stack.
-    pub fn dismiss_notice(&mut self, index: usize, cx: &mut Context<Self>) {
-        if index < self.notices.len() {
+    pub fn dismiss_notice(&mut self, id: u64, cx: &mut Context<Self>) {
+        if let Some(index) = self.notices.iter().position(|notice| notice.id == id) {
             self.notices.remove(index);
             cx.notify();
         }
     }
 
     pub fn push_notice(&mut self, kind: NoticeKind, text: String) {
-        log::info!("notice: {text}");
-        // Repeating the same banner (a retry loop, most often) should not
-        // stack; keep a short queue so different notices stay visible.
-        if self.notices.back().is_some_and(|(_, last)| last == &text) {
+        // Plain notices are keyed by their text, so repeating the same line
+        // replaces it rather than stacking.
+        let key = text.clone();
+        self.push_notice_keyed(&key, kind, text);
+    }
+
+    /// Push or update a notice under a stable key. Transient status lines
+    /// (retrying, compacting) use a fixed key so each attempt replaces the
+    /// previous one.
+    pub fn push_notice_keyed(&mut self, key: &str, kind: NoticeKind, text: String) {
+        log::info!("notice [{key}]: {text}");
+        if let Some(notice) = self.notices.iter_mut().find(|notice| notice.key == key) {
+            notice.kind = kind;
+            notice.text = text;
             return;
         }
-        self.notices.push_back((kind, text));
+        let id = self.next_notice_id;
+        self.next_notice_id = self.next_notice_id.wrapping_add(1);
+        self.notices.push_back(Notice {
+            id,
+            key: key.to_string(),
+            kind,
+            text,
+        });
         while self.notices.len() > 5 {
             self.notices.pop_front();
         }
     }
 
-    /// Remove a banner by its text, e.g. the transient retrying/compacting
-    /// note once the operation ends.
-    fn remove_notice_text(&mut self, text: &str) {
-        self.notices.retain(|(_, existing)| existing != text);
+    /// Remove a transient banner once its operation ends.
+    fn remove_notice_key(&mut self, key: &str) {
+        self.notices.retain(|notice| notice.key != key);
     }
 
     // -- event reduction ----------------------------------------------------
@@ -3676,12 +3779,6 @@ impl AppState {
                 // No AgentSettled will ever arrive: freeze any half-streamed
                 // view so its timer and live indicators stop.
                 self.finalize_open_views();
-                if self.stopping {
-                    // The user closed the session; disconnect() already put
-                    // the state where it belongs.
-                    self.stopping = false;
-                    return;
-                }
                 if self.conn != Conn::Live {
                     // A crash during startup or teardown: nothing to recover.
                     return;
@@ -3740,6 +3837,7 @@ impl AppState {
                 _ => {}
             }
         }
+        self.open_view_ix = None;
     }
 
     fn on_record(&mut self, record: RpcRecord, cx: &mut Context<Self>) {
@@ -3833,24 +3931,14 @@ impl AppState {
                     self.transcript.push(TranscriptItem::Assistant(Box::new(
                         AssistantView::streaming(),
                     )));
+                    self.open_view_ix = Some(self.transcript.len() - 1);
                 }
             }
             Event::MessageUpdate {
                 usage,
                 assistant_message_event,
             } => {
-                self.apply_delta(assistant_message_event);
-                // pi's cumulative usage for the streaming message: a live
-                // ticker without waiting for the run to finish.
-                if let Some(usage) = usage
-                    && let Some(TranscriptItem::Assistant(view)) =
-                        self.transcript.iter_mut().rev().find_map(|item| {
-                            matches!(item, TranscriptItem::Assistant(_)).then_some(item)
-                        })
-                    && let Some(latest) = usage.total_tokens
-                {
-                    view.live_tokens = Some(latest);
-                }
+                self.apply_delta(assistant_message_event, usage);
             }
             Event::MessageEnd { message } => {
                 if let AgentMessage::Assistant(assistant) = &message {
@@ -3885,6 +3973,7 @@ impl AppState {
                             );
                         }
                     }
+                    self.open_view_ix = None;
                 }
             }
             Event::ToolExecutionStart {
@@ -3932,7 +4021,7 @@ impl AppState {
                 card.took = Some(card.started.elapsed());
                 if let Some(result) = result.as_ref() {
                     card.result = Some(truncate_for_display(&result.text(), 2000).into());
-                    card.images = tool_images(result);
+                    card.images = tool_images(&result.content);
                 }
                 if is_error {
                     self.pending_writes.remove(&tool_call_id);
@@ -3954,8 +4043,12 @@ impl AppState {
             }
             Event::CompactionStart { .. } => {
                 // A banner that a run is briefly paused for compaction; the
-                // settled refresh clears it via the success notice.
-                self.push_notice(NoticeKind::Info, i18n::t(cx, "compacting").to_string());
+                // end event replaces it with the result.
+                self.push_notice_keyed(
+                    "compacting",
+                    NoticeKind::Info,
+                    i18n::t(cx, "compacting").to_string(),
+                );
             }
             Event::CompactionEnd {
                 aborted,
@@ -3963,8 +4056,7 @@ impl AppState {
                 error_message,
                 ..
             } => {
-                let transient = i18n::t(cx, "compacting").to_string();
-                self.remove_notice_text(&transient);
+                self.remove_notice_key("compacting");
                 if aborted {
                     self.push_notice(
                         NoticeKind::Warn,
@@ -4008,15 +4100,14 @@ impl AppState {
                 )
                 .replace("{delay}", &format!("{}s", delay_ms / 1000))
                 .replace("{e}", detail);
-                self.push_notice(NoticeKind::Warn, text);
+                self.push_notice_keyed("retrying", NoticeKind::Warn, text);
             }
             Event::AutoRetryEnd {
                 success,
                 final_error,
                 ..
             } => {
-                let transient = i18n::t(cx, "retrying").to_string();
-                self.remove_notice_text(&transient);
+                self.remove_notice_key("retrying");
                 if success {
                     self.push_notice(NoticeKind::Info, i18n::t(cx, "retry_succeeded").to_string());
                 } else {
@@ -4078,92 +4169,127 @@ impl AppState {
     }
 
     /// Append one streaming delta to the open assistant view.
-    fn apply_delta(&mut self, delta: AssistantMessageEvent) {
-        let Some(TranscriptItem::Assistant(view)) = self
-            .transcript
-            .iter_mut()
-            .rev()
-            .find(|item| matches!(item, TranscriptItem::Assistant(v) if !v.finished))
-        else {
-            // Delta without an open view (should not happen in RPC mode).
-            log::debug!("dropping delta with no open assistant view: {delta:?}");
-            return;
+    /// The assistant view currently receiving deltas, cached by index so a
+    /// stream does not scan the whole transcript for each chunk.
+    fn open_assistant_mut(&mut self) -> Option<&mut AssistantView> {
+        let cached = self.open_view_ix.filter(|index| {
+            matches!(
+                self.transcript.get(*index),
+                Some(TranscriptItem::Assistant(view)) if !view.finished
+            )
+        });
+        let index = match cached {
+            Some(index) => index,
+            None => {
+                let index = self.transcript.iter().rposition(
+                    |item| matches!(item, TranscriptItem::Assistant(view) if !view.finished),
+                )?;
+                self.open_view_ix = Some(index);
+                index
+            }
         };
-        match delta {
-            AssistantMessageEvent::TextStart { content_index } => {
-                view.live_text = Some(content_index);
-                view.text_blocks.entry(content_index).or_default();
-            }
-            AssistantMessageEvent::TextDelta {
-                content_index,
-                delta,
-            } => {
-                view.live_text = Some(content_index);
-                view.text_blocks
-                    .entry(content_index)
-                    .or_default()
-                    .push_str(&delta);
-            }
-            AssistantMessageEvent::TextEnd {
-                content_index,
-                content,
-            } => {
-                view.text_blocks.insert(content_index, content);
-                if view.live_text == Some(content_index) {
-                    view.live_text = None;
+        match self.transcript.get_mut(index) {
+            Some(TranscriptItem::Assistant(view)) => Some(view),
+            _ => None,
+        }
+    }
+
+    fn apply_delta(
+        &mut self,
+        delta: AssistantMessageEvent,
+        usage: Option<pi_rpc::protocol::Usage>,
+    ) {
+        let mut tool_call_end = None;
+        {
+            let Some(view) = self.open_assistant_mut() else {
+                // Delta without an open view (should not happen in RPC mode).
+                log::debug!("dropping delta with no open assistant view: {delta:?}");
+                return;
+            };
+            match delta {
+                AssistantMessageEvent::TextStart { content_index } => {
+                    view.live_text = Some(content_index);
+                    view.text_blocks.entry(content_index).or_default();
                 }
-            }
-            AssistantMessageEvent::ThinkingStart { content_index } => {
-                view.live_thinking = Some(content_index);
-                view.thinking_blocks.entry(content_index).or_default();
-            }
-            AssistantMessageEvent::ThinkingDelta {
-                content_index,
-                delta,
-            } => {
-                view.live_thinking = Some(content_index);
-                view.thinking_blocks
-                    .entry(content_index)
-                    .or_default()
-                    .push_str(&delta);
-            }
-            AssistantMessageEvent::ThinkingEnd { content_index } => {
-                if view.live_thinking == Some(content_index) {
-                    view.live_thinking = None;
+                AssistantMessageEvent::TextDelta {
+                    content_index,
+                    delta,
+                } => {
+                    view.live_text = Some(content_index);
+                    view.text_blocks
+                        .entry(content_index)
+                        .or_default()
+                        .push_str(&delta);
                 }
-                // Freeze the thinking duration here: the header switches from
-                // the live indicator to a static value at exactly this point.
-                if view.took.is_none() {
-                    view.took = Some(view.started.elapsed());
+                AssistantMessageEvent::TextEnd {
+                    content_index,
+                    content,
+                } => {
+                    view.text_blocks.insert(content_index, content);
+                    if view.live_text == Some(content_index) {
+                        view.live_text = None;
+                    }
                 }
+                AssistantMessageEvent::ThinkingStart { content_index } => {
+                    view.live_thinking = Some(content_index);
+                    view.thinking_blocks.entry(content_index).or_default();
+                }
+                AssistantMessageEvent::ThinkingDelta {
+                    content_index,
+                    delta,
+                } => {
+                    view.live_thinking = Some(content_index);
+                    view.thinking_blocks
+                        .entry(content_index)
+                        .or_default()
+                        .push_str(&delta);
+                }
+                AssistantMessageEvent::ThinkingEnd { content_index } => {
+                    if view.live_thinking == Some(content_index) {
+                        view.live_thinking = None;
+                    }
+                    // Freeze the thinking duration here: the header switches from
+                    // the live indicator to a static value at exactly this point.
+                    if view.took.is_none() {
+                        view.took = Some(view.started.elapsed());
+                    }
+                }
+                AssistantMessageEvent::ToolCallStart {
+                    id,
+                    tool_name,
+                    content_index,
+                    ..
+                } => {
+                    // Reserve the slot so later deltas for other content indexes
+                    // still land in this view; the card appears on execution.
+                    log::debug!(
+                        "tool call {id} ({tool_name}) announced at {content_index}; awaiting execution"
+                    );
+                }
+                AssistantMessageEvent::ToolCallDelta {
+                    content_index,
+                    delta,
+                } => {
+                    log::debug!(
+                        "tool call args delta at {content_index}: {} bytes",
+                        delta.len()
+                    );
+                }
+                AssistantMessageEvent::ToolCallEnd { tool_call, .. } => {
+                    tool_call_end = Some(tool_call);
+                }
+                // A delta from a newer pi. The final message_end remains
+                // authoritative, so ignoring it is safe.
+                AssistantMessageEvent::Unknown => {}
             }
-            AssistantMessageEvent::ToolCallStart {
-                id,
-                tool_name,
-                content_index,
-                ..
-            } => {
-                // Reserve the slot so later deltas for other content indexes
-                // still land in this view; the card appears on execution.
-                log::debug!(
-                    "tool call {id} ({tool_name}) announced at {content_index}; awaiting execution"
-                );
-            }
-            AssistantMessageEvent::ToolCallDelta {
-                content_index,
-                delta,
-            } => {
-                log::debug!(
-                    "tool call args delta at {content_index}: {} bytes",
-                    delta.len()
-                );
-            }
-            AssistantMessageEvent::ToolCallEnd { tool_call, .. } => {
-                self.ensure_tool_card(tool_call.id, tool_call.name, Some(&tool_call.arguments));
-            }
-            // A delta from a newer pi. The final message_end remains
-            // authoritative, so ignoring it is safe.
-            AssistantMessageEvent::Unknown => {}
+        }
+        if let Some(tool_call) = tool_call_end {
+            self.ensure_tool_card(tool_call.id, tool_call.name, Some(&tool_call.arguments));
+        }
+        if let Some(latest) = usage.and_then(|usage| usage.total_tokens)
+            && let Some(view) = self.open_assistant_mut()
+        {
+            view.live_tokens = Some(latest);
         }
     }
 
@@ -4195,6 +4321,7 @@ impl AppState {
             .iter()
             .rposition(|item| !matches!(item, TranscriptItem::Notice { .. }))
             .map_or(0, |i| i + 1);
+        self.open_view_ix = None;
         self.transcript.insert(
             insert_at,
             TranscriptItem::Tool(ToolView {
@@ -4243,6 +4370,7 @@ impl AppState {
     ) {
         self.transcript.clear();
         self.expanded_turns.clear();
+        self.open_view_ix = None;
         self.turn_running = false;
         self.clear_changes();
 
@@ -4277,7 +4405,8 @@ impl AppState {
             match message {
                 AgentMessage::User(user) => {
                     let text = user.text();
-                    if !text.is_empty() {
+                    let images = user_images(user);
+                    if !text.is_empty() || !images.is_empty() {
                         // Every turn gets its status line, live ones included:
                         // the duration comes from pi's entry timestamps, so a
                         // restored turn folds and reads like a finished run.
@@ -4306,6 +4435,7 @@ impl AppState {
                         self.transcript.push(TranscriptItem::User {
                             text: text.into(),
                             time: unix_secs(user.timestamp),
+                            images,
                         });
                         self.transcript.push(TranscriptItem::Turn {
                             started: Instant::now(),
@@ -4333,16 +4463,7 @@ impl AppState {
                 }
                 AgentMessage::ToolResult(result) => {
                     let text = result.text();
-                    let images = result
-                        .content
-                        .iter()
-                        .filter_map(|block| match block {
-                            pi_rpc::protocol::ToolResultBlock::Image { data, mime_type } => {
-                                Some((data.clone(), mime_type.clone()))
-                            }
-                            _ => None,
-                        })
-                        .collect();
+                    let images = tool_images(&result.content);
                     if let Some(card) = self.tool_card_mut(&result.tool_call_id) {
                         card.running = false;
                         card.failed = result.is_error;
@@ -4513,7 +4634,10 @@ pub(crate) fn fork_point_for(items: &[TranscriptItem], ix: usize) -> Option<(Str
 /// still gets its group, in the order the user added them.
 fn merge_user_projects(mut groups: Vec<SessionGroup>, projects: &[String]) -> Vec<SessionGroup> {
     for project in projects {
-        if !groups.iter().any(|group| group.cwd == *project) {
+        if !groups
+            .iter()
+            .any(|group| session_key(&group.cwd) == session_key(project))
+        {
             groups.push(SessionGroup {
                 cwd: project.clone(),
                 sessions: Vec::new(),
@@ -4575,13 +4699,66 @@ fn compaction_tokens(result: &serde_json::Value) -> Option<(u64, u64)> {
 }
 
 /// The images a tool result carries, as (base64, mime) pairs.
-fn tool_images(result: &pi_rpc::protocol::ToolResultContent) -> Vec<(String, String)> {
-    result
-        .content
+fn image_format(mime: &str) -> gpui::ImageFormat {
+    if mime.contains("jpeg") || mime.contains("jpg") {
+        gpui::ImageFormat::Jpeg
+    } else {
+        gpui::ImageFormat::Png
+    }
+}
+
+/// FNV-1a over the bytes: gpui's image cache keys on `Image::id`, so the id
+/// must identify the content (the old per-card index collided across cards).
+fn image_id(bytes: &[u8]) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100_0000_01b3);
+    }
+    hash
+}
+
+fn stored_image(bytes: Vec<u8>, mime: &str) -> StoredImage {
+    StoredImage {
+        image: Arc::new(gpui::Image {
+            format: image_format(mime),
+            id: image_id(&bytes),
+            bytes,
+        }),
+    }
+}
+
+fn stored_image_base64(data: &str, mime: &str) -> Option<StoredImage> {
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(data)
+        .ok()?;
+    Some(stored_image(bytes, mime))
+}
+
+fn tool_images(blocks: &[pi_rpc::protocol::ToolResultBlock]) -> Vec<StoredImage> {
+    blocks
         .iter()
         .filter_map(|block| match block {
             pi_rpc::protocol::ToolResultBlock::Image { data, mime_type } => {
-                Some((data.clone(), mime_type.clone()))
+                stored_image_base64(data, mime_type)
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+fn user_images(message: &pi_rpc::protocol::UserMessage) -> Vec<UserImage> {
+    let pi_rpc::protocol::UserContent::Blocks(blocks) = &message.content else {
+        return Vec::new();
+    };
+    blocks
+        .iter()
+        .filter_map(|block| match block {
+            pi_rpc::protocol::UserContentBlock::Image { data, mime_type } => {
+                stored_image_base64(data, mime_type).map(|stored| UserImage {
+                    name: String::new(),
+                    image: stored.image,
+                })
             }
             _ => None,
         })
@@ -4835,11 +5012,10 @@ mod tests {
             ],
             details: None,
         };
-        let images = tool_images(&result);
-        assert_eq!(
-            images,
-            vec![("aGVsbG8=".to_string(), "image/png".to_string())]
-        );
+        let images = tool_images(&result.content);
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].image.format, gpui::ImageFormat::Png);
+        assert_eq!(images[0].image.id, image_id(b"hello"));
     }
 
     #[test]
@@ -4873,7 +5049,6 @@ mod tests {
             sidebar_rows: Vec::new(),
             collapsed_projects: std::collections::HashSet::new(),
             collapsed_sessions: HashSet::new(),
-            stopping: false,
             last_error: String::new(),
             conn_gen: 0,
             probe_fail: 0,
@@ -4891,6 +5066,7 @@ mod tests {
             stats: None,
             auto_compaction: None,
             notices: VecDeque::new(),
+            next_notice_id: 1,
             last_project: None,
             commands: Vec::new(),
             workspace_files: Vec::new(),
@@ -4906,6 +5082,7 @@ mod tests {
             queued_steers: Vec::new(),
             queued_follow_ups: Vec::new(),
             expanded_turns: std::collections::HashSet::new(),
+            open_view_ix: None,
             turn_running: false,
             changes: Vec::new(),
             changes_seq: 0,
@@ -4951,14 +5128,23 @@ mod tests {
     fn notices_queue_without_losing_distinct_messages() {
         let mut state = empty_state();
         state.push_notice(NoticeKind::Info, "compacting".into());
-        state.push_notice(NoticeKind::Warn, "retrying".into());
-        // A repeated banner is not stacked twice.
-        state.push_notice(NoticeKind::Warn, "retrying".into());
+        state.push_notice_keyed("retrying", NoticeKind::Warn, "attempt 1/3".into());
+        // A keyed retry replaces its predecessor instead of stacking.
+        state.push_notice_keyed("retrying", NoticeKind::Warn, "attempt 2/3".into());
         assert_eq!(state.notices.len(), 2);
+        assert_eq!(
+            state
+                .notices
+                .iter()
+                .find(|n| n.key == "retrying")
+                .unwrap()
+                .text,
+            "attempt 2/3"
+        );
 
-        state.remove_notice_text("retrying");
+        state.remove_notice_key("retrying");
         assert_eq!(state.notices.len(), 1);
-        assert_eq!(state.notices[0].1, "compacting");
+        assert_eq!(state.notices[0].text, "compacting");
     }
 
     #[test]
@@ -4968,6 +5154,7 @@ mod tests {
             TranscriptItem::User {
                 text: "a".into(),
                 time: None,
+                images: Vec::new(),
             },
             TranscriptItem::Turn {
                 started: Instant::now(),
@@ -4976,6 +5163,7 @@ mod tests {
             TranscriptItem::User {
                 text: "b".into(),
                 time: None,
+                images: Vec::new(),
             },
         ];
         state.expanded_turns.insert(1);
@@ -5019,6 +5207,38 @@ mod tests {
             }
             other => panic!("expected tool card, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn user_images_decode_for_restored_prompts() {
+        use pi_rpc::protocol::{UserContent, UserContentBlock, UserMessage};
+        let user = UserMessage {
+            content: UserContent::Blocks(vec![
+                UserContentBlock::Image {
+                    data: "aGVsbG8=".into(),
+                    mime_type: "image/png".into(),
+                },
+                UserContentBlock::Text {
+                    text: "look".into(),
+                },
+            ]),
+            timestamp: 1.0,
+            attachments: None,
+        };
+        let images = user_images(&user);
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].image.id, image_id(b"hello"));
+        assert_eq!(images[0].image.format, gpui::ImageFormat::Png);
+    }
+
+    #[test]
+    fn user_projects_merge_by_normalized_cwd() {
+        let groups = vec![SessionGroup {
+            cwd: "C:\\dev\\x".into(),
+            sessions: Vec::new(),
+        }];
+        let merged = merge_user_projects(groups, &["C:/dev/x/".into()]);
+        assert_eq!(merged.len(), 1, "separator/trailing-slash variants fold");
     }
 
     #[test]
@@ -5133,6 +5353,7 @@ mod tests {
         let user = || TranscriptItem::User {
             text: "hi".into(),
             time: None,
+            images: Vec::new(),
         };
         let assistant = || TranscriptItem::Assistant(Box::new(AssistantView::streaming()));
         let turn = |took: Option<Duration>| TranscriptItem::Turn {
@@ -5323,6 +5544,7 @@ mod tests {
         let user = |text: &'static str| TranscriptItem::User {
             text: text.into(),
             time: None,
+            images: Vec::new(),
         };
         let assistant = |text: &'static str| {
             TranscriptItem::Assistant(Box::new(AssistantView::from_message(
@@ -5374,6 +5596,7 @@ mod tests {
         let user = |text: &str| TranscriptItem::User {
             text: text.into(),
             time: None,
+            images: Vec::new(),
         };
         let assistant = || TranscriptItem::Assistant(Box::new(AssistantView::streaming()));
         let items = vec![user("hi"), assistant(), user("hi"), assistant()];
@@ -5558,6 +5781,11 @@ pub struct PendingImage {
     pub preview: PathBuf,
 }
 
+enum ImageStageError {
+    Unsupported,
+    TooLarge { size: usize, max: usize },
+}
+
 /// Sniff an image's format from its magic bytes: `(mime, extension)`.
 fn sniff_image(bytes: &[u8]) -> Option<(&'static str, &'static str)> {
     const MIME_PNG: &str = "image/png";
@@ -5587,20 +5815,30 @@ fn sniff_image(bytes: &[u8]) -> Option<(&'static str, &'static str)> {
 /// Read the image files at `paths` into staged attachments; non-image files
 /// are skipped with a notice.
 pub fn stage_image_files(state: &Entity<AppState>, paths: &[std::path::PathBuf], cx: &mut App) {
-    for path in paths {
-        let name = path
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        let Ok(bytes) = std::fs::read(path) else {
-            continue;
-        };
-        state.update(cx, |s, cx| {
-            if s.stage_image(Some(name), bytes) {
-                cx.notify();
-            }
-        });
-    }
+    let state = state.clone();
+    let paths = paths.to_vec();
+    cx.spawn(async move |cx| {
+        for path in paths {
+            let name = path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let read_path = path.clone();
+            let bytes = cx
+                .background_executor()
+                .spawn(async move { std::fs::read(&read_path) })
+                .await;
+            let Ok(bytes) = bytes else {
+                continue;
+            };
+            state.update(cx, |s, cx| {
+                if s.stage_image(Some(name), bytes, cx) {
+                    cx.notify();
+                }
+            });
+        }
+    })
+    .detach();
 }
 
 #[cfg(test)]
@@ -5612,17 +5850,21 @@ mod image_tests {
     fn stage_sniffs_formats_and_rejects_junk() {
         let mut state = empty_state();
         let png = [0x89u8, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 3];
-        assert!(state.stage_image(None, png.to_vec()));
+        assert!(state.stage_image_impl(None, png.to_vec()).is_ok());
         assert_eq!(state.pending_images.len(), 1);
         assert_eq!(state.pending_images[0].mime, "image/png");
         assert_eq!(state.pending_images[0].name, "img-1.png");
         // A thumbnail file is staged beside the bytes for the chip.
         assert!(state.pending_images[0].preview.is_file());
 
-        assert!(state.stage_image(Some("photo.jpg".into()), vec![0xff, 0xd8, 0xff, 0xaa]));
+        assert!(
+            state
+                .stage_image_impl(Some("photo.jpg".into()), vec![0xff, 0xd8, 0xff, 0xaa])
+                .is_ok()
+        );
         assert_eq!(state.pending_images[1].mime, "image/jpeg");
 
-        assert!(!state.stage_image(None, b"just text".to_vec()));
+        assert!(state.stage_image_impl(None, b"just text".to_vec()).is_err());
         assert_eq!(state.pending_images.len(), 2, "junk must not stage");
 
         let removed_preview = state.pending_images[0].preview.clone();
@@ -5639,7 +5881,7 @@ mod image_tests {
             .into_iter()
             .chain(std::iter::repeat_n(0u8, MAX_IMAGE_BYTES + 1))
             .collect::<Vec<_>>();
-        assert!(!state.stage_image(None, big));
+        assert!(state.stage_image_impl(None, big).is_err());
         assert!(state.pending_images.is_empty());
     }
 }

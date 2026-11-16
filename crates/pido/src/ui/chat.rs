@@ -214,13 +214,18 @@ pub fn render_transcript(
             .notices
             .iter()
             .cloned()
-            .enumerate()
-            .map(|(index, (kind, text))| {
+            .map(|notice| {
                 div()
                     .flex_none()
                     .px_4()
                     .pt_2()
-                    .child(render_notice(index, kind, text, state.clone(), cx))
+                    .child(render_notice(
+                        notice.id,
+                        notice.kind,
+                        notice.text,
+                        state.clone(),
+                        cx,
+                    ))
                     .into_any_element()
             })
             .collect::<Vec<_>>();
@@ -589,7 +594,7 @@ fn render_item(
                 })
                 .into_any_element()
         }
-        TranscriptItem::User { text, time } => {
+        TranscriptItem::User { text, time, images } => {
             let group = SharedString::from(format!("user-{ix}"));
             let footer = div()
                 .flex_none()
@@ -637,16 +642,38 @@ fn render_item(
                         cx.write_to_clipboard(gpui::ClipboardItem::new_string(copy.to_string()));
                     })
                 });
+            let mut bubble = MessageBubble::new(Role::User);
+            if !images.is_empty() {
+                bubble = bubble.child(div().flex().flex_wrap().gap_1().children(
+                    images.iter().map(|image| {
+                        let thumbnail = gpui::img(gpui::ImageSource::Image(image.image.clone()))
+                            .max_h(gpui::px(180.))
+                            .rounded_sm();
+                        if image.name.is_empty() {
+                            thumbnail.into_any_element()
+                        } else {
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap_0p5()
+                                .child(thumbnail)
+                                .child(Caption::new(image.name.clone()))
+                                .into_any_element()
+                        }
+                    }),
+                ));
+            }
+            if !text.is_empty() {
+                bubble = bubble.child(ely_gpui_component::typography::SelectableText::new(
+                    ("user-text", ix),
+                    text.clone(),
+                ));
+            }
             div()
                 .group(group)
                 .flex()
                 .flex_col()
-                .child(MessageBubble::new(Role::User).child(
-                    ely_gpui_component::typography::SelectableText::new(
-                        ("user-text", ix),
-                        text.clone(),
-                    ),
-                ))
+                .child(bubble)
                 .child(footer)
                 .into_any_element()
         }
@@ -779,20 +806,10 @@ fn render_item(
             let image_elements: Vec<_> = card
                 .images
                 .iter()
-                .enumerate()
-                .map(|(image_ix, (data, mime))| {
-                    let format = if mime.contains("jpeg") || mime.contains("jpg") {
-                        gpui::ImageFormat::Jpeg
-                    } else {
-                        gpui::ImageFormat::Png
-                    };
-                    gpui::img(gpui::ImageSource::Image(std::sync::Arc::new(gpui::Image {
-                        format,
-                        bytes: data.clone().into_bytes(),
-                        id: image_ix as u64 + 1,
-                    })))
-                    .max_h(gpui::px(220.))
-                    .rounded_sm()
+                .map(|stored| {
+                    gpui::img(gpui::ImageSource::Image(stored.image.clone()))
+                        .max_h(gpui::px(220.))
+                        .rounded_sm()
                 })
                 .collect::<Vec<_>>();
             let wrap = div().px_1().child(rendered);
@@ -999,7 +1016,7 @@ fn compact_tokens(tokens: u64) -> String {
 /// The dismissible banner above the transcript (also used by the welcome
 /// screen for connection errors).
 pub fn render_notice(
-    index: usize,
+    id: u64,
     kind: NoticeKind,
     text: String,
     app: Entity<AppState>,
@@ -1022,8 +1039,8 @@ pub fn render_notice(
         .text_color(ink)
         .child(Paragraph::new(text))
         .child(
-            ely_gpui_component::buttons::Button::new(("dismiss", index), i18n::t(cx, "dismiss"))
-                .on_click(move |_, _, cx| app.update(cx, |s, cx| s.dismiss_notice(index, cx))),
+            ely_gpui_component::buttons::Button::new(("dismiss", id), i18n::t(cx, "dismiss"))
+                .on_click(move |_, _, cx| app.update(cx, |s, cx| s.dismiss_notice(id, cx))),
         )
 }
 

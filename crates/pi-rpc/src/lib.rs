@@ -9,6 +9,7 @@
 //! unit-testable against a bundled mock Pi binary.
 
 pub mod client;
+mod io_util;
 pub mod protocol;
 pub mod sessions;
 

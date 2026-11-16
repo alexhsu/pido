@@ -147,14 +147,15 @@ pub fn render(
                         .w_full()
                         .child(Caption::new(i18n::t(cx, "welcome_desc")))
                         .child(render_environment(state, cx))
-                        .children(
-                            notices
-                                .into_iter()
-                                .enumerate()
-                                .map(|(index, (kind, text))| {
-                                    chat::render_notice(index, kind, text, state.clone(), cx)
-                                }),
-                        )
+                        .children(notices.into_iter().map(|notice| {
+                            chat::render_notice(
+                                notice.id,
+                                notice.kind,
+                                notice.text,
+                                state.clone(),
+                                cx,
+                            )
+                        }))
                         .child(
                             div()
                                 .flex()

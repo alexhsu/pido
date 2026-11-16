@@ -269,7 +269,7 @@ pub fn render(state: &Entity<AppState>, app: &mut PidoApp, cx: &App) -> impl Int
                     let bytes = image.bytes.clone();
                     let mime = mime.to_string();
                     paste_state.update(cx, |s, cx| {
-                        if s.stage_image(None, bytes) {
+                        if s.stage_image(None, bytes, cx) {
                             if let Some(last) = s.pending_images.last_mut() {
                                 last.mime = mime;
                             }
