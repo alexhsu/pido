@@ -14,7 +14,8 @@ pub mod protocol;
 pub mod sessions;
 
 pub use client::{
-    ClientEvent, DisconnectReason, PiClient, PiProcessConfig, probe_auth, probe_pi_install,
+    ClientEvent, DisconnectReason, PI_PATH_ENV, PiClient, PiProbe, PiProcessConfig, probe_auth,
+    probe_pi_install,
 };
 pub use protocol::{
     AgentMessage, Command, Event, Request, Response, RpcRecord, StreamingBehavior, parse_record,

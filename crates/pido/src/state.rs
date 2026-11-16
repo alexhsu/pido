@@ -60,6 +60,10 @@ const RECOVERY_DELAYS: [u64; 8] = [1, 2, 4, 8, 15, 30, 30, 30];
 pub struct Environment {
     /// `Some(version)` when the pi CLI was found.
     pub pi_version: Option<String>,
+    /// Why a `pi` that exists cannot run (a missing `node`, a bad binary).
+    /// `None` when it is absent or healthy — those two cases have their own
+    /// banner text.
+    pub pi_error: Option<String>,
     /// Provider names that answer `pi auth check` with ready.
     pub ready_providers: Vec<String>,
 }
@@ -1202,8 +1206,15 @@ impl AppState {
             let found = cx
                 .background_executor()
                 .spawn(async move {
-                    let Some(pi_version) = pi_rpc::client::probe_pi_install(None) else {
-                        return Environment::default();
+                    let probe = pi_rpc::client::probe_pi_install(None);
+                    let Some(pi_version) = probe.version().map(str::to_string) else {
+                        // Missing or broken: keep the difference so the banner
+                        // can say which, and hand over the failure text.
+                        return Environment {
+                            pi_version: None,
+                            pi_error: probe.problem(),
+                            ready_providers: Vec::new(),
+                        };
                     };
                     let providers = probe_providers();
                     let ready_providers = std::thread::scope(|scope| {
@@ -1225,6 +1236,7 @@ impl AppState {
                     });
                     Environment {
                         pi_version: Some(pi_version),
+                        pi_error: None,
                         ready_providers,
                     }
                 })

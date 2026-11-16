@@ -197,6 +197,7 @@ pub fn render(
                                 danger_ink,
                                 i18n::t(cx, "connection_failed"),
                                 reason.into(),
+                                None,
                             ))
                             .child(
                                 div()
@@ -237,45 +238,66 @@ fn render_environment(
     let theme = cx.theme();
     let s = state.read(cx);
 
-    let (fill, ink, title, detail): (Hsla, Hsla, SharedString, SharedString) =
-        if s.environment.pi_version.is_none() {
-            (
-                theme.colors.danger_subtle,
-                theme.colors.danger,
-                i18n::t(cx, "pi_missing"),
-                i18n::t(
-                    cx,
-                    if cfg!(windows) {
-                        "pi_missing_desc_win"
-                    } else {
-                        "pi_missing_desc_unix"
-                    },
-                ),
-            )
-        } else if s.environment.ready_providers.is_empty() {
-            (
-                theme.colors.warning_subtle,
-                theme.colors.warning,
-                i18n::t(cx, "auth_missing"),
-                i18n::t(cx, "auth_missing_desc"),
-            )
-        } else {
-            (
-                theme.colors.success_subtle,
-                theme.colors.success,
-                format!(
-                    "pi {} · {}",
-                    s.environment.pi_version.as_deref().unwrap_or_default(),
-                    s.environment.ready_providers.join(", ")
-                )
-                .into(),
-                SharedString::default(),
-            )
+    let (fill, ink, title, detail, hint): (
+        Hsla,
+        Hsla,
+        SharedString,
+        SharedString,
+        Option<SharedString>,
+    ) = if s.environment.pi_version.is_none() {
+        // A `pi` the desktop session cannot see and a `pi` that exists but
+        // will not run are different problems for the user; say which one it
+        // is instead of always blaming a missing install.
+        let detail = match &s.environment.pi_error {
+            Some(error) => i18n::t_arg(cx, "pi_broken_desc", "e", error),
+            None => i18n::t(
+                cx,
+                if cfg!(windows) {
+                    "pi_missing_desc_win"
+                } else {
+                    "pi_missing_desc_unix"
+                },
+            ),
         };
-    banner(fill, ink, title, detail)
+        (
+            theme.colors.danger_subtle,
+            theme.colors.danger,
+            i18n::t(cx, "pi_missing"),
+            detail,
+            Some(i18n::t(cx, "pi_path_hint")),
+        )
+    } else if s.environment.ready_providers.is_empty() {
+        (
+            theme.colors.warning_subtle,
+            theme.colors.warning,
+            i18n::t(cx, "auth_missing"),
+            i18n::t(cx, "auth_missing_desc"),
+            None,
+        )
+    } else {
+        (
+            theme.colors.success_subtle,
+            theme.colors.success,
+            format!(
+                "pi {} · {}",
+                s.environment.pi_version.as_deref().unwrap_or_default(),
+                s.environment.ready_providers.join(", ")
+            )
+            .into(),
+            SharedString::default(),
+            None,
+        )
+    };
+    banner(fill, ink, title, detail, hint)
 }
 
-fn banner(fill: Hsla, ink: Hsla, title: SharedString, detail: SharedString) -> impl IntoElement {
+fn banner(
+    fill: Hsla,
+    ink: Hsla,
+    title: SharedString,
+    detail: SharedString,
+    hint: Option<SharedString>,
+) -> impl IntoElement {
     let has_detail = !detail.as_ref().is_empty();
     div()
         .flex()
@@ -288,4 +310,5 @@ fn banner(fill: Hsla, ink: Hsla, title: SharedString, detail: SharedString) -> i
         .text_color(ink)
         .child(Paragraph::new(title))
         .when(has_detail, |this| this.child(Caption::new(detail)))
+        .when_some(hint, |this, hint| this.child(Caption::new(hint)))
 }

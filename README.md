@@ -51,7 +51,15 @@ A native desktop client for the [Pi coding agent](https://github.com/earendil-wo
 
 - **pi CLI**(0.85+):`powershell -c "irm https://pi.dev/install.ps1 | iex"`(Windows)或 `curl -fsSL https://pi.dev/install.sh | sh`(macOS/Linux),需要 Node.js 22.19+
 - **认证**:在终端运行 `pi`,执行 `/login`(或 `pi auth login <provider>`)。pido 不经手凭据,pi 自己读取 `~/.pi/agent/auth.json`
+- **Linux/macOS 从桌面图标或 AppImage 启动时**:桌面会话不继承终端里的 `PATH`,而安装器通常把 `pi` 写进 `~/.pi/agent/bin`、`~/.local/bin` 这类只在 shell 里可见的目录。pido 会先查 `PATH`,再查这些常见目录;仍找不到,或报「pi 存在但无法运行」(多半是 `node` 不在桌面会话的 `PATH` 里),可用 `PIDO_PI_PATH=/完整路径/pi` 启动 pido 指定可执行文件
 - **Rust 1.98+**(仅构建时需要)
+
+English: a desktop launch (a `.desktop` entry or the AppImage) does not inherit
+your terminal's `PATH`, and pi's installer writes to directories like
+`~/.pi/agent/bin` or `~/.local/bin` that only a shell sees. pido searches
+`PATH` and then those well-known directories; if pi is still not found, or the
+banner says it is installed but will not run (usually a `node` the session
+cannot see), start pido with `PIDO_PI_PATH=/full/path/to/pi`.
 
 ## 下载 / Download
 

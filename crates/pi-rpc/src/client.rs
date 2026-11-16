@@ -46,33 +46,200 @@ pub(crate) fn next_request_id() -> String {
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
+/// Overrides where `pi` lives. A GUI launch (a `.desktop` entry or an
+/// AppImage on Linux) inherits the session's `PATH`, not the shell's, so the
+/// directory an installer appended to `~/.bashrc` is invisible to it.
+pub const PI_PATH_ENV: &str = "PIDO_PI_PATH";
+
+/// User directories that hold `pi` but are rarely on a desktop session's
+/// `PATH`: the pi installer's own bin, and the usual per-user package
+/// managers. Searched only after `PATH`.
+#[cfg(not(windows))]
+const UNIX_PI_DIRS: &[&str] = &[
+    ".pi/agent/bin",
+    ".pi/bin",
+    ".local/bin",
+    ".npm-global/bin",
+    ".nix-profile/bin",
+    ".bun/bin",
+    ".volta/bin",
+    ".asdf/shims",
+];
+
+/// System directories worth a direct look when `PATH` came up empty.
+#[cfg(not(windows))]
+const UNIX_PI_ROOTS: &[&str] = &[
+    "/usr/local/bin",
+    "/usr/bin",
+    "/snap/bin",
+    "/opt/homebrew/bin",
+    "/home/linuxbrew/.linuxbrew/bin",
+    "/nix/var/nix/profiles/default/bin",
+];
+
 /// Resolve the actual pi executable to spawn.
 ///
-/// On Windows, `std::process::Command` does not resolve `PATHEXT` and npm
-/// installs pi as `pi.cmd`, so spawning bare `pi` fails. Search `PATH` for
-/// the Windows executable forms; std routes `.cmd`/`.bat` through `cmd.exe`
-/// with safe escaping. On Unix, `pi` on `PATH` works directly.
+/// A bare `pi` is searched for explicitly instead of being handed to
+/// `Command::new`: Windows needs the `pi.cmd` npm shim (std does no `PATHEXT`
+/// lookup), and on Unix a desktop-launched app has a `PATH` that misses the
+/// directories installers write to, so the well-known ones are tried after
+/// `PATH`. An explicit path — or [`PI_PATH_ENV`] — always wins.
 fn resolve_pi_program(program: &Path) -> PathBuf {
+    let is_bare_name = program.parent().is_none_or(|p| p.as_os_str().is_empty());
+    if !is_bare_name || program.extension().is_some() {
+        return program.to_path_buf();
+    }
+    if let Some(raw) = std::env::var_os(PI_PATH_ENV) {
+        let candidate = PathBuf::from(raw);
+        if is_runnable(&candidate) {
+            return candidate;
+        }
+        // Set but unusable: say so, then fall through rather than failing the
+        // whole connection on a typo.
+        log::warn!(
+            "pi-rpc: {PI_PATH_ENV}={} is not an executable file; searching PATH instead",
+            candidate.display()
+        );
+    }
     #[cfg(windows)]
+    if let Some(found) = find_in_dirs(path_dirs(), ["pi.cmd", "pi.exe", "pi.bat"]) {
+        return found;
+    }
+    #[cfg(not(windows))]
     {
-        let is_bare_name = program.parent().is_none_or(|p| p.as_os_str().is_empty());
-        if program.extension().is_none()
-            && is_bare_name
-            && let Some(path_var) = std::env::var_os("PATH")
-        {
-            for dir in std::env::split_paths(&path_var) {
-                for name in ["pi.cmd", "pi.exe", "pi.bat"] {
-                    let candidate = dir.join(name);
-                    if candidate.is_file() {
-                        return candidate;
-                    }
+        if let Some(found) = find_in_dirs(path_dirs(), ["pi"]) {
+            return found;
+        }
+        if let Some(found) = find_in_unix_fallbacks() {
+            log::info!("pi-rpc: pi is not on PATH; using {}", found.display());
+            return found;
+        }
+    }
+    program.to_path_buf()
+}
+
+/// The directories on `PATH`, in order.
+fn path_dirs() -> impl Iterator<Item = PathBuf> {
+    std::env::var_os("PATH")
+        .map(|path_var| std::env::split_paths(&path_var).collect::<Vec<_>>())
+        .unwrap_or_default()
+        .into_iter()
+}
+
+/// The first runnable file called any of `names` in `dirs`.
+fn find_in_dirs<I, N>(dirs: I, names: N) -> Option<PathBuf>
+where
+    I: IntoIterator<Item = PathBuf>,
+    N: IntoIterator<Item = &'static str>,
+{
+    let names = names.into_iter().collect::<Vec<_>>();
+    for dir in dirs {
+        for name in &names {
+            let candidate = dir.join(name);
+            if is_runnable(&candidate) {
+                return Some(candidate);
+            }
+        }
+    }
+    None
+}
+
+/// Whether `path` is a file this process may execute. On Unix a missing
+/// execute bit is the usual reason an installed pi "is not there".
+fn is_runnable(path: &Path) -> bool {
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return false;
+    };
+    if !metadata.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        metadata.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    true
+}
+
+/// The per-user and system directories an installer is likely to have used.
+#[cfg(not(windows))]
+fn find_in_unix_fallbacks() -> Option<PathBuf> {
+    let home = dirs::home_dir()?;
+    let user_dirs = UNIX_PI_DIRS.iter().map(|dir| home.join(dir));
+    if let Some(found) = find_in_dirs(user_dirs, ["pi"]) {
+        return Some(found);
+    }
+    if let Some(found) = find_in_node_managers(&home) {
+        return Some(found);
+    }
+    let system_dirs = UNIX_PI_ROOTS.iter().map(PathBuf::from);
+    find_in_dirs(system_dirs, ["pi"])
+}
+
+/// Where version-managed Node installs keep their global binaries. `nvm` and
+/// `fnm` put each release in its own directory, so `npm -g` under either one
+/// leaves `pi` somewhere a desktop launch never looks.
+#[cfg(not(windows))]
+const NODE_MANAGER_ROOTS: &[&str] = &[
+    ".nvm/versions/node",
+    ".local/share/fnm/node-versions",
+    ".fnm/node-versions",
+];
+
+/// The `pi` of the newest Node release under `home`, if any is installed.
+#[cfg(not(windows))]
+fn find_in_node_managers(home: &Path) -> Option<PathBuf> {
+    let mut found: Vec<((u64, u64, u64), PathBuf)> = Vec::new();
+    for root in NODE_MANAGER_ROOTS {
+        let Ok(entries) = std::fs::read_dir(home.join(root)) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let version = version_key(&entry.file_name().to_string_lossy());
+            for suffix in ["bin", "installation/bin"] {
+                let candidate = entry.path().join(suffix).join("pi");
+                if is_runnable(&candidate) {
+                    found.push((version, candidate));
                 }
             }
         }
     }
-    #[cfg(not(windows))]
-    let _ = program;
-    program.to_path_buf()
+    found.sort_by(|left, right| right.0.cmp(&left.0));
+    found.into_iter().next().map(|(_, path)| path)
+}
+
+/// `v22.19.0` → `(22, 19, 0)`; anything unparseable sorts as zero.
+#[cfg(not(windows))]
+fn version_key(name: &str) -> (u64, u64, u64) {
+    let mut parts = name.trim_start_matches('v').split('.');
+    let major = parts.next().and_then(|part| part.parse::<u64>().ok());
+    let minor = parts.next().and_then(|part| part.parse::<u64>().ok());
+    let patch = parts.next().and_then(|part| part.parse::<u64>().ok());
+    (major.unwrap_or(0), minor.unwrap_or(0), patch.unwrap_or(0))
+}
+
+/// A `pi` command that can find its own dependencies.
+///
+/// A `pi` resolved outside `PATH` (an nvm, volta or asdf shim, most often) is
+/// usually launched through `#!/usr/bin/env node`, and that `node` sits in the
+/// same directory. Prepending it lets the child run without the user having to
+/// rebuild their desktop session's environment.
+fn pi_command(program: &Path) -> ProcessCommand {
+    let mut command = ProcessCommand::new(program);
+    let Some(dir) = program
+        .parent()
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .filter(|dir| !path_dirs().any(|path_dir| path_dir == *dir))
+    else {
+        return command;
+    };
+    let mut dirs = vec![dir.to_path_buf()];
+    dirs.extend(path_dirs());
+    if let Ok(path) = std::env::join_paths(dirs) {
+        command.env("PATH", path);
+    }
+    command
 }
 
 /// Default bound for `request`. `abort` and `bash` only respond once idle or
@@ -203,7 +370,7 @@ impl PiClient {
             anyhow::bail!("working directory does not exist: {}", config.cwd.display());
         }
         let program = resolve_pi_program(&config.pi_path.clone().unwrap_or_else(|| "pi".into()));
-        let mut command = ProcessCommand::new(&program);
+        let mut command = pi_command(&program);
         command
             .args(["--mode", "rpc"])
             .args(&config.extra_args)
@@ -612,20 +779,100 @@ fn fail_pending(pending: &Mutex<HashMap<String, Pending>>) {
     pending.lock().unwrap().clear();
 }
 
-/// Probe whether a `pi` executable is available and report its version, for
-/// onboarding UIs.
-pub fn probe_pi_install(pi_path: Option<&PathBuf>) -> Option<String> {
+/// What a probe of the `pi` CLI found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PiProbe {
+    /// The CLI ran and reported a version.
+    Ready { program: PathBuf, version: String },
+    /// No usable `pi` executable was found, on `PATH` or in an installer's
+    /// directory.
+    Missing,
+    /// Something called `pi` exists, but running it failed: a wrong
+    /// architecture, a missing execute bit, or — most often on Linux — a
+    /// `node` the desktop session's `PATH` cannot see.
+    Broken {
+        program: PathBuf,
+        /// How the process ended, as `ExitStatus` words it (exit code or
+        /// signal).
+        status: String,
+        /// The first few stderr lines, which is where pi puts the reason.
+        detail: String,
+    },
+}
+
+impl PiProbe {
+    /// The version string, when the CLI answered.
+    pub fn version(&self) -> Option<&str> {
+        match self {
+            PiProbe::Ready { version, .. } => Some(version.as_str()),
+            _ => None,
+        }
+    }
+
+    /// A one-line explanation for a UI banner, when `pi` was found but is
+    /// unusable. `None` when it is ready, or simply absent (that case has its
+    /// own install hint).
+    pub fn problem(&self) -> Option<String> {
+        match self {
+            PiProbe::Ready { .. } | PiProbe::Missing => None,
+            PiProbe::Broken {
+                program,
+                status,
+                detail,
+            } => {
+                let mut text = format!("{} ({status})", program.display());
+                if !detail.is_empty() {
+                    text.push_str(": ");
+                    text.push_str(detail);
+                }
+                Some(text)
+            }
+        }
+    }
+}
+
+/// Probe the `pi` CLI for onboarding UIs.
+///
+/// The three outcomes are distinguished on purpose: a GUI launch that cannot
+/// see the installer's directory and an installed-but-unrunnable CLI both used
+/// to read as "pi is not installed", which sent users looking for the wrong
+/// problem.
+pub fn probe_pi_install(pi_path: Option<&PathBuf>) -> PiProbe {
     let program = resolve_pi_program(&pi_path.cloned().unwrap_or_else(|| "pi".into()));
-    let mut command = ProcessCommand::new(&program);
+    let mut command = pi_command(&program);
     command.arg("--version").stdin(Stdio::null());
     #[cfg(windows)]
     command.creation_flags(CREATE_NO_WINDOW);
-    let output = command.output().ok()?;
-    if output.status.success() {
-        Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
-    } else {
-        None
+    match command.output() {
+        Ok(output) if output.status.success() => PiProbe::Ready {
+            program,
+            version: String::from_utf8_lossy(&output.stdout).trim().to_string(),
+        },
+        Ok(output) => PiProbe::Broken {
+            program,
+            status: output.status.to_string(),
+            detail: first_lines(&String::from_utf8_lossy(&output.stderr), 3),
+        },
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => PiProbe::Missing,
+        Err(error) => PiProbe::Broken {
+            program,
+            status: error.kind().to_string(),
+            detail: error.to_string(),
+        },
     }
+}
+
+/// The first `count` non-empty lines of `text`, joined with ` · ` and capped
+/// at 300 characters, for a banner.
+fn first_lines(text: &str, count: usize) -> String {
+    let joined = text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .take(count)
+        .collect::<Vec<_>>()
+        .join(" · ");
+    joined.chars().take(300).collect()
 }
 
 /// Check whether pi is authenticated for a provider, via `pi auth check`.
@@ -634,7 +881,7 @@ pub fn probe_pi_install(pi_path: Option<&PathBuf>) -> Option<String> {
 /// could not run. Exit codes: 0 ready, 1 not_ready, 2 error.
 pub fn probe_auth(provider: &str, pi_path: Option<&PathBuf>) -> anyhow::Result<bool> {
     let program = resolve_pi_program(&pi_path.cloned().unwrap_or_else(|| "pi".into()));
-    let mut command = ProcessCommand::new(&program);
+    let mut command = pi_command(&program);
     command
         .args(["auth", "check", "--provider", provider])
         .stdin(Stdio::null());
@@ -670,7 +917,7 @@ mod tests {
         // This machine has pi installed (it is a project prerequisite), so a
         // successful probe here validates the plumbing end to end.
         if which_pi().is_some() {
-            assert!(probe_pi_install(None).is_some());
+            assert!(probe_pi_install(None).version().is_some());
         }
     }
 
@@ -680,5 +927,129 @@ mod tests {
                 .map(|dir| dir.join(if cfg!(windows) { "pi.cmd" } else { "pi" }))
                 .find(|path| path.exists())
         })
+    }
+
+    #[test]
+    fn a_missing_program_is_missing_not_broken() {
+        let absent = PathBuf::from("pido-test-no-such-directory").join("pi");
+        assert_eq!(probe_pi_install(Some(&absent)), PiProbe::Missing);
+    }
+
+    /// A script standing in for `pi`: records whether a non-executable file
+    /// reads as broken instead of missing, which is what a bad `chmod` or a
+    /// missing shebang interpreter looks like from here.
+    #[cfg(unix)]
+    fn script(dir: &Path, name: &str, body: &str, mode: u32) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join(name);
+        std::fs::write(&path, body).expect("write script");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode))
+            .expect("chmod script");
+        path
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_working_pi_reports_its_version() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = script(dir.path(), "pi", "#!/bin/sh\necho 0.99.0\n", 0o755);
+        match probe_pi_install(Some(&path)) {
+            PiProbe::Ready { version, .. } => assert_eq!(version, "0.99.0"),
+            other => panic!("expected Ready, got {other:?}"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unrunnable_pi_reports_the_reason() {
+        // Exit 127 with stderr is exactly what `#!/usr/bin/env node` prints
+        // when the desktop session's PATH has no node.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = script(
+            dir.path(),
+            "pi",
+            "#!/bin/sh\necho 'env: node: No such file or directory' >&2\nexit 127\n",
+            0o755,
+        );
+        match probe_pi_install(Some(&path)) {
+            PiProbe::Broken { status, detail, .. } => {
+                assert!(status.contains("127"), "status was {status}");
+                assert!(detail.contains("node"), "detail was {detail}");
+            }
+            other => panic!("expected Broken, got {other:?}"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_non_executable_pi_is_not_taken_for_a_missing_one() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = script(dir.path(), "pi", "#!/bin/sh\nexit 0\n", 0o644);
+        assert!(!is_runnable(&path), "0664 is not executable");
+        assert!(
+            matches!(probe_pi_install(Some(&path)), PiProbe::Broken { .. }),
+            "an unreadable install must not read as absent"
+        );
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(is_runnable(&path));
+    }
+
+    #[test]
+    fn directories_are_searched_in_order_and_skip_non_executables() {
+        let empty = tempfile::tempdir().expect("tempdir");
+        let real = tempfile::tempdir().expect("tempdir");
+        #[cfg(unix)]
+        let name = "pi";
+        #[cfg(windows)]
+        let name = "pi.cmd";
+        let found = real.path().join(name);
+        std::fs::write(&found, "").expect("write candidate");
+
+        // A directory without the binary is skipped, not an error.
+        let hit = find_in_dirs(
+            [empty.path().to_path_buf(), real.path().to_path_buf()],
+            [name],
+        );
+        assert_eq!(hit.as_deref(), Some(found.as_path()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_pi_under_a_versioned_node_manager_is_found() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = tempfile::tempdir().expect("tempdir");
+        let old = home.path().join(".nvm/versions/node/v18.0.0/bin");
+        let new = home.path().join(".nvm/versions/node/v22.19.0/bin");
+        for dir in [&old, &new] {
+            std::fs::create_dir_all(dir).expect("mkdir");
+            let pi = dir.join("pi");
+            std::fs::write(&pi, "#!/bin/sh\nexit 0\n").expect("write pi");
+            std::fs::set_permissions(&pi, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        }
+        assert_eq!(
+            find_in_node_managers(home.path()),
+            Some(new.join("pi")),
+            "the newest Node release wins"
+        );
+    }
+
+    #[test]
+    fn a_pi_outside_path_gets_its_own_directory_first() {
+        // The nvm/volta/asdf case: pi is found by its shim directory, and the
+        // `node` its shebang needs lives beside it.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let program = dir.path().join(if cfg!(windows) { "pi.cmd" } else { "pi" });
+        std::fs::write(&program, "").expect("write candidate");
+
+        let path = pi_command(&program)
+            .get_envs()
+            .find(|(key, _)| key.to_string_lossy() == "PATH")
+            .and_then(|(_, value)| value.map(|value| value.to_string_lossy().into_owned()))
+            .expect("PATH is set when pi lives outside it");
+        assert_eq!(
+            std::env::split_paths(&path).next().as_deref(),
+            Some(dir.path())
+        );
     }
 }
