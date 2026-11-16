@@ -644,12 +644,15 @@ fn render_item(
                 });
             let mut bubble = MessageBubble::new(Role::User);
             if !images.is_empty() {
+                // `image()` decodes on first paint and caches; a payload that
+                // cannot be decoded is skipped rather than drawn as a gap.
                 bubble = bubble.child(div().flex().flex_wrap().gap_1().children(
-                    images.iter().map(|image| {
-                        let thumbnail = gpui::img(gpui::ImageSource::Image(image.image.clone()))
+                    images.iter().filter_map(|image| {
+                        let decoded = image.image()?.clone();
+                        let thumbnail = gpui::img(gpui::ImageSource::Image(decoded))
                             .max_h(gpui::px(180.))
                             .rounded_sm();
-                        if image.name.is_empty() {
+                        Some(if image.name.is_empty() {
                             thumbnail.into_any_element()
                         } else {
                             div()
@@ -659,7 +662,7 @@ fn render_item(
                                 .child(thumbnail)
                                 .child(Caption::new(image.name.clone()))
                                 .into_any_element()
-                        }
+                        })
                     }),
                 ));
             }
@@ -806,10 +809,13 @@ fn render_item(
             let image_elements: Vec<_> = card
                 .images
                 .iter()
-                .map(|stored| {
-                    gpui::img(gpui::ImageSource::Image(stored.image.clone()))
-                        .max_h(gpui::px(220.))
-                        .rounded_sm()
+                .filter_map(|stored| {
+                    let decoded = stored.image()?.clone();
+                    Some(
+                        gpui::img(gpui::ImageSource::Image(decoded))
+                            .max_h(gpui::px(220.))
+                            .rounded_sm(),
+                    )
                 })
                 .collect::<Vec<_>>();
             let wrap = div().px_1().child(rendered);

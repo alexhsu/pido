@@ -759,18 +759,82 @@ fn join_blocks(blocks: &BTreeMap<u32, String>) -> String {
         .join("\n\n")
 }
 
-/// A decoded image ready for gpui's content-addressed cache. Built once when
-/// the bytes arrive, not once per frame.
+/// An image on its way to gpui's content-addressed cache.
+///
+/// The payload stays in the shape it arrived in (arc'd bytes, or the base64
+/// text pi sends) and is decoded the first time it is painted: opening a
+/// session with fifty screenshots must not decode all of them up front, and
+/// cloning a transcript row must not copy megabytes.
 #[derive(Clone, Debug)]
 pub struct StoredImage {
-    pub image: Arc<gpui::Image>,
+    /// Taken when the image is decoded: once gpui owns its copy, holding the
+    /// payload too would double the image's footprint.
+    source: std::cell::RefCell<Option<ImageSource>>,
+    format: gpui::ImageFormat,
+    decoded: std::cell::OnceCell<Option<Arc<gpui::Image>>>,
+}
+
+#[derive(Clone, Debug)]
+enum ImageSource {
+    /// Encoded bytes we already hold, e.g. a file just read from disk.
+    Bytes(Arc<Vec<u8>>),
+    /// base64 exactly as pi's protocol carries it.
+    Base64(Arc<str>),
+}
+
+impl StoredImage {
+    /// An image whose encoded bytes are already in memory.
+    fn from_bytes(bytes: Arc<Vec<u8>>, mime: &str) -> Self {
+        Self {
+            source: std::cell::RefCell::new(Some(ImageSource::Bytes(bytes))),
+            format: image_format(mime),
+            decoded: std::cell::OnceCell::new(),
+        }
+    }
+
+    /// An image pi sent as base64; decoded on first paint.
+    fn from_base64(data: &str, mime: &str) -> Self {
+        Self {
+            source: std::cell::RefCell::new(Some(ImageSource::Base64(Arc::from(data)))),
+            format: image_format(mime),
+            decoded: std::cell::OnceCell::new(),
+        }
+    }
+
+    /// The decoded image, or `None` when the payload cannot be decoded (a
+    /// malformed base64 string, most often). Decoding happens once; a failure
+    /// is remembered so a broken image is not retried every frame.
+    pub fn image(&self) -> Option<&Arc<gpui::Image>> {
+        self.decoded
+            .get_or_init(|| {
+                let bytes = match self.source.borrow_mut().take()? {
+                    ImageSource::Bytes(bytes) => (*bytes).clone(),
+                    ImageSource::Base64(data) => base64::engine::general_purpose::STANDARD
+                        .decode(data.as_ref())
+                        .ok()?,
+                };
+                Some(Arc::new(gpui::Image {
+                    format: self.format,
+                    id: image_id(&bytes),
+                    bytes,
+                }))
+            })
+            .as_ref()
+    }
 }
 
 /// An image attached to a user prompt, with the name it was staged under.
 #[derive(Clone, Debug)]
 pub struct UserImage {
     pub name: String,
-    pub image: Arc<gpui::Image>,
+    pub stored: StoredImage,
+}
+
+impl UserImage {
+    /// The decoded image, or `None` when the payload cannot be decoded.
+    pub fn image(&self) -> Option<&Arc<gpui::Image>> {
+        self.stored.image()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -2259,7 +2323,7 @@ impl AppState {
             key,
             name,
             mime: mime.into(),
-            data: bytes,
+            data: Arc::new(bytes),
             preview,
         });
         Ok(())
@@ -2650,6 +2714,9 @@ impl AppState {
     /// Drop the session and return to the welcome screen.
     pub fn disconnect(&mut self, cx: &mut Context<Self>) {
         self.session_gen += 1;
+        // Retire the event pump too: records already in flight must not fold
+        // into a transcript the next connect is about to build.
+        self.conn_gen += 1;
         if let Some(client) = self.client.take() {
             client.shutdown();
         }
@@ -2805,7 +2872,7 @@ impl AppState {
                 .iter()
                 .map(|image| pi_rpc::protocol::ImageInput {
                     content_type: "image",
-                    data: base64::engine::general_purpose::STANDARD.encode(&image.data),
+                    data: base64::engine::general_purpose::STANDARD.encode(image.data.as_slice()),
                     mime_type: image.mime.clone(),
                 })
                 .collect::<Vec<_>>()
@@ -2847,13 +2914,15 @@ impl AppState {
             }
         };
         // The staged images leave with the message, whatever its fate. Keep
-        // decoded copies on the transcript row so the prompt is not blank.
+        // them on the transcript row so the prompt is not blank; sharing the
+        // arc means the send copies no bytes, and the row decodes on first
+        // paint rather than here.
         let user_images = self
             .pending_images
             .iter()
             .map(|image| UserImage {
                 name: image.name.clone(),
-                image: stored_image(image.data.clone(), &image.mime).image,
+                stored: StoredImage::from_bytes(Arc::clone(&image.data), &image.mime),
             })
             .collect();
         self.clear_images();
@@ -4698,10 +4767,18 @@ fn compaction_tokens(result: &serde_json::Value) -> Option<(u64, u64)> {
     Some((before, after))
 }
 
-/// The images a tool result carries, as (base64, mime) pairs.
+/// Map a mime type to gpui's decoder. Every format [`sniff_image`] accepts
+/// must round-trip here — bytes decoded as the wrong format render as nothing.
 fn image_format(mime: &str) -> gpui::ImageFormat {
+    let mime = mime.to_ascii_lowercase();
     if mime.contains("jpeg") || mime.contains("jpg") {
         gpui::ImageFormat::Jpeg
+    } else if mime.contains("webp") {
+        gpui::ImageFormat::Webp
+    } else if mime.contains("gif") {
+        gpui::ImageFormat::Gif
+    } else if mime.contains("bmp") {
+        gpui::ImageFormat::Bmp
     } else {
         gpui::ImageFormat::Png
     }
@@ -4718,29 +4795,12 @@ fn image_id(bytes: &[u8]) -> u64 {
     hash
 }
 
-fn stored_image(bytes: Vec<u8>, mime: &str) -> StoredImage {
-    StoredImage {
-        image: Arc::new(gpui::Image {
-            format: image_format(mime),
-            id: image_id(&bytes),
-            bytes,
-        }),
-    }
-}
-
-fn stored_image_base64(data: &str, mime: &str) -> Option<StoredImage> {
-    let bytes = base64::engine::general_purpose::STANDARD
-        .decode(data)
-        .ok()?;
-    Some(stored_image(bytes, mime))
-}
-
 fn tool_images(blocks: &[pi_rpc::protocol::ToolResultBlock]) -> Vec<StoredImage> {
     blocks
         .iter()
         .filter_map(|block| match block {
             pi_rpc::protocol::ToolResultBlock::Image { data, mime_type } => {
-                stored_image_base64(data, mime_type)
+                Some(StoredImage::from_base64(data, mime_type))
             }
             _ => None,
         })
@@ -4754,12 +4814,10 @@ fn user_images(message: &pi_rpc::protocol::UserMessage) -> Vec<UserImage> {
     blocks
         .iter()
         .filter_map(|block| match block {
-            pi_rpc::protocol::UserContentBlock::Image { data, mime_type } => {
-                stored_image_base64(data, mime_type).map(|stored| UserImage {
-                    name: String::new(),
-                    image: stored.image,
-                })
-            }
+            pi_rpc::protocol::UserContentBlock::Image { data, mime_type } => Some(UserImage {
+                name: String::new(),
+                stored: StoredImage::from_base64(data, mime_type),
+            }),
             _ => None,
         })
         .collect()
@@ -5014,8 +5072,48 @@ mod tests {
         };
         let images = tool_images(&result.content);
         assert_eq!(images.len(), 1);
-        assert_eq!(images[0].image.format, gpui::ImageFormat::Png);
-        assert_eq!(images[0].image.id, image_id(b"hello"));
+        let decoded = images[0].image().expect("the payload decodes");
+        assert_eq!(decoded.format, gpui::ImageFormat::Png);
+        assert_eq!(decoded.id, image_id(b"hello"));
+    }
+
+    #[test]
+    fn every_format_the_sniffer_accepts_decodes_as_itself() {
+        // A mismatch here is invisible: gpui just draws nothing.
+        for mime in [
+            "image/png",
+            "image/jpeg",
+            "image/gif",
+            "image/webp",
+            "image/bmp",
+        ] {
+            assert_eq!(image_format(mime).mime_type(), mime);
+        }
+    }
+
+    #[test]
+    fn images_decode_once_and_only_when_painted() {
+        let stored = StoredImage::from_base64("aGVsbG8=", "image/png");
+        assert!(
+            stored.decoded.get().is_none(),
+            "nothing is decoded at construction"
+        );
+        let first = stored.image().expect("hello decodes").clone();
+        let again = stored.image().expect("cached").clone();
+        assert!(
+            Arc::ptr_eq(&first, &again),
+            "the second paint reuses the arc"
+        );
+        assert_eq!(first.id, image_id(b"hello"));
+        assert!(
+            stored.source.borrow().is_none(),
+            "the raw payload is released once gpui owns a copy"
+        );
+
+        // A broken payload reports failure once and remembers it.
+        let broken = StoredImage::from_base64("not base64!!", "image/png");
+        assert!(broken.image().is_none());
+        assert!(broken.decoded.get().is_some(), "the failure is cached too");
     }
 
     #[test]
@@ -5210,7 +5308,7 @@ mod tests {
     }
 
     #[test]
-    fn user_images_decode_for_restored_prompts() {
+    fn user_images_restore_from_history() {
         use pi_rpc::protocol::{UserContent, UserContentBlock, UserMessage};
         let user = UserMessage {
             content: UserContent::Blocks(vec![
@@ -5227,8 +5325,10 @@ mod tests {
         };
         let images = user_images(&user);
         assert_eq!(images.len(), 1);
-        assert_eq!(images[0].image.id, image_id(b"hello"));
-        assert_eq!(images[0].image.format, gpui::ImageFormat::Png);
+        // Restoring is cheap: the payload is only decoded when it is painted.
+        let decoded = images[0].image().expect("the history image decodes");
+        assert_eq!(decoded.id, image_id(b"hello"));
+        assert_eq!(decoded.format, gpui::ImageFormat::Png);
     }
 
     #[test]
@@ -5776,7 +5876,9 @@ pub struct PendingImage {
     pub key: String,
     pub name: String,
     pub mime: String,
-    pub data: Vec<u8>,
+    /// The staged bytes. Shared by arc with the transcript row's thumbnail, so
+    /// sending an image copies it once (into gpui's `Image`) instead of twice.
+    pub data: Arc<Vec<u8>>,
     /// The staged bytes written to a temp file, for the chip's thumbnail.
     pub preview: PathBuf,
 }

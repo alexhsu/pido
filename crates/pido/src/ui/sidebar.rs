@@ -136,17 +136,18 @@ pub fn render(
         })
         .when_some(search_field, |this, field| {
             // The session search: titles filter as you type, content matches
-            // join in from the background pass.
+            // join in from the background pass. Ely's `Input` owns the frame so
+            // the field reads as a field — magnifier in front, focus ring, and
+            // a clear button while there is a query — instead of a bare row of
+            // text with a hairline around it.
+            let focused = field.read(cx).focus().is_focused(window);
+            let icon = if focused { colors.fg } else { colors.fg_subtle };
             this.child(
                 div().flex_none().px_4().pb_2().child(
-                    div()
-                        .w_full()
-                        .rounded_md()
-                        .border_1()
-                        .border_color(colors.border)
-                        .bg(colors.surface)
-                        .px_2()
-                        .child(field),
+                    ely_gpui_component::forms::Input::new(&field)
+                        .size(ControlSize::Sm)
+                        .prefix(Icon::new(IconName::Search).size(IconSize::Sm).color(icon))
+                        .clearable(),
                 ),
             )
         })
