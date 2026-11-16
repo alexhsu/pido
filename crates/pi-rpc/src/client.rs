@@ -1007,12 +1007,35 @@ mod tests {
         let name = "pi.cmd";
         let found = real.path().join(name);
         std::fs::write(&found, "").expect("write candidate");
+        // On Unix a runnable file needs its execute bit; `fs::write` leaves
+        // 0o644, which `is_runnable` correctly rejects.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&found, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod candidate");
+        }
 
-        // A directory without the binary is skipped, not an error.
-        let hit = find_in_dirs(
-            [empty.path().to_path_buf(), real.path().to_path_buf()],
-            [name],
-        );
+        // The same name without the execute bit must be walked past (Unix
+        // only: Windows has no such bit).
+        #[cfg(unix)]
+        let stale = tempfile::tempdir().expect("tempdir");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let stale_copy = stale.path().join(name);
+            std::fs::write(&stale_copy, "").expect("write stale candidate");
+            std::fs::set_permissions(&stale_copy, std::fs::Permissions::from_mode(0o644))
+                .expect("chmod stale candidate");
+        }
+
+        // An empty directory is skipped, an unrunnable copy is skipped, and
+        // the runnable file in the last directory wins.
+        let mut dirs = vec![empty.path().to_path_buf()];
+        #[cfg(unix)]
+        dirs.push(stale.path().to_path_buf());
+        dirs.push(real.path().to_path_buf());
+        let hit = find_in_dirs(dirs, [name]);
         assert_eq!(hit.as_deref(), Some(found.as_path()));
     }
 
