@@ -150,15 +150,17 @@ fn is_runnable(path: &Path) -> bool {
     let Ok(metadata) = std::fs::metadata(path) else {
         return false;
     };
-    if !metadata.is_file() {
-        return false;
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        metadata.permissions().mode() & 0o111 != 0
-    }
-    #[cfg(not(unix))]
+    metadata.is_file() && has_execute_bit(&metadata)
+}
+
+#[cfg(unix)]
+fn has_execute_bit(metadata: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    metadata.permissions().mode() & 0o111 != 0
+}
+
+#[cfg(not(unix))]
+fn has_execute_bit(_metadata: &std::fs::Metadata) -> bool {
     true
 }
 
@@ -205,7 +207,7 @@ fn find_in_node_managers(home: &Path) -> Option<PathBuf> {
             }
         }
     }
-    found.sort_by(|left, right| right.0.cmp(&left.0));
+    found.sort_by_key(|left| std::cmp::Reverse(left.0));
     found.into_iter().next().map(|(_, path)| path)
 }
 
