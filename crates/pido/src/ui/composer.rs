@@ -437,7 +437,11 @@ fn stats_caption(s: &AppState, cx: &App) -> Option<SharedString> {
     if let Some(tokens) = stats.tokens.as_ref() {
         let total = tokens.total_tokens.unwrap_or(tokens.input + tokens.output);
         if total > 0 {
-            parts.push(format!("{} tok", compact_count(total)));
+            parts.push(format!(
+                "{} {}",
+                compact_count(total),
+                i18n::t(cx, "tok_short")
+            ));
             if let Some(hit) = cache_hit_percent(tokens.input, tokens.cache_read) {
                 parts.push(i18n::t_arg(cx, "status_cache", "p", &hit).to_string());
             }

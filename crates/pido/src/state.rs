@@ -2075,9 +2075,6 @@ impl AppState {
             return;
         }
         let name = name.trim().to_string();
-        if name.is_empty() {
-            return;
-        }
         let path = path.to_string();
         cx.spawn(async move |this, cx| {
             let path_for_write = path.clone();
@@ -2094,7 +2091,11 @@ impl AppState {
             this.update(cx, |s, cx| {
                 match result {
                     Ok(()) => {
-                        patch_session_title(&mut s.sidebar_rows, &path, &name);
+                        // A blank name clears the title: the rescan below
+                        // drops the row's name, so no title patch then.
+                        if !name.is_empty() {
+                            patch_session_title(&mut s.sidebar_rows, &path, &name);
+                        }
                         s.refresh_sessions(cx);
                     }
                     Err(error) => s.push_notice(NoticeKind::Error, format!("rename: {error}")),
@@ -2117,10 +2118,13 @@ impl AppState {
     }
 
     /// Rename the session. Pi keeps the name in the session file and reports
-    /// it in `get_state`, so the header and the sidebar both follow.
+    /// it in `get_state`, so the header and the sidebar both follow. An empty
+    /// name clears the title (pi's RPC refuses empty strings, so that path
+    /// writes the file and reloads it instead).
     pub fn rename_session(&mut self, name: String, cx: &mut Context<Self>) {
         let name = name.trim().to_string();
         if name.is_empty() {
+            self.clear_session_name(cx);
             return;
         }
         self.session_name = Some(name.clone());
@@ -2131,6 +2135,51 @@ impl AppState {
         }
         self.check_command(Command::SetSessionName { name }, "set_session_name", cx);
         self.refresh_sessions(cx);
+        cx.notify();
+    }
+
+    /// Drop the open session's title. pi has no RPC for this (its
+    /// `set_session_name` rejects empty strings), so the clear is written as
+    /// an empty `session_info` — the same entry pi uses to clear a title —
+    /// and then the session is reloaded so pi's in-memory copy agrees.
+    fn clear_session_name(&mut self, cx: &mut Context<Self>) {
+        if self.streaming || self.turn_running {
+            self.push_notice(NoticeKind::Warn, i18n::t(cx, "agent_busy").to_string());
+            cx.notify();
+            return;
+        }
+        let Some(file) = self.session_file.clone() else {
+            // A draft has no file to write; nothing to clear yet.
+            return;
+        };
+        if self.client().is_none() {
+            return;
+        }
+        self.session_name = None;
+        cx.spawn(async move |this, cx| {
+            let path = PathBuf::from(&file);
+            let written = cx
+                .background_executor()
+                .spawn(async move { sessions::append_session_name(&path, "") })
+                .await;
+            this.update(cx, |s, cx| {
+                match written {
+                    Ok(()) => {
+                        s.refresh_sessions(cx);
+                        // Reload the same file: pi re-reads it and its
+                        // in-memory name goes with it, so a later get_state
+                        // cannot resurrect the old title.
+                        s.switch_session(PathBuf::from(&file), cx);
+                    }
+                    Err(error) => {
+                        s.push_notice(NoticeKind::Error, format!("rename: {error}"));
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
         cx.notify();
     }
 
@@ -3591,6 +3640,11 @@ impl AppState {
         mode: pi_rpc::protocol::QueueMode,
         cx: &mut Context<Self>,
     ) {
+        // `Unknown` came from a newer pi; echoing it back would send a
+        // literal "unknown" mode.
+        if matches!(mode, pi_rpc::protocol::QueueMode::Unknown) {
+            return;
+        }
         let (previous, set) = if steering {
             (self.steer_mode, Command::SetSteeringMode { mode })
         } else {

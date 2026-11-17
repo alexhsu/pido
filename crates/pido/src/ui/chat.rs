@@ -746,9 +746,10 @@ fn render_item(
             }
             if !view.finished && empty {
                 // Message announced, first delta still in flight.
-                bubble = bubble.child(ely_gpui_component::chat::ThinkingIndicator::new((
-                    "wait", ix,
-                )));
+                bubble = bubble.child(
+                    ely_gpui_component::chat::ThinkingIndicator::new(("wait", ix))
+                        .label(i18n::t(cx, "thinking")),
+                );
             }
             let wrapper = div().group(group(ix)).flex().flex_col().child(bubble);
             // A finished message shows its actions on hover; a streaming one
@@ -918,10 +919,10 @@ fn render_item(
                             .flex()
                             .items_center()
                             .gap_2()
-                            .child(ely_gpui_component::chat::ThinkingIndicator::new((
-                                "shell-run",
-                                ix,
-                            )))
+                            .child(
+                                ely_gpui_component::chat::ThinkingIndicator::new(("shell-run", ix))
+                                    .label(i18n::t(cx, "thinking")),
+                            )
                             .child({
                                 let stop_state = stop_state.clone();
                                 let stop_id = stop_id.clone();

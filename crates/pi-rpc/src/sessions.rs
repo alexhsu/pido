@@ -17,7 +17,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::Deserialize;
 
-use crate::io_util::read_line_capped;
+use crate::io_util::read_line_capped_terminated;
 
 /// Default session root: `$PI_CODING_AGENT_SESSION_DIR`, else
 /// `~/.pi/agent/sessions`. Pi honours the same variable.
@@ -87,10 +87,64 @@ struct EntryTail {
     entry_type: Option<String>,
 }
 
+/// What a scan has learned from the bytes it has already read. Kept next to
+/// the consumed offset so an append-only file only needs its new tail read.
+#[derive(Clone, Default)]
+struct ScanAccum {
+    name: Option<String>,
+    /// The first user message, untruncated.
+    preview: Option<String>,
+    message_count: usize,
+}
+
+impl ScanAccum {
+    /// Fold one JSONL entry into the accumulators.
+    fn consume(&mut self, line: &str) {
+        if line.trim().is_empty() {
+            return;
+        }
+        let Ok(entry) = serde_json::from_str::<EntryTail>(line) else {
+            return;
+        };
+        match entry.entry_type.as_deref() {
+            Some("session_info") => {
+                // Last one wins; a blank name clears the title, exactly as
+                // pi's own getSessionName resolves it.
+                self.name = entry
+                    .name
+                    .filter(|entry_name| !entry_name.trim().is_empty());
+            }
+            Some("message") => {
+                self.message_count += 1;
+                if self.preview.is_none()
+                    && let Some(message) = &entry.message
+                    && message.get("role").and_then(|r| r.as_str()) == Some("user")
+                {
+                    self.preview = user_message_preview(message);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// The header line's fields, which never change once written.
+#[derive(Clone)]
+struct SessionHead {
+    session_id: String,
+    cwd: String,
+    timestamp: Option<String>,
+    parent_session: Option<String>,
+}
+
 /// A cached session summary keyed by the file's metadata.
 struct CachedSummary {
     modified: SystemTime,
     len: u64,
+    /// How many bytes have been parsed: the end of the last complete line.
+    consumed: u64,
+    accum: ScanAccum,
+    head: SessionHead,
     summary: SessionSummary,
 }
 
@@ -105,6 +159,10 @@ pub struct SessionScanner {
 impl SessionScanner {
     /// Scan `root`, parsing only new or changed files. Unreadable or malformed
     /// files are skipped; a partial write must not hide the rest of the list.
+    ///
+    /// A file that only grew (the normal case for the active session, which
+    /// appends on every turn) is parsed from the byte it was last left at;
+    /// a file that shrank or was rewritten in place is parsed whole again.
     pub fn scan(&mut self, root: &Path) -> anyhow::Result<Vec<SessionGroup>> {
         let files = walk_dirs(root)?;
         let present: HashSet<&Path> = files.iter().map(PathBuf::as_path).collect();
@@ -112,33 +170,116 @@ impl SessionScanner {
 
         for path in &files {
             let stamp = file_stamp(path);
-            if let Some(cached) = self.cache.get(path)
-                && stamp
-                    .is_some_and(|(modified, len)| cached.modified == modified && cached.len == len)
-            {
-                summaries.push(cached.summary.clone());
+            let Some((modified, len)) = stamp else {
+                // No metadata: parse without caching.
+                if let Some(summary) = parse_session_file(path) {
+                    summaries.push(summary);
+                } else {
+                    log::warn!("skipping unparseable session file: {}", path.display());
+                }
                 continue;
+            };
+            if let Some(cached) = self.cache.get(path) {
+                if cached.modified == modified && cached.len == len {
+                    summaries.push(cached.summary.clone());
+                    continue;
+                }
+                if len > cached.consumed
+                    && let Some((summary, consumed, accum)) =
+                        append_scan(path, cached.consumed, &cached.head, cached.accum.clone())
+                {
+                    self.cache.insert(
+                        path.clone(),
+                        CachedSummary {
+                            modified,
+                            len,
+                            consumed,
+                            accum,
+                            head: cached.head.clone(),
+                            summary: summary.clone(),
+                        },
+                    );
+                    summaries.push(summary);
+                    continue;
+                }
             }
-            let Some(summary) = parse_session_file(path) else {
+            let Some((summary, consumed, accum, head)) = parse_session_file_full(path) else {
                 log::warn!("skipping unparseable session file: {}", path.display());
                 continue;
             };
-            if let Some((modified, len)) = stamp {
-                self.cache.insert(
-                    path.clone(),
-                    CachedSummary {
-                        modified,
-                        len,
-                        summary: summary.clone(),
-                    },
-                );
-            }
+            self.cache.insert(
+                path.clone(),
+                CachedSummary {
+                    modified,
+                    len,
+                    consumed,
+                    accum,
+                    head,
+                    summary: summary.clone(),
+                },
+            );
             summaries.push(summary);
         }
 
         self.cache
             .retain(|path, _| present.contains(path.as_path()));
         Ok(group_summaries(summaries))
+    }
+}
+
+/// Parse just the bytes appended since `consumed`. Returns the refreshed
+/// summary, the new consumed offset and the accumulators that produced it;
+/// `None` when the file cannot be reopened or seeked (the caller then parses
+/// it whole).
+fn append_scan(
+    path: &Path,
+    consumed: u64,
+    head: &SessionHead,
+    mut accum: ScanAccum,
+) -> Option<(SessionSummary, u64, ScanAccum)> {
+    let mut file = std::fs::File::open(path).ok()?;
+    use std::io::Seek as _;
+    file.seek(std::io::SeekFrom::Start(consumed)).ok()?;
+    let mut reader = BufReader::new(file);
+    let next = scan_body(&mut reader, &mut accum, consumed, path);
+    Some((build_summary(path, head, &accum), next, accum))
+}
+
+/// Fold every terminated line from `reader` into `accum`, starting at byte
+/// offset `from`. Returns the offset just past the last line consumed.
+///
+/// An unterminated final line is never consumed: pi terminates every entry
+/// with a newline, so an unterminated tail is a write still in flight.
+/// Parsing it now would count it twice once the writer finishes the line.
+fn scan_body<R: BufRead>(reader: &mut R, accum: &mut ScanAccum, from: u64, path: &Path) -> u64 {
+    let mut offset = from;
+    let mut buf = Vec::new();
+    while let Ok((len, terminated)) = read_line_capped_terminated(reader, &mut buf, MAX_LINE) {
+        if len == 0 || !terminated {
+            break;
+        }
+        if len > MAX_LINE {
+            log::warn!("session {}: skipped an oversized line", path.display());
+        } else if let Ok(line) = std::str::from_utf8(&buf) {
+            accum.consume(line.trim_end_matches(['\r', '\n']));
+        }
+        offset += len as u64;
+    }
+    offset
+}
+
+/// The summary implied by a header and the accumulators.
+fn build_summary(path: &Path, head: &SessionHead, accum: &ScanAccum) -> SessionSummary {
+    SessionSummary {
+        updated_secs: file_mtime(path),
+        path: path.to_path_buf(),
+        session_id: head.session_id.clone(),
+        cwd: head.cwd.clone(),
+        timestamp: head.timestamp.clone(),
+        name: accum.name.clone(),
+        preview: accum.preview.as_ref().map(|p| truncate(p, 120)),
+        message_count: accum.message_count,
+        parent_session: head.parent_session.clone(),
     }
 }
 
@@ -165,11 +306,12 @@ pub fn read_session_cwd(path: &Path) -> Option<String> {
 /// renames; writing it here lets pido rename a session that is not open
 /// without switching to it first. The entry hangs off the file's last entry,
 /// so the tree stays linear.
+///
+/// An empty `name` is not a no-op: pi resolves the title from the latest
+/// `session_info` and treats a blank one as "cleared" — the only way to drop
+/// a name, since its RPC refuses empty strings.
 pub fn append_session_name(path: &Path, name: &str) -> std::io::Result<()> {
     let name = name.replace(['\r', '\n'], " ").trim().to_string();
-    if name.is_empty() {
-        return Ok(());
-    }
     let text = std::fs::read_to_string(path)?;
     let mut parent = None;
     let mut taken = HashSet::new();
@@ -354,79 +496,42 @@ fn walk_dirs(root: &Path) -> anyhow::Result<Vec<PathBuf>> {
     Ok(files)
 }
 
+/// The per-line cap for summary scanning: a multi-megabyte transcript (base64
+/// tool images can make one line huge) must not be loaded whole.
+const MAX_LINE: usize = 4 * 1024 * 1024;
+
 /// Parse one session file into a summary. `None` when the header line is
 /// missing or malformed (not a session file).
 fn parse_session_file(path: &Path) -> Option<SessionSummary> {
-    // Summary scanning must not load a multi-megabyte transcript (base64
-    // tool images can make a single line huge). Read line by line and cap
-    // the buffer; oversized lines are skipped.
-    const MAX_LINE: usize = 4 * 1024 * 1024;
+    parse_session_file_full(path).map(|(summary, _, _, _)| summary)
+}
+
+/// Parse one session file whole: the summary, how many bytes that consumed,
+/// the accumulators behind it, and the immutable header fields. The scanner
+/// caches these so a later scan can read only the appended tail.
+fn parse_session_file_full(path: &Path) -> Option<(SessionSummary, u64, ScanAccum, SessionHead)> {
     let file = std::fs::File::open(path).ok()?;
     let mut reader = BufReader::new(file);
     let mut buf = Vec::new();
 
-    let header_len = read_line_capped(&mut reader, &mut buf, MAX_LINE).ok()?;
+    let (header_len, _) = read_line_capped_terminated(&mut reader, &mut buf, MAX_LINE).ok()?;
     if header_len == 0 || header_len > MAX_LINE {
         return None;
     }
     let header_text = std::str::from_utf8(&buf).ok()?;
     let header: SessionHeader =
         serde_json::from_str(header_text.trim_end_matches(['\r', '\n'])).ok()?;
-    let session_id = header.id?;
-    let cwd = header.cwd.unwrap_or_default();
-
-    let mut name: Option<String> = None;
-    let mut preview: Option<String> = None;
-    let mut message_count = 0usize;
-    loop {
-        let len = read_line_capped(&mut reader, &mut buf, MAX_LINE).ok()?;
-        if len == 0 {
-            break;
-        }
-        if len > MAX_LINE {
-            log::warn!("session {}: skipped an oversized line", path.display());
-            continue;
-        }
-        let Ok(line) = std::str::from_utf8(&buf) else {
-            continue;
-        };
-        let line = line.trim_end_matches(['\r', '\n']);
-        if line.trim().is_empty() {
-            continue;
-        }
-        let Ok(entry) = serde_json::from_str::<EntryTail>(line) else {
-            continue;
-        };
-        match entry.entry_type.as_deref() {
-            Some("session_info") => {
-                if let Some(entry_name) = entry.name {
-                    name = Some(entry_name); // last one wins
-                }
-            }
-            Some("message") => {
-                message_count += 1;
-                if preview.is_none()
-                    && let Some(message) = &entry.message
-                    && message.get("role").and_then(|r| r.as_str()) == Some("user")
-                {
-                    preview = user_message_preview(message);
-                }
-            }
-            _ => {}
-        }
-    }
-
-    Some(SessionSummary {
-        updated_secs: file_mtime(path),
-        path: path.to_path_buf(),
-        session_id,
-        cwd,
+    let head = SessionHead {
+        session_id: header.id?,
+        cwd: header.cwd.unwrap_or_default(),
         timestamp: header.timestamp,
-        name,
-        preview: preview.map(|p| truncate(&p, 120)),
-        message_count,
         parent_session: header.parent_session,
-    })
+    };
+
+    let mut accum = ScanAccum::default();
+    let consumed = scan_body(&mut reader, &mut accum, header_len as u64, path);
+    let summary = build_summary(path, &head, &accum);
+    Some((summary, consumed, accum, head))
 }
 
 /// The file's last modification time, as unix seconds; None when unknown.
@@ -714,6 +819,115 @@ mod tests {
     }
 
     #[test]
+    fn incremental_scan_matches_a_full_parse() {
+        let root = tempdir();
+        let project = root.path().join("--C--one--");
+        let path = write_session(
+            &project,
+            "2026-01-01T10-00-00-000Z_id.jsonl",
+            &[
+                r#"{"type":"session","version":3,"id":"id","timestamp":"2026-01-01T10:00:00.000Z","cwd":"C:\\one"}"#.into(),
+                r#"{"type":"message","id":"m1","parentId":null,"timestamp":"2026-01-01T10:00:01.000Z","message":{"role":"user","content":"first ask","timestamp":1}}"#.into(),
+            ],
+            10,
+        );
+        let mut scanner = SessionScanner::default();
+        scanner.scan(root.path()).unwrap();
+
+        // Append a name and two messages — the ordinary turn-by-turn growth.
+        append_session_name(&path, "named later").unwrap();
+        let mut text = std::fs::read_to_string(&path).unwrap();
+        for id in ["m2", "m3"] {
+            text.push_str(&format!(
+                r#"{{"type":"message","id":"{id}","parentId":"m1","timestamp":"2026-01-01T10:00:02.000Z","message":{{"role":"user","content":"more","timestamp":2}}}}"#
+            ));
+            text.push('\n');
+        }
+        std::fs::write(&path, &text).unwrap();
+
+        let incremented = scanner.scan(root.path()).unwrap()[0].sessions[0].clone();
+        let full = parse_session_file(&path).expect("parses");
+        assert_eq!(incremented.name.as_deref(), Some("named later"));
+        assert_eq!(incremented.preview.as_deref(), Some("first ask"));
+        assert_eq!(incremented.message_count, 3);
+        assert_eq!(
+            (
+                incremented.name,
+                incremented.preview,
+                incremented.message_count
+            ),
+            (full.name, full.preview, full.message_count)
+        );
+    }
+
+    #[test]
+    fn a_partially_written_line_waits_for_its_newline() {
+        let root = tempdir();
+        let project = root.path().join("--C--one--");
+        let path = write_session(
+            &project,
+            "2026-01-01T10-00-00-000Z_id.jsonl",
+            &[r#"{"type":"session","version":3,"id":"id","timestamp":"2026-01-01T10:00:00.000Z","cwd":"C:\\one"}"#.into()],
+            10,
+        );
+        // A writer stopped halfway through an entry: no trailing newline.
+        let mut text = std::fs::read_to_string(&path).unwrap();
+        text.push_str(
+            r#"{"type":"message","id":"m1","parentId":null,"timestamp":"2026-01-01T10:00:01.000Z","message":{"role":"user","content":"half"#,
+        );
+        std::fs::write(&path, &text).unwrap();
+        let mut scanner = SessionScanner::default();
+        assert_eq!(
+            scanner.scan(root.path()).unwrap()[0].sessions[0].message_count,
+            0,
+            "an unterminated tail is not an entry yet"
+        );
+
+        // The writer finishes the line: it must count exactly once.
+        text.push_str(r#""},"timestamp":1}"#);
+        text.push('\n');
+        std::fs::write(&path, &text).unwrap();
+        assert_eq!(
+            scanner.scan(root.path()).unwrap()[0].sessions[0].message_count,
+            1
+        );
+        // And a rescan with no further writes keeps that count.
+        assert_eq!(
+            scanner.scan(root.path()).unwrap()[0].sessions[0].message_count,
+            1
+        );
+    }
+
+    #[test]
+    fn a_truncated_file_falls_back_to_a_full_parse() {
+        let root = tempdir();
+        let project = root.path().join("--C--one--");
+        let header = r#"{"type":"session","version":3,"id":"id","timestamp":"2026-01-01T10:00:00.000Z","cwd":"C:\\one"}"#;
+        let message = |id: &str| {
+            format!(
+                r#"{{"type":"message","id":"{id}","parentId":null,"timestamp":"2026-01-01T10:00:01.000Z","message":{{"role":"user","content":"hi","timestamp":1}}}}"#
+            )
+        };
+        let path = write_session(
+            &project,
+            "2026-01-01T10-00-00-000Z_id.jsonl",
+            &[header.into(), message("m1"), message("m2")],
+            10,
+        );
+        let mut scanner = SessionScanner::default();
+        assert_eq!(
+            scanner.scan(root.path()).unwrap()[0].sessions[0].message_count,
+            2
+        );
+
+        // Rewritten shorter (a compaction or a hand edit): the incremental
+        // path cannot see the removed bytes, so it must re-parse whole.
+        std::fs::write(&path, format!("{header}\n{}\n", message("m3"))).unwrap();
+        let summary = scanner.scan(root.path()).unwrap()[0].sessions[0].clone();
+        assert_eq!(summary.message_count, 1);
+    }
+
+    #[test]
     fn read_session_cwd_reads_only_the_header() {
         let root = tempdir();
         let project = root.path().join("--C--one--");
@@ -726,18 +940,6 @@ mod tests {
             10,
         );
         assert_eq!(read_session_cwd(&path).as_deref(), Some("C:\\one"));
-    }
-
-    #[test]
-    fn capped_line_reader_keeps_only_the_prefix() {
-        let input = b"aaaaaaaaaa\nshort\n";
-        let mut reader: &[u8] = input;
-        let mut buf = Vec::new();
-        assert_eq!(read_line_capped(&mut reader, &mut buf, 5).unwrap(), 11);
-        assert_eq!(buf, b"aaaaa");
-        assert_eq!(read_line_capped(&mut reader, &mut buf, 5).unwrap(), 6);
-        assert_eq!(buf, b"short");
-        assert_eq!(read_line_capped(&mut reader, &mut buf, 5).unwrap(), 0);
     }
 
     #[test]
@@ -780,6 +982,36 @@ mod tests {
         assert_eq!(entry["type"], "session_info");
         assert_eq!(entry["parentId"], "m1", "hangs off the last entry");
         assert_eq!(entry["id"].as_str().unwrap().len(), 8);
+    }
+
+    #[test]
+    fn an_empty_name_clears_the_title() {
+        // pi's RPC refuses empty strings; its file format carries the clear
+        // as a `session_info` whose name is blank, and the parser must read
+        // that back as "no name".
+        let root = tempdir();
+        let path = write_session(
+            &root.path().join("--C--one--"),
+            "2026-01-01T10-00-00-000Z_id.jsonl",
+            &[
+                r#"{"type":"session","version":3,"id":"id","timestamp":"2026-01-01T10:00:00.000Z","cwd":"C:\\one"}"#.into(),
+                r#"{"type":"message","id":"m1","parentId":null,"timestamp":"2026-01-01T10:01:00.000Z","message":{"role":"user","content":"hi","timestamp":1}}"#.into(),
+            ],
+            1_000,
+        );
+        append_session_name(&path, "named").unwrap();
+        assert_eq!(
+            parse_session_file(&path).expect("parses").name.as_deref(),
+            Some("named")
+        );
+
+        append_session_name(&path, "   ").unwrap();
+        let summary = parse_session_file(&path).expect("parses");
+        assert_eq!(summary.name, None, "a blank session_info clears the title");
+        let text = std::fs::read_to_string(&path).unwrap();
+        let entry: serde_json::Value = serde_json::from_str(text.lines().last().unwrap()).unwrap();
+        assert_eq!(entry["type"], "session_info");
+        assert_eq!(entry["name"], "");
     }
 
     #[test]

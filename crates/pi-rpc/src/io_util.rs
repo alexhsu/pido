@@ -10,12 +10,25 @@ pub(crate) fn read_line_capped<R: BufRead>(
     buf: &mut Vec<u8>,
     cap: usize,
 ) -> std::io::Result<usize> {
+    read_line_capped_terminated(reader, buf, cap).map(|(len, _)| len)
+}
+
+/// [`read_line_capped`], also reporting whether a newline closed the line.
+///
+/// A reader that tracks how far it has parsed needs this: an unterminated
+/// tail is a write still in flight, and it must not be counted as an entry
+/// until the writer finishes it.
+pub(crate) fn read_line_capped_terminated<R: BufRead>(
+    reader: &mut R,
+    buf: &mut Vec<u8>,
+    cap: usize,
+) -> std::io::Result<(usize, bool)> {
     buf.clear();
     let mut total = 0usize;
     loop {
         let available = reader.fill_buf()?;
         if available.is_empty() {
-            return Ok(total);
+            return Ok((total, false));
         }
         let newline = available.iter().position(|byte| *byte == b'\n');
         let take = newline.map_or(available.len(), |index| index + 1);
@@ -26,7 +39,7 @@ pub(crate) fn read_line_capped<R: BufRead>(
         reader.consume(take);
         total += take;
         if newline.is_some() {
-            return Ok(total);
+            return Ok((total, true));
         }
     }
 }
@@ -45,5 +58,21 @@ mod tests {
         assert_eq!(read_line_capped(&mut reader, &mut buf, 4).unwrap(), 3);
         assert_eq!(buf, b"ok\n");
         assert_eq!(read_line_capped(&mut reader, &mut buf, 4).unwrap(), 0);
+    }
+
+    #[test]
+    fn reports_whether_a_newline_closed_the_line() {
+        let input = b"done\npartial";
+        let mut reader: &[u8] = input;
+        let mut buf = Vec::new();
+        assert_eq!(
+            read_line_capped_terminated(&mut reader, &mut buf, 64).unwrap(),
+            (5, true)
+        );
+        // The tail has no newline: a writer is mid-append.
+        assert_eq!(
+            read_line_capped_terminated(&mut reader, &mut buf, 64).unwrap(),
+            (7, false)
+        );
     }
 }

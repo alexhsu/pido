@@ -571,8 +571,10 @@ impl Render for PidoApp {
                                 .update(cx, |s, cx| s.cancel_dialog(&dialog.id, cx));
                             return;
                         }
-                        // The terminal consumes Escape as the \x1b key; the
-                        // global Stop action must not steal it.
+                        // In the terminal, Escape is the \x1b key the shell
+                        // expects. The global action dispatched first and
+                        // consumed the keystroke, so the terminal's own
+                        // handler never runs — send the byte here instead.
                         let terminal_focused = this.terminal.as_ref().is_some_and(|terminal| {
                             terminal
                                 .read(cx)
@@ -580,6 +582,9 @@ impl Render for PidoApp {
                                 .contains_focused(window, cx)
                         });
                         if terminal_focused {
+                            if let Some(terminal) = &this.terminal {
+                                terminal.update(cx, |terminal, _| terminal.write(b"\x1b".to_vec()));
+                            }
                             return;
                         }
                         // Esc backs out of the palette, the find bar and the
