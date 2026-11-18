@@ -42,6 +42,8 @@ pub struct Settings {
     /// `"follow_up"`. Pure client preference; pi has no server-side default.
     #[serde(default)]
     pub queue_mode: Option<String>,
+    /// Whether to look for a newer release at startup. Absent means yes.
+    pub update_check: Option<bool>,
     pub window: Option<WindowState>,
 }
 

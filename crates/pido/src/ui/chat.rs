@@ -231,6 +231,7 @@ pub fn render_transcript(
             .collect::<Vec<_>>();
         (empty, notices, s.visible_rows(), s.session_epoch)
     };
+    let update_banner = render_update_banner(state, cx);
     let count = visible.len();
 
     // Own the scroll state: rebuilt when the conversation was replaced, kept
@@ -293,6 +294,7 @@ pub fn render_transcript(
         .overflow_hidden()
         .flex()
         .flex_col()
+        .children(update_banner)
         .children(notices)
         .child(if empty {
             div()
@@ -1018,6 +1020,128 @@ fn compact_tokens(tokens: u64) -> String {
     } else {
         tokens.to_string()
     }
+}
+
+/// The update banner: a newer release exists, is downloading, is ready to
+/// launch, or failed. One row; its buttons depend on the state.
+fn render_update_banner(state: &Entity<AppState>, cx: &App) -> Option<AnyElement> {
+    use ely_gpui_component::buttons::{Button, IconButton};
+    use ely_gpui_component::primitives::IconName;
+
+    let status = state.read(cx).update.clone()?;
+    let theme = cx.theme();
+    let (fill, ink) = (theme.colors.info_subtle, theme.colors.info);
+
+    let mut actions: Vec<AnyElement> = Vec::new();
+    let text: String = match status {
+        crate::state::UpdateStatus::Available {
+            version,
+            page,
+            asset_url,
+            checksum_url,
+            installable,
+            dismissed,
+            ..
+        } => {
+            if dismissed {
+                return None;
+            }
+            if installable && asset_url.is_some() && checksum_url.is_some() {
+                let app = state.clone();
+                actions.push(
+                    Button::new("update-now", i18n::t(cx, "update_now"))
+                        .primary()
+                        .on_click(move |_, _, cx| {
+                            app.update(cx, |s, cx| s.start_update_download(cx));
+                        })
+                        .into_any_element(),
+                );
+            }
+            if !page.is_empty() {
+                actions.push(
+                    Button::new("update-page", i18n::t(cx, "update_release_page"))
+                        .on_click(move |_, _, cx| cx.open_url(&page))
+                        .into_any_element(),
+                );
+            }
+            i18n::t_arg(cx, "update_available", "v", &version).to_string()
+        }
+        crate::state::UpdateStatus::Downloading { received, total } => {
+            if let Some(percent) = received.saturating_mul(100).checked_div(total) {
+                i18n::t_arg(cx, "update_downloading", "p", &percent.to_string()).to_string()
+            } else {
+                i18n::t_arg(
+                    cx,
+                    "update_downloading_bytes",
+                    "m",
+                    &format!("{:.1}", received as f64 / 1_048_576.0),
+                )
+                .to_string()
+            }
+        }
+        crate::state::UpdateStatus::ReadyToRestart { version } => {
+            let app = state.clone();
+            actions.push(
+                Button::new("update-restart", i18n::t(cx, "restart_now"))
+                    .primary()
+                    .on_click(move |_, _, cx| {
+                        app.update(cx, |s, cx| s.restart_into_update(cx));
+                    })
+                    .into_any_element(),
+            );
+            let app = state.clone();
+            actions.push(
+                Button::new("update-later", i18n::t(cx, "later"))
+                    .on_click(move |_, _, cx| {
+                        app.update(cx, |s, cx| s.dismiss_update(cx));
+                    })
+                    .into_any_element(),
+            );
+            i18n::t_arg(cx, "update_ready", "v", &version).to_string()
+        }
+        crate::state::UpdateStatus::Failed { message } => {
+            let app = state.clone();
+            actions.push(
+                Button::new("update-retry", i18n::t(cx, "retry"))
+                    .on_click(move |_, _, cx| {
+                        app.update(cx, |s, cx| s.start_update_download(cx));
+                    })
+                    .into_any_element(),
+            );
+            let app = state.clone();
+            actions.push(
+                IconButton::new("update-dismiss", IconName::X)
+                    .tooltip(i18n::t(cx, "dismiss"))
+                    .on_click(move |_, _, cx| {
+                        app.update(cx, |s, cx| s.dismiss_update(cx));
+                    })
+                    .into_any_element(),
+            );
+            i18n::t_arg(cx, "update_failed", "e", &message).to_string()
+        }
+    };
+
+    Some(
+        div()
+            .flex_none()
+            .px_4()
+            .pt_2()
+            .child(
+                div()
+                    .w_full()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .px_3()
+                    .py_2()
+                    .rounded_md()
+                    .bg(fill)
+                    .text_color(ink)
+                    .child(div().flex_1().min_w_0().child(Paragraph::new(text)))
+                    .children(actions),
+            )
+            .into_any_element(),
+    )
 }
 
 /// The dismissible banner above the transcript (also used by the welcome

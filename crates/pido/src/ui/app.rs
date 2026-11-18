@@ -277,6 +277,10 @@ impl PidoApp {
         if self.right_open && self.right_tab == RightTab::Terminal {
             self.ensure_terminal(cx);
         }
+        // Look for a newer release in the background; the banner appears when
+        // one exists. A failure stays silent — the user did not ask.
+        self.state
+            .update(cx, |s, cx| s.check_for_updates(false, cx));
         cx.notify();
     }
 
@@ -858,6 +862,10 @@ impl PidoApp {
                 i18n::t(cx, "shell_template").to_string(),
                 PaletteAction::ShellTemplate,
             ),
+            (
+                i18n::t(cx, "check_updates").to_string(),
+                PaletteAction::CheckUpdate,
+            ),
         ];
         let state = self.state.clone();
         let files = state.read(cx).workspace_files.clone();
@@ -926,6 +934,9 @@ impl PidoApp {
                     if let Some(draft) = &this.draft {
                         draft.update(cx, |field, cx| field.set_text("!", cx));
                     }
+                }
+                PaletteAction::CheckUpdate => {
+                    this.state.update(cx, |s, cx| s.check_for_updates(true, cx));
                 }
                 PaletteAction::InsertFile(file) => {
                     if let Some(draft) = &this.draft {

@@ -147,6 +147,17 @@ jobs:
             macos-aarch64) mv stage/*.zip dist/ ;;
             linux-x64) mv *.AppImage dist/ ;;
           esac
+          # The updater verifies what it downloads against this file, which
+          # must share the asset's name plus `.sha256`.
+          cd dist
+          sha256sum pido-* > pido-checksums.txt
+          for asset in pido-*; do
+            case "$asset" in
+              *.sha256|pido-checksums.txt) continue ;;
+            esac
+            sha256sum "$asset" > "$asset.sha256"
+          done
+          ls -la
           ls -la dist/
 
       - uses: actions/upload-artifact@v4

@@ -5,6 +5,7 @@ mod i18n;
 mod settings;
 mod state;
 mod ui;
+mod update;
 
 use ely_gpui_component::{
     Assets,
