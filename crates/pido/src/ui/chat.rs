@@ -1064,6 +1064,17 @@ fn render_update_banner(state: &Entity<AppState>, cx: &App) -> Option<AnyElement
                         .into_any_element(),
                 );
             }
+            // "Not now" must exist: without it the banner would stay until
+            // the user updates or restarts.
+            let app = state.clone();
+            actions.push(
+                IconButton::new("update-not-now", IconName::X)
+                    .tooltip(i18n::t(cx, "later"))
+                    .on_click(move |_, _, cx| {
+                        app.update(cx, |s, cx| s.dismiss_update(cx));
+                    })
+                    .into_any_element(),
+            );
             i18n::t_arg(cx, "update_available", "v", &version).to_string()
         }
         crate::state::UpdateStatus::Downloading { received, total } => {
