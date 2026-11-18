@@ -1088,9 +1088,29 @@ pub struct SessionEntry {
     #[serde(default)]
     pub message: Option<AgentMessage>,
     /// Compaction entries carry the summary that replaced the older
-    /// messages; absent on every other entry type.
+    /// messages; absent on every other entry type. `branch_summary`
+    /// entries carry their generated digest here too.
     #[serde(default)]
     pub summary: Option<String>,
+}
+
+/// `get_tree` payload: the session as nested nodes plus the current leaf.
+/// Multiple roots appear when navigation created orphan branches.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionTree {
+    #[serde(default)]
+    pub tree: Vec<TreeNode>,
+    pub leaf_id: Option<String>,
+}
+
+/// One node of `get_tree`: an entry and the branches growing under it.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TreeNode {
+    pub entry: SessionEntry,
+    #[serde(default)]
+    pub children: Vec<TreeNode>,
 }
 
 /// `get_session_stats` payload.

@@ -84,6 +84,12 @@ struct Recovery {
 /// Seconds to wait before each recovery spawn; the last entry repeats.
 const RECOVERY_DELAYS: [u64; 8] = [1, 2, 4, 8, 15, 30, 30, 30];
 
+/// The pi build pido expects. Older CLIs lack protocol surface pido speaks
+/// every day (the `get_entries` leaf cursor, session sync events), so a
+/// lower version earns a soft banner — degraded, not broken: unknown
+/// records are skipped, not fatal.
+pub const MIN_PI_VERSION: (u64, u64, u64) = (1, 0, 0);
+
 /// Environment probe results for the welcome screen.
 #[derive(Debug, Clone, Default)]
 pub struct Environment {
@@ -95,6 +101,9 @@ pub struct Environment {
     pub pi_error: Option<String>,
     /// Provider names that answer `pi auth check` with ready.
     pub ready_providers: Vec<String>,
+    /// pi's resolved `retry.enabled`, read from its settings files during
+    /// the probe; `get_state` does not carry it.
+    pub auto_retry: bool,
 }
 
 /// A line in the transcript.
@@ -1073,6 +1082,12 @@ pub struct AppState {
     /// Pi's auto-compaction switch, as `get_state` last reported it. `None`
     /// before the first round trip.
     pub auto_compaction: Option<bool>,
+    /// Pi's auto-retry switch, read from pi's settings files at probe time
+    /// (`get_state` does not carry it) and toggled optimistically.
+    pub auto_retry: Option<bool>,
+    /// Set between `auto_retry_start` and its end event, while pi waits out
+    /// a backoff to retry the run.
+    pub retrying: bool,
     /// Dismissible banners over the transcript, oldest first. A queue keeps
     /// retry/compaction/error notices from silently replacing each other.
     pub notices: VecDeque<Notice>,
@@ -1096,6 +1111,10 @@ pub struct AppState {
     /// Bumped whenever the conversation is replaced, so the message list gets
     /// a fresh scroll/away state instead of reusing the old session's.
     pub session_epoch: u64,
+    /// The open session's branch tree, fetched on demand for the right
+    /// panel's tree tab. `None` until asked, and after the session was
+    /// replaced — the tab refetches when it opens.
+    pub session_tree: Option<Vec<TreeRow>>,
     /// Bumped when a session action (connect/new/switch/fork/disconnect)
     /// starts; its async callbacks compare this and drop stale results.
     session_gen: u64,
@@ -1186,6 +1205,8 @@ impl AppState {
                 last_session_loaded: false,
                 stats: None,
                 auto_compaction: None,
+                auto_retry: None,
+                retrying: false,
                 notices: VecDeque::new(),
                 next_notice_id: 1,
                 last_project,
@@ -1196,6 +1217,7 @@ impl AppState {
                 pending_images: Vec::new(),
                 pending_dialog: None,
                 session_epoch: 0,
+                session_tree: None,
                 session_gen: 0,
                 pending_steers: Vec::new(),
                 pending_follow_ups: Vec::new(),
@@ -1240,6 +1262,7 @@ impl AppState {
     /// for env-var auth) are checked, in parallel so startup is not serialized
     /// behind several Node processes.
     fn probe_environment(&self, cx: &Context<Self>) {
+        let cwd = self.cwd.clone();
         cx.spawn(async move |this, cx| {
             let found = cx
                 .background_executor()
@@ -1252,8 +1275,10 @@ impl AppState {
                             pi_version: None,
                             pi_error: probe.problem(),
                             ready_providers: Vec::new(),
+                            auto_retry: true,
                         };
                     };
+                    let retry_enabled = pi_rpc::client::pi_retry_enabled(cwd.as_deref());
                     let providers = probe_providers();
                     let ready_providers = std::thread::scope(|scope| {
                         let handles = providers
@@ -1276,10 +1301,12 @@ impl AppState {
                         pi_version: Some(pi_version),
                         pi_error: None,
                         ready_providers,
+                        auto_retry: retry_enabled,
                     }
                 })
                 .await;
             this.update(cx, |s, cx| {
+                s.auto_retry = Some(found.auto_retry);
                 s.environment = found;
                 cx.notify();
             })
@@ -1328,7 +1355,9 @@ impl AppState {
             self.turn_running = false;
             self.clear_changes();
             self.notices.clear();
+            self.retrying = false;
             self.session_epoch += 1;
+            self.session_tree = None;
             self.pending_steers.clear();
             self.pending_follow_ups.clear();
             self.queued_steers.clear();
@@ -1443,6 +1472,7 @@ impl AppState {
                                 s.conn = Conn::Live;
                                 s.recovering = None;
                                 s.notices.clear();
+                                s.retrying = false;
                                 if let Ok(Ok(Some(payload))) =
                                     state_result.map(|r| r.data_as::<SessionState>())
                                 {
@@ -1595,6 +1625,7 @@ impl AppState {
             };
             self.recovering = None;
             self.notices.clear();
+            self.retrying = false;
             cx.notify();
             return;
         }
@@ -2629,6 +2660,7 @@ impl AppState {
         self.session_name = None;
         self.stats = None;
         self.session_epoch += 1;
+        self.session_tree = None;
         self.pending_steers.clear();
         self.pending_follow_ups.clear();
         self.query_state(cx);
@@ -2700,6 +2732,109 @@ impl AppState {
                             // re-editing.
                             s.finish_fork(cx);
                             s.restore_to_composer(&user_text);
+                        }
+                    }
+                    Err(error) => s.push_notice(NoticeKind::Error, error.to_string()),
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Fetch the open session's branch tree for the right panel: `get_tree`
+    /// from live pi, the session file itself otherwise (its last entry is
+    /// the leaf pi loads). A stale answer from a session the user already
+    /// left is dropped.
+    pub fn refresh_session_tree(&self, cx: &Context<Self>) {
+        let generation = self.session_gen;
+        let client = self.client();
+        let file = self.session_file.clone();
+        cx.spawn(async move |this, cx| {
+            let result: anyhow::Result<Vec<TreeRow>> = cx
+                .background_executor()
+                .spawn(async move {
+                    if let Some(client) = client
+                        && let Ok(response) = client.request(Command::GetTree)
+                        && response.success
+                        && let Ok(Some(tree)) = response.data_as::<pi_rpc::protocol::SessionTree>()
+                    {
+                        return Ok(flatten_nodes(&tree.tree, tree.leaf_id.as_deref()));
+                    }
+                    let path = file.ok_or_else(|| anyhow::anyhow!("no open session"))?;
+                    let entries = sessions::read_session_entries(std::path::Path::new(&path))?;
+                    Ok(flatten_entries(&entries))
+                })
+                .await;
+            this.update(cx, |s, cx| {
+                if s.session_gen != generation {
+                    return;
+                }
+                match result {
+                    Ok(rows) => s.session_tree = Some(rows),
+                    Err(error) => log::warn!("session tree: {error}"),
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Fork the open session at a user prompt's entry — the branch tree's
+    /// affordance for the same flow as the transcript's hover fork. pi
+    /// branches before that prompt, rebinds, and reports its text so it can
+    /// go back to the composer for re-editing.
+    pub fn fork_entry(&mut self, entry_id: &str, cx: &mut Context<Self>) {
+        if self.conn != Conn::Live {
+            return;
+        }
+        if self.streaming || self.turn_running {
+            self.push_notice(NoticeKind::Warn, i18n::t(cx, "agent_busy").to_string());
+            cx.notify();
+            return;
+        }
+        let Some(client) = self.client() else { return };
+        let entry_id = entry_id.to_string();
+        self.session_gen += 1;
+        let generation = self.session_gen;
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn({
+                    let entry_id = entry_id.clone();
+                    async move {
+                        let forked = client.request(Command::Fork { entry_id })?;
+                        if !forked.success {
+                            anyhow::bail!("fork failed: {:?}", forked.error);
+                        }
+                        let cancelled = session_action_cancelled(&forked);
+                        let text = forked
+                            .data
+                            .as_ref()
+                            .and_then(|data| data.get("text"))
+                            .and_then(serde_json::Value::as_str)
+                            .map(str::to_string);
+                        Ok((cancelled, text))
+                    }
+                })
+                .await;
+            this.update(cx, |s, cx| {
+                if s.session_gen != generation {
+                    return;
+                }
+                match result {
+                    Ok((true, _)) => {
+                        s.push_notice(
+                            NoticeKind::Warn,
+                            i18n::t(cx, "session_cancelled").to_string(),
+                        );
+                    }
+                    Ok((false, text)) => {
+                        s.finish_fork(cx);
+                        if let Some(text) = text {
+                            s.restore_to_composer(&text);
                         }
                     }
                     Err(error) => s.push_notice(NoticeKind::Error, error.to_string()),
@@ -2839,6 +2974,7 @@ impl AppState {
         self.pending_dialog = None;
         self.pending_composer_text = None;
         self.notices.clear();
+        self.retrying = false;
         cx.notify();
     }
 
@@ -4000,6 +4136,77 @@ impl AppState {
         cx.notify();
     }
 
+    /// Flip pi's auto-retry switch. Optimistic, like the compaction one; pi
+    /// persists the pick into its own global settings, so it survives pido
+    /// restarts. `get_state` does not carry the value, so there is nothing
+    /// to re-sync from — the probe read is the baseline.
+    pub fn set_auto_retry(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        if self.auto_retry == Some(enabled) {
+            return;
+        }
+        let Some(client) = self.client() else { return };
+        let previous = self.auto_retry;
+        self.auto_retry = Some(enabled);
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { client.request(Command::SetAutoRetry { enabled }) })
+                .await;
+            this.update(cx, |s, cx| {
+                match result {
+                    Ok(response) if response.success => {}
+                    Ok(response) => {
+                        s.auto_retry = previous;
+                        s.push_notice(
+                            NoticeKind::Error,
+                            format!("set_auto_retry: {}", response.error.unwrap_or_default()),
+                        );
+                    }
+                    Err(error) => {
+                        s.auto_retry = previous;
+                        s.push_notice(NoticeKind::Error, error.to_string());
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+        cx.notify();
+    }
+
+    /// Cancel the retry pi is waiting out: the backoff stops and the run
+    /// ends with its error. Optimistically drop the status line; pi's
+    /// `auto_retry_end` event lands as the final notice.
+    pub fn abort_retry(&mut self, cx: &mut Context<Self>) {
+        if !self.retrying {
+            return;
+        }
+        let Some(client) = self.client() else { return };
+        self.retrying = false;
+        self.remove_notice_key("retrying");
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { client.request(Command::AbortRetry) })
+                .await;
+            this.update(cx, |s, cx| {
+                if let Ok(response) = result
+                    && !response.success
+                {
+                    s.push_notice(
+                        NoticeKind::Error,
+                        format!("abort_retry: {}", response.error.unwrap_or_default()),
+                    );
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+        cx.notify();
+    }
+
     /// Run a command in the background and surface failures as notices.
     fn check_command(&self, command: Command, label: &str, cx: &Context<Self>) {
         let Some(client) = self.client() else { return };
@@ -4496,6 +4703,7 @@ impl AppState {
                 .replace("{delay}", &format!("{}s", delay_ms / 1000))
                 .replace("{e}", detail);
                 self.push_notice_keyed("retrying", NoticeKind::Warn, text);
+                self.retrying = true;
             }
             Event::AutoRetryEnd {
                 success,
@@ -4503,6 +4711,7 @@ impl AppState {
                 ..
             } => {
                 self.remove_notice_key("retrying");
+                self.retrying = false;
                 if success {
                     self.push_notice(NoticeKind::Info, i18n::t(cx, "retry_succeeded").to_string());
                 } else {
@@ -5193,6 +5402,116 @@ fn active_branch<'a>(entries: &'a [SessionEntry], leaf_id: Option<&str>) -> Vec<
     chain
 }
 
+/// One drawn row of the session's branch tree: an entry, its nesting
+/// depth, and whether pi would run it (the path from the leaf to the
+/// root).
+#[derive(Debug, Clone)]
+pub struct TreeRow {
+    pub depth: usize,
+    pub entry: SessionEntry,
+    pub on_active: bool,
+}
+
+/// Ids on the path from `leaf_id` to the root; everything when the leaf
+/// is unknown, matching [`active_branch`]'s fallback. Iterative: a
+/// linear session nests one branch per prompt, and the walk must not
+/// care how long it is.
+fn active_ids<'a>(
+    by_id: &HashMap<&'a str, &'a SessionEntry>,
+    leaf_id: Option<&'a str>,
+    total: usize,
+) -> HashSet<&'a str> {
+    let Some(leaf_id) = leaf_id else {
+        return by_id.keys().copied().collect();
+    };
+    let mut seen = HashSet::new();
+    let mut current = leaf_id;
+    while let Some(entry) = by_id.get(current).copied() {
+        if !seen.insert(current) {
+            log::warn!("session tree has a cycle at {current}");
+            break;
+        }
+        match entry.parent_id.as_deref() {
+            Some(parent) => current = parent,
+            None => break,
+        }
+    }
+    if seen.is_empty() {
+        log::warn!("leaf {leaf_id} not found in {total} entries");
+        return by_id.keys().copied().collect();
+    }
+    seen
+}
+
+/// Flatten `get_tree`'s nested nodes into drawing order. Children keep
+/// their wire order, which is insertion order; the walk is iterative so
+/// a deep branch cannot exhaust the stack.
+pub(crate) fn flatten_nodes(
+    nodes: &[pi_rpc::protocol::TreeNode],
+    leaf_id: Option<&str>,
+) -> Vec<TreeRow> {
+    let mut every: HashMap<&str, &SessionEntry> = HashMap::new();
+    let mut stack: Vec<&pi_rpc::protocol::TreeNode> = nodes.iter().collect();
+    while let Some(node) = stack.pop() {
+        every.insert(node.entry.id.as_str(), &node.entry);
+        stack.extend(node.children.iter());
+    }
+    let total = every.len();
+    let active = active_ids(&every, leaf_id, total);
+    let mut rows = Vec::new();
+    let mut stack: Vec<(&pi_rpc::protocol::TreeNode, usize)> =
+        nodes.iter().rev().map(|node| (node, 0)).collect();
+    while let Some((node, depth)) = stack.pop() {
+        rows.push(TreeRow {
+            depth,
+            entry: node.entry.clone(),
+            on_active: active.contains(node.entry.id.as_str()),
+        });
+        for child in node.children.iter().rev() {
+            stack.push((child, depth + 1));
+        }
+    }
+    rows
+}
+
+/// Flatten a session file's append-order entries the same way. The file
+/// carries no leaf marker, so its last entry is the leaf — pi appends
+/// every new entry at the end, pointing at where it grew from.
+pub(crate) fn flatten_entries(entries: &[SessionEntry]) -> Vec<TreeRow> {
+    let ids: HashSet<&str> = entries.iter().map(|entry| entry.id.as_str()).collect();
+    let mut children_of: HashMap<&str, Vec<usize>> = HashMap::new();
+    let mut roots: Vec<usize> = Vec::new();
+    for (ix, entry) in entries.iter().enumerate() {
+        match entry.parent_id.as_deref() {
+            Some(parent) if ids.contains(parent) => children_of.entry(parent).or_default().push(ix),
+            _ => roots.push(ix),
+        }
+    }
+    let by_id: HashMap<&str, &SessionEntry> = entries
+        .iter()
+        .map(|entry| (entry.id.as_str(), entry))
+        .collect();
+    let leaf = entries.last().map(|entry| entry.id.as_str());
+    let active = active_ids(&by_id, leaf, entries.len());
+    let mut rows = Vec::new();
+    // (entry index, depth); reversed pushes keep siblings in file order.
+    let mut stack: Vec<(usize, usize)> = roots.iter().rev().map(|&ix| (ix, 0)).collect();
+    while let Some((ix, depth)) = stack.pop() {
+        let entry = &entries[ix];
+        rows.push(TreeRow {
+            depth,
+            entry: entry.clone(),
+            on_active: active.contains(entry.id.as_str()),
+        });
+        if let Some(kids) = children_of.get(entry.id.as_str()) {
+            for &kid in kids.iter().rev() {
+                stack.push((kid, depth + 1));
+            }
+        }
+    }
+    rows
+}
+
 /// Providers worth probing for onboarding: those in `auth.json` plus the
 /// common env-var-backed ones. Only their names are read; credentials stay
 /// with pi.
@@ -5365,6 +5684,69 @@ mod tests {
     }
 
     #[test]
+    fn flatten_entries_draws_file_order_with_the_active_path_marked() {
+        // A fork at the root prompt: file order is the parent line, the
+        // abandoned branch, then the active one — whose leaf is last.
+        let entries = vec![
+            entry("m1", None),
+            entry("m2", Some("m1")),
+            entry("m3", Some("m1")),
+        ];
+        let rows = flatten_entries(&entries);
+        let depths: Vec<(usize, bool)> =
+            rows.iter().map(|row| (row.depth, row.on_active)).collect();
+        assert_eq!(
+            depths,
+            vec![(0, true), (1, false), (1, true)],
+            "last entry is the leaf; its sibling is abandoned"
+        );
+    }
+
+    #[test]
+    fn flatten_entries_marks_everything_when_the_chain_breaks() {
+        // An orphan (parent id nothing owns) is its own root, and with no
+        // leaf to walk the fallback marks the whole tree active — the same
+        // rule `active_branch` applies.
+        let entries = vec![entry("m1", Some("ghost")), entry("m2", Some("m1"))];
+        let rows = flatten_entries(&entries);
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|row| row.on_active));
+        assert_eq!(rows[0].depth, 0);
+        assert_eq!(rows[1].depth, 1);
+    }
+
+    #[test]
+    fn flatten_nodes_keeps_wire_order_under_each_root() {
+        use pi_rpc::protocol::TreeNode;
+        let node = |id: &str, parent: Option<&str>, children: Vec<TreeNode>| TreeNode {
+            entry: entry(id, parent),
+            children,
+        };
+        let tree = vec![node(
+            "m1",
+            None,
+            vec![
+                node("m2", Some("m1"), vec![]),
+                node("m3", Some("m1"), vec![node("m4", Some("m3"), vec![])]),
+            ],
+        )];
+        let rows = flatten_nodes(&tree, Some("m4"));
+        let order: Vec<(&str, usize, bool)> = rows
+            .iter()
+            .map(|row| (row.entry.id.as_str(), row.depth, row.on_active))
+            .collect();
+        assert_eq!(
+            order,
+            vec![
+                ("m1", 0, true),
+                ("m2", 1, false),
+                ("m3", 1, true),
+                ("m4", 2, true)
+            ]
+        );
+    }
+
+    #[test]
     fn compaction_tokens_reads_the_reported_range() {
         let full: serde_json::Value = serde_json::from_str(
             r#"{"summary":"s","firstKeptEntryId":"e1","tokensBefore":150000,"estimatedTokensAfter":32000}"#,
@@ -5489,6 +5871,8 @@ mod tests {
             last_session_loaded: false,
             stats: None,
             auto_compaction: None,
+            auto_retry: None,
+            retrying: false,
             notices: VecDeque::new(),
             next_notice_id: 1,
             last_project: None,
@@ -5499,6 +5883,7 @@ mod tests {
             next_image_key: 1,
             next_shell_id: 1,
             session_epoch: 0,
+            session_tree: None,
             session_gen: 0,
             pending_steers: Vec::new(),
             pending_follow_ups: Vec::new(),

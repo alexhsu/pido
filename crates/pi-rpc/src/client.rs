@@ -802,6 +802,61 @@ pub enum PiProbe {
     },
 }
 
+/// `pi --version` output ("1.5.2", tolerating a `v` prefix or a trailing
+/// tag like `-beta.1`) as a comparable tuple. `None` when the text carries
+/// no leading number at all — callers must not warn on garbage.
+pub fn pi_version_tuple(version: &str) -> Option<(u64, u64, u64)> {
+    let mut parts = version
+        .trim()
+        .trim_start_matches(['v', 'V'])
+        .split(['-', '+'])
+        .next()?
+        .split('.');
+    let parse = |part: Option<&str>| -> Option<u64> {
+        let digits: String = part?
+            .chars()
+            .take_while(|char| char.is_ascii_digit())
+            .collect();
+        if digits.is_empty() {
+            None
+        } else {
+            digits.parse().ok()
+        }
+    };
+    let major = parse(parts.next())?;
+    let minor = parse(parts.next()).unwrap_or(0);
+    let patch = parse(parts.next()).unwrap_or(0);
+    Some((major, minor, patch))
+}
+
+/// pi's resolved `retry.enabled`, the same merge order pi itself uses: the
+/// global settings file, then the project's on top. Absent or unreadable
+/// means pi's default, which is on.
+pub fn pi_retry_enabled(cwd: Option<&Path>) -> bool {
+    let pick = |text: &str| {
+        serde_json::from_str::<serde_json::Value>(text)
+            .ok()
+            .and_then(|settings| settings.get("retry")?.get("enabled")?.as_bool())
+    };
+    if let Some(home) = dirs::home_dir() {
+        let global = home.join(".pi").join("agent").join("settings.json");
+        if let Ok(text) = std::fs::read_to_string(global)
+            && let Some(enabled) = pick(&text)
+        {
+            return enabled;
+        }
+    }
+    if let Some(cwd) = cwd {
+        let project = cwd.join(".pi").join("settings.json");
+        if let Ok(text) = std::fs::read_to_string(project)
+            && let Some(enabled) = pick(&text)
+        {
+            return enabled;
+        }
+    }
+    true
+}
+
 impl PiProbe {
     /// The version string, when the CLI answered.
     pub fn version(&self) -> Option<&str> {
@@ -912,6 +967,16 @@ mod tests {
         assert_eq!(config.cwd, PathBuf::from("/tmp/project"));
         assert!(config.extra_args.is_empty());
         assert!(config.pi_path.is_none());
+    }
+
+    #[test]
+    fn pi_versions_parse_for_comparison() {
+        assert_eq!(pi_version_tuple("1.5.2"), Some((1, 5, 2)));
+        assert_eq!(pi_version_tuple("v0.85"), Some((0, 85, 0)));
+        assert_eq!(pi_version_tuple("1.10.0-beta.1"), Some((1, 10, 0)));
+        assert_eq!(pi_version_tuple(" 2.0 "), Some((2, 0, 0)));
+        assert_eq!(pi_version_tuple("unknown"), None);
+        assert_eq!(pi_version_tuple(""), None);
     }
 
     #[test]

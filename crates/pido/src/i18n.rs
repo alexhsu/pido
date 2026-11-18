@@ -200,6 +200,17 @@ const ZH_STRINGS: &[(&str, &str)] = &[
     ("queued_steer", "转向"),
     ("queued_follow_up", "追加"),
     ("queue_mode", "运行中发送:转向立即介入,追加等本轮结束"),
+    (
+        "pi_version_old",
+        "pi {v} 低于 pido 支持的最低版本 {min},部分功能可能异常,建议升级 pi",
+    ),
+    ("auto_retry", "自动重试"),
+    ("stop_retry", "停止重试"),
+    ("tree", "会话树"),
+    ("tree_refresh", "刷新分支树"),
+    ("tree_fork_here", "从这里分叉"),
+    ("tree_empty", "此会话还没有分支记录"),
+    ("tree_no_session", "打开会话后可查看分支树"),
 ];
 
 /// The English catalog.
@@ -399,6 +410,17 @@ const EN_STRINGS: &[(&str, &str)] = &[
         "queue_mode",
         "Mid-run sends: steer joins now, follow-up queues",
     ),
+    (
+        "pi_version_old",
+        "pi {v} is below the minimum pido expects ({min}); some features may misbehave — upgrading pi is recommended",
+    ),
+    ("auto_retry", "Auto retry"),
+    ("stop_retry", "Stop retrying"),
+    ("tree", "Session tree"),
+    ("tree_refresh", "Refresh the branch tree"),
+    ("tree_fork_here", "Fork from here"),
+    ("tree_empty", "No branches recorded in this session yet"),
+    ("tree_no_session", "Open a session to see its branch tree"),
 ];
 
 /// Install the catalogs with `default` as the starting locale (the persisted

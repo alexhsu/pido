@@ -19,12 +19,15 @@ A native desktop client for the [Pi coding agent](https://github.com/earendil-wo
 - **命令运行器** — 输入框输 `!cmd` 直接跑 shell 命令(`!!` 发送原文),输出流式进转录行、可中止,并进入模型上下文;命令面板带「运行命令」模板
 - **状态同步** — pi 侧的改名/换思考级别即时反映到侧栏与选择器;重试显示「第 2/3 次(2s 后):错误详情」;压缩启动有提示
 - **运行控制** — 队列投递方式可选(全部一次 / 每轮一条);头部「复制最后回答」一键复制;流式中实时显示累计 token
-- **富展示** — 工具返回的图片(read 截图等)直接在卡片下渲染;工具结果一键复制
+- **富展示** — 工具返回的图片(read 截图等)直接在卡片下渲染;工具结果一键复制;回答里的代码块自带复制按钮与折叠
+- **会话分支树** — 右侧栏「会话树」标签画出当前会话的分叉结构:活跃分支高亮,离开的分支带摘要标记(`branch_summary`);活跃分支的提问可在节点上一键「从这里分叉」;未连接时直接读会话文件建树
+- **自动重试控制** — 头部重试菜单可开关 pi 的自动重试(写入 pi 的全局设置);重试等待中的横幅与菜单都能一键停止
+- **版本提示** — pi 低于 pido 支持的最低版本时,转录上方给出升级提醒
 - **搜索/面板增强** — 面板与侧栏过滤支持子序列模糊匹配(`xs` 找到「新会话」);面板置顶工作区文件(@ 引用);查找条显示命中行类型与上下文摘录
 - **会话搜索** — 转录区 Ctrl+F 即时过滤并循环跳转(高亮当前行);侧栏输入框按标题/内容过滤会话,内容命中带上下文摘录
 - **命令面板** — Ctrl+K 呼出:跳会话、切模型/思考级别、执行 pi 的 / 命令、新会话/导出/压缩/切主题,方向键 + Enter 即达
 - **改动审查** — agent 用 `edit`/`write` 改过的文件按项目路径汇总,在可调宽、可隐藏的右侧栏里看统一/并排 diff,打开的历史会话也能重建
-- **内置终端** — 右侧栏终端页运行真实 shell(Windows 为 PowerShell,Linux/macOS 为 `$SHELL`,ConPTY/PTY 驱动),可新建、随会话目录启动
+- **内置终端** — 右侧栏终端页运行真实 shell(Windows 为 PowerShell,Linux/macOS 为 `$SHELL`,ConPTY/PTY 驱动),可新建、随会话目录启动;切换会话时自动在新目录重生
 - **统计** — token 用量、成本、上下文占用,每轮结束后刷新
 - **亮暗主题 + 中英双语** — 一键切换,偏好持久化(含窗口尺寸、最近项目)
 - **A complete chat loop** — pick a project directory, stream replies, thinking, and tool-call cards live
@@ -38,12 +41,15 @@ A native desktop client for the [Pi coding agent](https://github.com/earendil-wo
 - **Shell runner** — type `!cmd` to run a shell command (`!!` sends literally); output streams into a transcript row with a stop button and joins the model's context; the palette carries a run-a-command entry
 - **State sync** — renames and thinking-level picks made in pi reach the sidebar and picker live; retries name their attempt and delay; compaction start announces itself
 - **Run controls** — queue delivery is all-at-once or one-per-turn; the header copies the last answer; a streaming answer shows its cumulative token count as it grows
-- **Rich results** — images a tool returns (screenshot reads) render under the card; results copy in one click
+- **Rich results** — images a tool returns (screenshot reads) render under the card; results copy in one click; code blocks in answers carry their own copy button and folding
+- **Branch tree** — the right panel's "Session tree" tab draws the open session's fork structure: the active branch highlighted, abandoned ones marked with their summaries (`branch_summary`); a user prompt on the active branch forks from its node in one click; with no live pi the tree is built from the session file itself
+- **Retry control** — the header retry menu flips pi's auto-retry (persisted into pi's own global settings); a retry's backoff stops from the banner or the menu
+- **Version notice** — when the pi CLI is older than the minimum pido expects, a banner above the transcript says so
 - **Search/palette** — subsequence fuzzy matching (`xs` finds 新会话); workspace files lead the palette (@refs); the find bar names the matched row's kind and excerpt
 - **Search** — Ctrl+F filters the transcript and cycles through matches (the current row tints); the sidebar filters sessions by title or content, with a snippet on content hits
 - **Command palette** — Ctrl+K: jump to sessions, switch models and thinking levels, run pi's slash commands, new chat / export / compact / theme — arrows and Enter
 - **Change review** — files the agent edited or wrote, in a resizable, hideable right panel with unified/split diffs; restored sessions too
-- **Built-in terminal** — the right panel's terminal tab runs a real shell (PowerShell on Windows, `$SHELL` on Linux/macOS) via ConPTY/PTY; spawn a fresh one any time
+- **Built-in terminal** — the right panel's terminal tab runs a real shell (PowerShell on Windows, `$SHELL` on Linux/macOS) via ConPTY/PTY; spawn a fresh one any time, and it respawns in the new directory when the session switches
 - **Stats** — tokens, cost, and context usage refresh after every run
 - **Dark/light + 中文/English** — one-click toggle, persisted along with window size and last project
 

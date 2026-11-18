@@ -143,13 +143,15 @@ pub struct TranscriptScroll {
     pub fresh: usize,
 }
 
-/// The right panel's two tabs.
+/// The right panel's three tabs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RightTab {
     /// Reviewing the session's file changes.
     Diff,
     /// A live shell next to the chat.
     Terminal,
+    /// The session's branch tree, read-only.
+    Tree,
 }
 
 impl PidoApp {
@@ -167,6 +169,17 @@ impl PidoApp {
                 this.find = None;
                 this.palette = None;
                 this.palette_selected = 0;
+                // A shell left over from the previous session still sits in
+                // its directory; one that never started spawns in the new
+                // cwd when the panel opens.
+                if this.terminal.is_some() {
+                    this.restart_terminal(cx);
+                }
+                // The tree tab must not show the old session's branches.
+                if this.right_open && this.right_tab == RightTab::Tree {
+                    this.state
+                        .update(cx, |state, cx| state.refresh_session_tree(cx));
+                }
             }
             let restored = state.update(cx, |state, _| state.take_pending_composer_text());
             if let (Some(text), Some(draft)) = (restored, this.draft.clone()) {
@@ -680,11 +693,20 @@ impl PidoApp {
         }
         self.right_open = true;
         self.right_tab = tab;
-        if tab == RightTab::Diff {
-            // Reopen on the newest file rather than a stale pick.
-            self.diff_selected = None;
-        } else {
-            self.ensure_terminal(cx);
+        match tab {
+            RightTab::Diff => {
+                // Reopen on the newest file rather than a stale pick.
+                self.diff_selected = None;
+            }
+            RightTab::Terminal => {
+                self.ensure_terminal(cx);
+            }
+            RightTab::Tree => {
+                // Fresh every open: the tree is one cheap request, and a
+                // stale one would misrender the branches.
+                self.state
+                    .update(cx, |state, cx| state.refresh_session_tree(cx));
+            }
         }
         crate::settings::save_setting(|s| {
             s.right_open = Some(true);

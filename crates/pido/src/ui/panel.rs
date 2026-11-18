@@ -39,14 +39,15 @@ pub fn render(
             None,
         )
         .segment("terminal", i18n::t(cx, "terminal"), None)
+        .segment("tree", i18n::t(cx, "tree"), None)
         .on_change({
             let view = view.clone();
             move |key, _, cx| {
                 view.update(cx, |this, cx| {
-                    let next = if key.as_ref() == "terminal" {
-                        RightTab::Terminal
-                    } else {
-                        RightTab::Diff
+                    let next = match key.as_ref() {
+                        "terminal" => RightTab::Terminal,
+                        "tree" => RightTab::Tree,
+                        _ => RightTab::Diff,
                     };
                     if this.right_tab != next {
                         this.open_right(next, cx);
@@ -90,6 +91,18 @@ pub fn render(
                             }),
                     )
                 })
+                .when(tab == RightTab::Tree, |this| {
+                    let state = state.clone();
+                    this.child(
+                        IconButton::new("tree-refresh", IconName::RefreshCw)
+                            .variant(ButtonVariant::Ghost)
+                            .size(ControlSize::Sm)
+                            .tooltip(i18n::t(cx, "tree_refresh"))
+                            .on_click(move |_, _, cx| {
+                                state.update(cx, |s, cx| s.refresh_session_tree(cx));
+                            }),
+                    )
+                })
                 .child({
                     let view = view.clone();
                     IconButton::new("panel-close", IconName::X)
@@ -104,6 +117,7 @@ pub fn render(
         .child(match tab {
             RightTab::Diff => diff_tab(app, view, state, cx).into_any_element(),
             RightTab::Terminal => terminal_tab(app, view, cx).into_any_element(),
+            RightTab::Tree => crate::ui::tree::render(state, cx).into_any_element(),
         })
         .into_any_element()
 }
@@ -166,5 +180,6 @@ fn tab_key(tab: RightTab) -> &'static str {
     match tab {
         RightTab::Diff => "diff",
         RightTab::Terminal => "terminal",
+        RightTab::Tree => "tree",
     }
 }

@@ -26,6 +26,10 @@ pub fn render_header(
 ) -> impl IntoElement + use<> {
     let theme = cx.theme();
     let s = state.read(cx);
+    // Menu picks read the state up front: the borrow has to end before the
+    // builder chain's mutable `cx` uses (menu_under).
+    let auto_retry_on = s.auto_retry.unwrap_or(true);
+    let retrying = s.retrying;
     let app = state.clone();
     let next_locale = i18n::other_locale(cx);
 
@@ -194,6 +198,49 @@ pub fn render_header(
                 cx,
             )
         })
+        .child({
+            // Auto-retry flips pi's persisted switch; stopping cancels the
+            // backoff pi is currently waiting out.
+            let app = app.clone();
+            let auto = auto_retry_on;
+            let auto_label = i18n::t(cx, "auto_retry").to_string();
+            let stop_label = i18n::t(cx, "stop_retry").to_string();
+            let tooltip = i18n::t(cx, "auto_retry");
+            let mut menu = ely_gpui_component::menus::Menu::new().item({
+                let app = app.clone();
+                ely_gpui_component::menus::MenuItem::check(auto_label, auto).on_click(
+                    move |_, cx| {
+                        app.update(cx, |s, cx| s.set_auto_retry(!auto, cx));
+                    },
+                )
+            });
+            if retrying {
+                let app = app.clone();
+                menu = menu.item(
+                    ely_gpui_component::menus::MenuItem::new(stop_label)
+                        .icon(ely_gpui_component::primitives::IconName::X)
+                        .on_click(move |_, cx| {
+                            app.update(cx, |s, cx| s.abort_retry(cx));
+                        }),
+                );
+            }
+            ely_gpui_component::menus::menu_under(
+                "retry".into(),
+                &menu,
+                move |click| {
+                    ely_gpui_component::buttons::IconButton::new(
+                        "retry-button",
+                        ely_gpui_component::primitives::IconName::RotateCcw,
+                    )
+                    .variant(ely_gpui_component::buttons::ButtonVariant::Ghost)
+                    .tooltip(tooltip)
+                    .on_click(move |event, window, cx| click(event, window, cx))
+                    .into_any_element()
+                },
+                window,
+                cx,
+            )
+        })
 }
 
 /// The scrollable transcript area with the notice banner and empty state.
@@ -215,23 +262,24 @@ pub fn render_transcript(
             .iter()
             .cloned()
             .map(|notice| {
+                let element = if notice.key == "retrying" {
+                    render_retry_notice(&notice, state, cx).into_any_element()
+                } else {
+                    render_notice(notice.id, notice.kind, notice.text, state.clone(), cx)
+                        .into_any_element()
+                };
                 div()
                     .flex_none()
                     .px_4()
                     .pt_2()
-                    .child(render_notice(
-                        notice.id,
-                        notice.kind,
-                        notice.text,
-                        state.clone(),
-                        cx,
-                    ))
+                    .child(element)
                     .into_any_element()
             })
             .collect::<Vec<_>>();
         (empty, notices, s.visible_rows(), s.session_epoch)
     };
     let update_banner = render_update_banner(state, cx);
+    let version_banner = render_version_banner(state, cx);
     let count = visible.len();
 
     // Own the scroll state: rebuilt when the conversation was replaced, kept
@@ -295,6 +343,7 @@ pub fn render_transcript(
         .flex()
         .flex_col()
         .children(update_banner)
+        .children(version_banner)
         .children(notices)
         .child(if empty {
             div()
@@ -726,6 +775,14 @@ fn render_item(
                             cx.write_to_clipboard(gpui::ClipboardItem::new_string(selected));
                         }
                     })
+                    // Fenced code goes to Ely's CodeBlock, which carries its
+                    // own copy button, highlight colors and folding — the
+                    // prose renderer's plain block has none of those.
+                    .code(move |id, language, code| {
+                        ely_gpui_component::chat::CodeBlock::new(id, code)
+                            .when_some(language, |block, language| block.language(language))
+                            .into_any_element()
+                    })
                     .into_any_element(),
                     None => ely_gpui_component::chat::StreamingMarkdown::new(
                         ("text", ix),
@@ -1153,6 +1210,68 @@ fn render_update_banner(state: &Entity<AppState>, cx: &App) -> Option<AnyElement
             )
             .into_any_element(),
     )
+}
+
+/// A soft warning when the pi CLI predates what pido expects. Unknown
+/// records degrade gracefully, so this is advice, not a blocker.
+fn render_version_banner(state: &Entity<AppState>, cx: &App) -> Option<AnyElement> {
+    let version = state.read(cx).environment.pi_version.as_deref()?;
+    let tuple = pi_rpc::client::pi_version_tuple(version)?;
+    if tuple >= crate::state::MIN_PI_VERSION {
+        return None;
+    }
+    let theme = cx.theme();
+    let (major, minor, patch) = crate::state::MIN_PI_VERSION;
+    let text = i18n::t_arg(cx, "pi_version_old", "v", version)
+        .replace("{min}", &format!("{major}.{minor}.{patch}"));
+    Some(
+        div()
+            .flex_none()
+            .px_4()
+            .pt_2()
+            .child(
+                div()
+                    .w_full()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .px_3()
+                    .py_2()
+                    .rounded_md()
+                    .bg(theme.colors.warning_subtle)
+                    .text_color(theme.colors.warning)
+                    .child(Paragraph::new(text)),
+            )
+            .into_any_element(),
+    )
+}
+
+/// The retrying status line carries a stop button: pi's backoff between
+/// attempts can stretch to a minute, and waiting it out is not the only
+/// answer.
+fn render_retry_notice(
+    notice: &crate::state::Notice,
+    state: &Entity<AppState>,
+    cx: &App,
+) -> impl IntoElement + use<> {
+    let theme = cx.theme();
+    let app = state.clone();
+    div()
+        .flex()
+        .items_center()
+        .gap_2()
+        .px_3()
+        .py_2()
+        .rounded_md()
+        .bg(theme.colors.warning_subtle)
+        .text_color(theme.colors.warning)
+        .child(Paragraph::new(notice.text.clone()))
+        .child(
+            ely_gpui_component::buttons::Button::new("stop-retry", i18n::t(cx, "stop_retry"))
+                .on_click(move |_, _, cx| {
+                    app.update(cx, |s, cx| s.abort_retry(cx));
+                }),
+        )
 }
 
 /// The dismissible banner above the transcript (also used by the welcome

@@ -632,9 +632,52 @@ pub fn search_content(root: &Path, query: &str) -> Vec<(PathBuf, String)> {
     hits
 }
 
+/// Every entry of one session file, in append order — the tree a branch
+/// viewer draws. Lines this build cannot parse (a newer pi's new entry
+/// type) are skipped: the rest of the tree stays visible.
+pub fn read_session_entries(path: &Path) -> anyhow::Result<Vec<crate::protocol::SessionEntry>> {
+    let file = std::fs::File::open(path)?;
+    let mut reader = BufReader::new(file);
+    let mut entries = Vec::new();
+    let mut line = String::new();
+    loop {
+        line.clear();
+        match reader.read_line(&mut line) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {}
+        }
+        if let Ok(entry) = serde_json::from_str::<crate::protocol::SessionEntry>(line.trim_end()) {
+            entries.push(entry);
+        }
+    }
+    Ok(entries)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn read_session_entries_skips_lines_it_cannot_parse() {
+        let dir = std::env::temp_dir().join("pido-pi-rpc-tree-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("tree-test.jsonl");
+        std::fs::write(
+            &path,
+            "{\"type\":\"session\",\"id\":\"s\",\"cwd\":\"/tmp\",\"timestamp\":\"t\"}\n\
+             {\"type\":\"message\",\"id\":\"m1\",\"parentId\":null,\"timestamp\":\"2026-01-01T00:00:00.000Z\",\"message\":{\"role\":\"user\",\"content\":\"hi\",\"timestamp\":1}}\n\
+             not json at all\n\
+             {\"type\":\"branch_summary\",\"id\":\"b1\",\"parentId\":\"m1\",\"timestamp\":\"t\",\"summary\":\"went left\"}\n",
+        )
+        .unwrap();
+        let entries = read_session_entries(&path).unwrap();
+        // The header parses as an entry too (its id and no parent make it
+        // the tree's root); only the garbage line is skipped.
+        assert_eq!(entries.len(), 3, "garbage is skipped, the rest stays");
+        assert_eq!(entries[1].id, "m1");
+        assert_eq!(entries[2].summary.as_deref(), Some("went left"));
+        let _ = std::fs::remove_file(&path);
+    }
 
     /// Write a session and set its modification time, in seconds since the
     /// epoch, so activity ordering is deterministic.
