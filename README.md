@@ -69,9 +69,16 @@ cannot see), start pido with `PIDO_PI_PATH=/full/path/to/pi`.
 
 Windows 与 macOS 用户请暂从源码构建(`cargo run --release -p pido`)。
 
+每个产物都附带同名 `.sha256`,应用内「立即更新」(仅 AppImage)下载后据此校验。
+
+**发版检查单**:两个 crate 的 `Cargo.toml` `version` 必须与标签一致(应用据此判断自身版本),然后 `git tag vX.Y.Z && git push origin vX.Y.Z`。
+
 English: a `v*` tag currently publishes a **Linux AppImage only** — the
 Windows zip and the macOS `.app` bundle return once signing certificates
-are in place; build from source meanwhile.
+are in place; build from source meanwhile. Every artifact ships with a
+`.sha256` sibling, which the in-app update verifies. **Before tagging**,
+set `version` in both crates' `Cargo.toml` to the tag's number — the app
+reads it to know what it is.
 
 ## 运行 / Run
 
