@@ -115,11 +115,19 @@ fn assistant_text(message: &pi_rpc::protocol::AssistantMessage) -> SharedString 
     excerpt(Some(&joined))
 }
 
-/// One or two lines' worth, enough to recognize the node.
+/// One line's worth, enough to recognize the node. Newlines MUST go: the
+/// drawing path (Ellipsis's measurement copy, then gpui's text shaping)
+/// asserts on them and took the whole app down once.
 fn excerpt(text: Option<&str>) -> SharedString {
-    let text = text.unwrap_or_default().trim();
-    let mut out: String = text.chars().take(160).collect();
-    if text.chars().count() > 160 {
+    let flat = text
+        .unwrap_or_default()
+        .split(['\n', '\r'])
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join(" · ");
+    let mut out: String = flat.chars().take(160).collect();
+    if flat.chars().count() > 160 {
         out.push('…');
     }
     out.into()
@@ -174,8 +182,8 @@ pub fn render(state: &Entity<AppState>, cx: &App) -> AnyElement {
         .id("tree-scroll")
         .flex_1()
         .min_h_0()
+        .min_w_0()
         .overflow_y_scroll()
-        .overflow_x_hidden()
         .flex()
         .flex_col()
         .py_2()
@@ -233,11 +241,16 @@ fn tree_row(
         .pl(px(10.0 + row.depth as f32 * 16.0))
         .pr_3()
         .py_0p5()
+        .w_full()
         .min_w_0()
         .child(
             div()
                 .flex_none()
-                .text_size(theme.text_size(TextSize::Sm))
+                .text_size(theme.text_size(if row.kind == RowKind::Assistant {
+                    TextSize::Xs
+                } else {
+                    TextSize::Sm
+                }))
                 .text_color(ink)
                 .child(glyph),
         );
@@ -273,7 +286,11 @@ fn tree_row(
         RowKind::User | RowKind::Assistant => div()
             .flex_1()
             .min_w_0()
-            .text_size(theme.text_size(TextSize::Sm))
+            .text_size(theme.text_size(if row.kind == RowKind::Assistant {
+                TextSize::Xs
+            } else {
+                TextSize::Sm
+            }))
             .text_color(ink)
             .child(Ellipsis::new(row.text.clone())),
     };
