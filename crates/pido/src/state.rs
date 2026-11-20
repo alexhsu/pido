@@ -5402,14 +5402,19 @@ fn active_branch<'a>(entries: &'a [SessionEntry], leaf_id: Option<&str>) -> Vec<
     chain
 }
 
-/// One drawn row of the session's branch tree: an entry, its nesting
-/// depth, and whether pi would run it (the path from the leaf to the
-/// root).
+/// One drawn row of the session's branch tree: an entry, how far to indent
+/// it, whether pi would run it, and how many branches grow from it.
 #[derive(Debug, Clone)]
 pub struct TreeRow {
+    /// Indent for drawing: the number of **forked** ancestors, not the raw
+    /// parent-chain length. A linear session stays one flush column — the
+    /// chain is what the transcript already shows — and only real branches
+    /// step right, which also keeps the depth bounded.
     pub depth: usize,
     pub entry: SessionEntry,
     pub on_active: bool,
+    /// How many children this entry has; more than one draws a fork marker.
+    pub children: usize,
 }
 
 /// Ids on the path from `leaf_id` to the root; everything when the leaf
@@ -5462,13 +5467,17 @@ pub(crate) fn flatten_nodes(
     let mut stack: Vec<(&pi_rpc::protocol::TreeNode, usize)> =
         nodes.iter().rev().map(|node| (node, 0)).collect();
     while let Some((node, depth)) = stack.pop() {
+        // Children of a forked entry all step right one level; children of
+        // a linear entry stay flush with it.
+        let child_depth = depth + usize::from(node.children.len() > 1);
         rows.push(TreeRow {
             depth,
             entry: node.entry.clone(),
             on_active: active.contains(node.entry.id.as_str()),
+            children: node.children.len(),
         });
         for child in node.children.iter().rev() {
-            stack.push((child, depth + 1));
+            stack.push((child, child_depth));
         }
     }
     rows
@@ -5498,14 +5507,22 @@ pub(crate) fn flatten_entries(entries: &[SessionEntry]) -> Vec<TreeRow> {
     let mut stack: Vec<(usize, usize)> = roots.iter().rev().map(|&ix| (ix, 0)).collect();
     while let Some((ix, depth)) = stack.pop() {
         let entry = &entries[ix];
+        let kids = children_of
+            .get(entry.id.as_str())
+            .map(Vec::len)
+            .unwrap_or(0);
+        // A forked entry's children all step right; a linear chain's next
+        // entry stays flush — the transcript already shows the chain.
+        let child_depth = depth + usize::from(kids > 1);
         rows.push(TreeRow {
             depth,
             entry: entry.clone(),
             on_active: active.contains(entry.id.as_str()),
+            children: kids,
         });
-        if let Some(kids) = children_of.get(entry.id.as_str()) {
-            for &kid in kids.iter().rev() {
-                stack.push((kid, depth + 1));
+        if let Some(kid_ixs) = children_of.get(entry.id.as_str()) {
+            for &kid in kid_ixs.iter().rev() {
+                stack.push((kid, child_depth));
             }
         }
     }
@@ -5686,20 +5703,40 @@ mod tests {
     #[test]
     fn flatten_entries_draws_file_order_with_the_active_path_marked() {
         // A fork at the root prompt: file order is the parent line, the
-        // abandoned branch, then the active one — whose leaf is last.
+        // abandoned branch, then the active one — whose leaf is last. The
+        // two children are a fork, so both step right one level.
         let entries = vec![
             entry("m1", None),
             entry("m2", Some("m1")),
             entry("m3", Some("m1")),
         ];
         let rows = flatten_entries(&entries);
-        let depths: Vec<(usize, bool)> =
-            rows.iter().map(|row| (row.depth, row.on_active)).collect();
+        let drawn: Vec<(usize, usize, bool)> = rows
+            .iter()
+            .map(|row| (row.depth, row.children, row.on_active))
+            .collect();
         assert_eq!(
-            depths,
-            vec![(0, true), (1, false), (1, true)],
-            "last entry is the leaf; its sibling is abandoned"
+            drawn,
+            vec![(0, 2, true), (1, 0, false), (1, 0, true)],
+            "the forked parent marks the branch; the leaf is last"
         );
+    }
+
+    #[test]
+    fn flatten_entries_keeps_a_linear_chain_flush() {
+        // A real session is a linear chain — every entry's parent is the
+        // one before it — and the drawing must not turn that into a
+        // staircase: depth counts forks, not chain length.
+        let entries = vec![
+            entry("m1", None),
+            entry("m2", Some("m1")),
+            entry("m3", Some("m2")),
+        ];
+        let rows = flatten_entries(&entries);
+        let depths: Vec<usize> = rows.iter().map(|row| row.depth).collect();
+        assert_eq!(depths, vec![0, 0, 0], "no forks, no indent");
+        assert_eq!(rows[0].children, 1);
+        assert_eq!(rows[2].children, 0, "the leaf has no children");
     }
 
     #[test]
@@ -5712,7 +5749,7 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert!(rows.iter().all(|row| row.on_active));
         assert_eq!(rows[0].depth, 0);
-        assert_eq!(rows[1].depth, 1);
+        assert_eq!(rows[1].depth, 0, "one child is not a fork");
     }
 
     #[test]
@@ -5741,7 +5778,8 @@ mod tests {
                 ("m1", 0, true),
                 ("m2", 1, false),
                 ("m3", 1, true),
-                ("m4", 2, true)
+                // m3 has a single child, so m4 stays at its level.
+                ("m4", 1, true)
             ]
         );
     }

@@ -139,9 +139,11 @@ PI_SMOKE_PROMPT="hi" cargo run -p pi-rpc --example real_pi -- /tmp   # 完整流
 
 ## 状态与路线 / Status
 
-MVP(核心聊天客户端)已完成,扩展 UI 原生对话框(权限审批类扩展)、队列可视化、会话重命名、改动审查(右侧栏 diff)、内置终端均已支持。明确不在当前范围:checkpoint 回溯、多 pi 进程并发。
+MVP(核心聊天客户端)已完成,扩展 UI 原生对话框(权限审批类扩展)、队列可视化、会话重命名、改动审查(右侧栏 diff)、内置终端、会话分支树均已支持。checkpoint 回溯仍不可行(pi 的 RPC 无法移动 leaf)。
 
 依赖固定:`ely-gpui-component` 锁定 rev `e0f355a`,`gpui-pre =0.3.11`;升级视为显式变更。
+
+多标签页、每项目独立 pi 进程的可行性设计与分期方案见 [docs/multi-tab.md](docs/multi-tab.md)(设计文档,未实施)。A design for parallel tabs with one pi process per project lives there too.
 
 ## License
 
