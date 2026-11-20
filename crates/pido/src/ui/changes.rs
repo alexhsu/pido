@@ -64,7 +64,7 @@ pub fn render(
             .layout(layout)
             .on_layout(move |layout: DiffLayout, _, cx| {
                 layout_view.update(cx, |this, cx| {
-                    this.diff_layout = layout;
+                    this.slot_mut().diff_layout = layout;
                     cx.notify();
                 });
             })
@@ -145,7 +145,7 @@ fn file_row(
         .hover(|this| this.bg(colors.hover))
         .on_click(move |_, _, cx| {
             view.update(cx, |this, cx| {
-                this.diff_selected = Some(key.clone());
+                this.slot_mut().diff_selected = Some(key.clone());
                 cx.notify();
             });
         })

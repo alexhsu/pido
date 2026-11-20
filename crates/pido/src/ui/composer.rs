@@ -27,7 +27,7 @@ pub fn render(state: &Entity<AppState>, app: &mut PidoApp, cx: &App) -> impl Int
     let colors = theme.colors.clone();
     let s = state.read(cx);
     let streaming = s.streaming;
-    let Some(draft) = app.draft.clone() else {
+    let Some(draft) = app.slot().draft.clone() else {
         return div().into_any_element();
     };
     let image_only = !s.pending_images.is_empty() && draft.read(cx).text().trim().is_empty();

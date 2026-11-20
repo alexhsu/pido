@@ -286,7 +286,7 @@ pub fn render_transcript(
     // (with its measured heights and away badge) across re-renders. The away
     // badge lives in its own entity — the list's paint pass reads it, and
     // reading the view there would re-enter the view's update.
-    if app.list_epoch != epoch || app.transcript_list.is_none() {
+    if app.slot().list_epoch != epoch || app.slot().transcript_list.is_none() {
         let overdraw = cx.theme().list_overdraw().to_pixels(window.rem_size());
         let list = gpui::ListState::new(count, gpui::ListAlignment::Bottom, overdraw);
         let scroll = cx.new(|_| crate::ui::app::TranscriptScroll::default());
@@ -305,12 +305,16 @@ pub fn render_transcript(
                 })
                 .ok();
         });
-        app.transcript_list = Some(list);
-        app.transcript_scroll = Some(scroll);
-        app.list_epoch = epoch;
+        app.slot_mut().transcript_list = Some(list);
+        app.slot_mut().transcript_scroll = Some(scroll);
+        app.slot_mut().list_epoch = epoch;
     }
-    let list = app.transcript_list.clone().expect("transcript list");
-    let scroll = app.transcript_scroll.clone().expect("transcript scroll");
+    let list = app.slot().transcript_list.clone().expect("transcript list");
+    let scroll = app
+        .slot()
+        .transcript_scroll
+        .clone()
+        .expect("transcript scroll");
     let feed_count = list.item_count();
     let (away, fresh) = {
         let scroll = scroll.read(cx);
@@ -357,6 +361,7 @@ pub fn render_transcript(
             let visible = std::rc::Rc::new(visible);
             // The current find match's transcript index, for the row tint.
             let hit_ix = app
+                .slot()
                 .find
                 .as_ref()
                 .and_then(|find| find.matches.get(find.current).copied());
@@ -451,7 +456,7 @@ pub fn render_transcript(
                                 let scroll = scroll.clone();
                                 let list = list.clone();
                                 ely_gpui_component::chat::ScrollToBottomButton::new(
-                                    ("transcript-jump", app.list_epoch),
+                                    ("transcript-jump", app.slot().list_epoch),
                                     fresh,
                                     move |_, cx| {
                                         let end = list.item_count();
@@ -469,7 +474,7 @@ pub fn render_transcript(
                             }),
                     )
                 })
-                .when_some(app.find.clone(), |this, find| {
+                .when_some(app.slot().find.clone(), |this, find| {
                     this.child(render_find_bar(state, view, &find, cx))
                 })
                 .into_any_element()

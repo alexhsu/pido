@@ -142,13 +142,19 @@ fn diff_tab(
             .child(Caption::new(i18n::t(cx, "changes_empty")))
             .into_any_element();
     }
-    crate::ui::changes::render(state, view, app.diff_selected.clone(), app.diff_layout, cx)
-        .into_any_element()
+    crate::ui::changes::render(
+        state,
+        view,
+        app.slot().diff_selected.clone(),
+        app.slot().diff_layout,
+        cx,
+    )
+    .into_any_element()
 }
 
 /// The live shell, or the way back to a fresh one.
 fn terminal_tab(app: &PidoApp, view: &Entity<PidoApp>, cx: &App) -> impl IntoElement + use<> {
-    match &app.terminal {
+    match &app.slot().terminal {
         Some(terminal) => div()
             .id("terminal-pane")
             .flex_1()

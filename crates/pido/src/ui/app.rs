@@ -41,28 +41,15 @@ fn clamp_width(width: f32, range: &std::ops::RangeInclusive<f32>) -> f32 {
     width.clamp(*range.start(), *range.end())
 }
 
-pub struct PidoApp {
-    /// The panes' widths in logical pixels, always clamped to their ranges.
-    /// Shared with the resize handler, which cannot reach the view: dragging
-    /// past a limit holds the value at the limit, and the next render reseeds
-    /// the split back into range.
-    left_px: std::rc::Rc<std::cell::Cell<f32>>,
-    right_px: std::rc::Rc<std::cell::Cell<f32>>,
-    /// Set by the resize handler when a drag leaves the range, cleared by the
-    /// render that has reseeded the split back in: while it is fresh, the
-    /// seed alternates by a hair so the split keeps pulling the pane back.
-    snap_since: std::rc::Rc<std::cell::Cell<Option<std::time::Instant>>>,
-    snap_flip: std::rc::Rc<std::cell::Cell<u64>>,
-    pub focus: FocusHandle,
+/// One backing session: its state entity plus the view state that rides
+/// along with it. Everything here dies with the session; the shell's own
+/// fields (pane widths, dialogs over projects, the right panel's chrome)
+/// outlive it. M0 keeps exactly one slot — later milestones grow the Vec
+/// so a switched-away session keeps its pi process running.
+pub struct SessionSlot {
     pub state: gpui::Entity<AppState>,
     /// The composer's multi-line field, owned here so it survives re-renders.
     pub draft: Option<gpui::Entity<TextInput>>,
-    /// The welcome screen's project-directory field, created lazily.
-    pub welcome_dir: Option<gpui::Entity<TextInput>>,
-    /// Last observed window size, persisted on quit.
-    window_size: Option<(f32, f32)>,
-    /// Throttles pane-width writes while the split is being dragged.
-    pane_save_at: std::rc::Rc<std::cell::Cell<Option<std::time::Instant>>>,
     /// Whether the composer has been focused since the session went live.
     composer_focused: bool,
     /// The dialog's text field (input/editor), per pending request id.
@@ -74,18 +61,11 @@ pub struct PidoApp {
     rename_open: bool,
     rename_field: Option<gpui::Entity<TextInput>>,
     rename_target: Option<String>,
-    /// The project-rename dialog: the project path being named. When set it
-    /// takes over the same dialog slot as the session rename.
-    rename_project: Option<String>,
-    /// The remove-project confirmation: which path it is about.
-    confirm_remove: Option<String>,
-    /// The right panel: open, which file is picked, and its diff layout.
+    /// The right panel's diff pick and layout, per session.
     pub diff_selected: Option<String>,
     pub diff_layout: ely_gpui_component::git::DiffLayout,
-    /// Which right-panel tab shows, and whether the panel is open at all.
-    pub right_tab: RightTab,
-    right_open: bool,
-    /// The panel's terminal, spawned on first use and kept while the app runs.
+    /// The panel's terminal, spawned on first use and kept while the slot
+    /// lives.
     pub terminal: Option<gpui::Entity<ely_gpui_component::terminal::Terminal>>,
     /// The transcript's scroll state, owned here so search can jump to a row
     /// and the tail-follow badge survives re-renders. Rebuilt whenever
@@ -107,6 +87,67 @@ pub struct PidoApp {
     /// The session epoch the find bar and palette were opened for; changing
     /// sessions drops both so their indices cannot outlive the transcript.
     session_seen: u64,
+}
+
+impl SessionSlot {
+    fn new(state: gpui::Entity<AppState>) -> Self {
+        Self {
+            state,
+            draft: None,
+            composer_focused: false,
+            dialog_field: None,
+            dialog_field_for: None,
+            rename_open: false,
+            rename_field: None,
+            rename_target: None,
+            diff_selected: None,
+            diff_layout: ely_gpui_component::git::DiffLayout::Unified,
+            terminal: None,
+            transcript_list: None,
+            list_epoch: 0,
+            transcript_scroll: None,
+            find: None,
+            palette: None,
+            palette_gen: 0,
+            palette_selected: 0,
+            session_seen: 0,
+        }
+    }
+}
+
+pub struct PidoApp {
+    /// The panes' widths in logical pixels, always clamped to their ranges.
+    /// Shared with the resize handler, which cannot reach the view: dragging
+    /// past a limit holds the value at the limit, and the next render reseeds
+    /// the split back into range.
+    left_px: std::rc::Rc<std::cell::Cell<f32>>,
+    right_px: std::rc::Rc<std::cell::Cell<f32>>,
+    /// Set by the resize handler when a drag leaves the range, cleared by the
+    /// render that has reseeded the split back in: while it is fresh, the
+    /// seed alternates by a hair so the split keeps pulling the pane back.
+    snap_since: std::rc::Rc<std::cell::Cell<Option<std::time::Instant>>>,
+    snap_flip: std::rc::Rc<std::cell::Cell<u64>>,
+    pub focus: FocusHandle,
+    /// The backing sessions. M0 keeps exactly one; the accessors route
+    /// everything through the active one.
+    slots: Vec<SessionSlot>,
+    /// Which slot the window shows. Always valid: slots are never removed
+    /// while it points there.
+    active: usize,
+    /// The welcome screen's project-directory field, created lazily.
+    pub welcome_dir: Option<gpui::Entity<TextInput>>,
+    /// Last observed window size, persisted on quit.
+    window_size: Option<(f32, f32)>,
+    /// Throttles pane-width writes while the split is being dragged.
+    pane_save_at: std::rc::Rc<std::cell::Cell<Option<std::time::Instant>>>,
+    /// The project-rename dialog: the project path being named. When set it
+    /// takes over the same dialog slot as the session rename.
+    rename_project: Option<String>,
+    /// The remove-project confirmation: which path it is about.
+    confirm_remove: Option<String>,
+    /// Which right-panel tab shows, and whether the panel is open at all.
+    pub right_tab: RightTab,
+    right_open: bool,
     /// The sidebar's session-search field, created once in setup.
     pub search_field: Option<gpui::Entity<TextInput>>,
 }
@@ -158,31 +199,37 @@ impl PidoApp {
     pub fn new(cx: &mut Context<Self>) -> Self {
         let focus = cx.focus_handle();
         let state = AppState::new(cx);
-        // Re-render whenever the state entity changes, and drain any text a
-        // cancelled/failed action wants restored into the composer.
+        // Re-render whenever the active slot's state entity changes, and
+        // drain any text a cancelled/failed action wants restored into the
+        // composer. Later milestones re-subscribe when the active slot
+        // changes; M0 has exactly one.
         cx.observe(&state, |this, state, cx| {
             // Find matches and palette rows carry transcript indices; a new
             // session invalidates both.
             let epoch = state.read(cx).session_epoch;
-            if this.session_seen != epoch {
-                this.session_seen = epoch;
-                this.find = None;
-                this.palette = None;
-                this.palette_selected = 0;
+            let slot = this.slot_mut();
+            if slot.session_seen != epoch {
+                slot.session_seen = epoch;
+                slot.find = None;
+                slot.palette = None;
+                slot.palette_selected = 0;
                 // A shell left over from the previous session still sits in
                 // its directory; one that never started spawns in the new
                 // cwd when the panel opens.
-                if this.terminal.is_some() {
+                let has_terminal = slot.terminal.is_some();
+                let open_tree = this.right_open && this.right_tab == RightTab::Tree;
+                if has_terminal {
                     this.restart_terminal(cx);
                 }
                 // The tree tab must not show the old session's branches.
-                if this.right_open && this.right_tab == RightTab::Tree {
-                    this.state
+                if open_tree {
+                    this.slot()
+                        .state
                         .update(cx, |state, cx| state.refresh_session_tree(cx));
                 }
             }
             let restored = state.update(cx, |state, _| state.take_pending_composer_text());
-            if let (Some(text), Some(draft)) = (restored, this.draft.clone()) {
+            if let (Some(text), Some(draft)) = (restored, this.slot().draft.clone()) {
                 draft.update(cx, |input, cx| {
                     if !input.text().trim().is_empty() {
                         input.insert("\n", cx);
@@ -209,43 +256,36 @@ impl PidoApp {
         let snap_since = std::rc::Rc::new(std::cell::Cell::new(None));
         let snap_flip = std::rc::Rc::new(std::cell::Cell::new(0u64));
         let right_open = persisted.right_open.unwrap_or(false);
-        let session_seen = state.read(cx).session_epoch;
         let app = Self {
             left_px,
             right_px,
             snap_since,
             snap_flip,
             focus,
-            state,
-            draft: None,
+            slots: vec![SessionSlot::new(state)],
+            active: 0,
             welcome_dir: None,
             window_size: None,
             pane_save_at: std::rc::Rc::new(std::cell::Cell::new(None)),
-            composer_focused: false,
-            dialog_field: None,
-            dialog_field_for: None,
-            rename_open: false,
-            rename_field: None,
-            rename_target: None,
             rename_project: None,
             confirm_remove: None,
-            diff_selected: None,
-            diff_layout: ely_gpui_component::git::DiffLayout::Unified,
             right_tab: RightTab::Diff,
             right_open,
-            terminal: None,
-            transcript_list: None,
-            list_epoch: 0,
-            transcript_scroll: None,
-            find: None,
-            palette: None,
-            palette_gen: 0,
-            palette_selected: 0,
-            session_seen,
             search_field: None,
         };
         app.observe_window_for_quit(cx);
         app
+    }
+
+    /// The session the window shows. M0 keeps exactly one slot, so this is
+    /// infallible; later milestones switch which index `active` names.
+    pub fn slot(&self) -> &SessionSlot {
+        self.slots.get(self.active).expect("active slot")
+    }
+
+    /// The active slot for mutation; same single-slot guarantee.
+    pub fn slot_mut(&mut self) -> &mut SessionSlot {
+        self.slots.get_mut(self.active).expect("active slot")
     }
 
     /// Stash the window size on every render and persist it when the app
@@ -270,7 +310,7 @@ impl PidoApp {
     /// Called once the window is open: fields that need a Window are created
     /// here (see main.rs).
     pub fn setup(&mut self, window: &mut gpui::Window, cx: &mut Context<Self>) {
-        self.draft = Some(cx.new(|cx| {
+        self.slot_mut().draft = Some(cx.new(|cx| {
             TextInput::new(window, cx)
                 .multi_line(1, 8)
                 .placeholder_key("idle_hint")
@@ -281,7 +321,9 @@ impl PidoApp {
         cx.subscribe(&search, move |this, field, event: &InputEvent, cx| {
             if *event == InputEvent::Changed {
                 let query = field.read(cx).text().to_string();
-                this.state.update(cx, |s, cx| s.set_search(&query, cx));
+                this.slot()
+                    .state
+                    .update(cx, |s, cx| s.set_search(&query, cx));
             }
         })
         .detach();
@@ -292,7 +334,8 @@ impl PidoApp {
         }
         // Look for a newer release in the background; the banner appears when
         // one exists. A failure stays silent — the user did not ask.
-        self.state
+        self.slot()
+            .state
             .update(cx, |s, cx| s.check_for_updates(false, cx));
         cx.notify();
     }
@@ -327,7 +370,8 @@ impl PidoApp {
             .map(|args| args.split_whitespace().map(str::to_string).collect())
             .unwrap_or_default();
         if let Some(path) = dir {
-            self.state
+            self.slot()
+                .state
                 .update(cx, |s, cx| s.connect(path, resume, extra, cx));
         }
     }
@@ -340,13 +384,13 @@ impl Render for PidoApp {
         let column = theme.container_width(ContainerSize::Md);
         let bounds = window.bounds();
         self.window_size = Some((f32::from(bounds.size.width), f32::from(bounds.size.height)));
-        let state = self.state.clone();
+        let state = self.slot().state.clone();
         let live = matches!(state.read(cx).conn, Conn::Live | Conn::Reconnecting { .. });
 
         // The find bar's matches track its query and the transcript. While a
         // stream is running the text changes every frame, so rescan at a
         // human pace rather than on every redraw.
-        if let Some(find) = &mut self.find {
+        if let Some(find) = &mut self.slot_mut().find {
             let query = find.field.read(cx).text().trim().to_string();
             let s = state.read(cx);
             let count = s.transcript.len();
@@ -376,14 +420,14 @@ impl Render for PidoApp {
             }
         }
 
-        if live && !self.composer_focused {
-            if let Some(draft) = &self.draft {
+        if live && !self.slot().composer_focused {
+            if let Some(draft) = &self.slot().draft {
                 let focus = draft.read(cx).focus().clone();
                 window.focus(&focus, cx);
             }
-            self.composer_focused = true;
+            self.slot_mut().composer_focused = true;
         } else if !live {
-            self.composer_focused = false;
+            self.slot_mut().composer_focused = false;
         }
 
         let main: gpui::AnyElement =
@@ -550,11 +594,11 @@ impl Render for PidoApp {
                     // non-empty; when only images are staged, send here so an
                     // image-only message is possible.
                     .capture_action(cx.listener(|this, _: &Enter, window, cx| {
-                        let state = this.state.read(cx);
+                        let state = this.slot().state.read(cx);
                         if state.pending_images.is_empty() {
                             return;
                         }
-                        let Some(draft) = this.draft.clone() else {
+                        let Some(draft) = this.slot().draft.clone() else {
                             return;
                         };
                         if !draft.read(cx).focus().contains_focused(window, cx) {
@@ -563,7 +607,8 @@ impl Render for PidoApp {
                         if !draft.read(cx).text().trim().is_empty() {
                             return;
                         }
-                        this.state
+                        this.slot()
+                            .state
                             .update(cx, |s, cx| s.send_text(String::new(), cx));
                         cx.stop_propagation();
                     }))
@@ -574,7 +619,7 @@ impl Render for PidoApp {
                     .on_action(cx.listener(|this, _: &Stop, window, cx| {
                         // A dialog owns Escape: cancel it instead of also
                         // stopping the run underneath.
-                        if this.rename_open {
+                        if this.slot().rename_open {
                             this.close_rename(cx);
                             return;
                         }
@@ -583,8 +628,9 @@ impl Render for PidoApp {
                             cx.notify();
                             return;
                         }
-                        if let Some(dialog) = this.state.read(cx).pending_dialog.clone() {
-                            this.state
+                        if let Some(dialog) = this.slot().state.read(cx).pending_dialog.clone() {
+                            this.slot()
+                                .state
                                 .update(cx, |s, cx| s.cancel_dialog(&dialog.id, cx));
                             return;
                         }
@@ -592,25 +638,26 @@ impl Render for PidoApp {
                         // expects. The global action dispatched first and
                         // consumed the keystroke, so the terminal's own
                         // handler never runs — send the byte here instead.
-                        let terminal_focused = this.terminal.as_ref().is_some_and(|terminal| {
-                            terminal
-                                .read(cx)
-                                .focus_handle(cx)
-                                .contains_focused(window, cx)
-                        });
+                        let terminal_focused =
+                            this.slot().terminal.as_ref().is_some_and(|terminal| {
+                                terminal
+                                    .read(cx)
+                                    .focus_handle(cx)
+                                    .contains_focused(window, cx)
+                            });
                         if terminal_focused {
-                            if let Some(terminal) = &this.terminal {
+                            if let Some(terminal) = &this.slot().terminal {
                                 terminal.update(cx, |terminal, _| terminal.write(b"\x1b".to_vec()));
                             }
                             return;
                         }
                         // Esc backs out of the palette, the find bar and the
                         // right panel before it stops a run.
-                        if this.palette.is_some() {
+                        if this.slot().palette.is_some() {
                             this.close_palette(window, cx);
                             return;
                         }
-                        if this.find.is_some() {
+                        if this.slot().find.is_some() {
                             this.close_find(window, cx);
                             return;
                         }
@@ -618,38 +665,44 @@ impl Render for PidoApp {
                             this.close_right(cx);
                             return;
                         }
-                        if this.state.read(cx).streaming {
-                            this.state.update(cx, |s, cx| s.stop(cx));
+                        if this.slot().state.read(cx).streaming {
+                            this.slot().state.update(cx, |s, cx| s.stop(cx));
                         }
                     }))
                     .on_action(cx.listener(|this, _: &Find, window, cx| {
                         this.toggle_find(window, cx);
                     }))
                     .on_action(cx.listener(|this, _: &Palette, window, cx| {
-                        if this.palette.is_some() {
+                        if this.slot().palette.is_some() {
                             this.close_palette(window, cx);
                         } else {
                             this.open_palette(window, cx);
                         }
                     }))
                     .on_action(cx.listener(|this, _: &PinSession, _window, cx| {
-                        if let Some(file) = this.state.read(cx).session_file.clone() {
-                            this.state.update(cx, |s, cx| s.toggle_pin(&file, cx));
+                        if let Some(file) = this.slot().state.read(cx).session_file.clone() {
+                            this.slot()
+                                .state
+                                .update(cx, |s, cx| s.toggle_pin(&file, cx));
                         }
                     }))
                     .on_action(cx.listener(|this, _: &RenameSession, window, cx| {
-                        if this.state.read(cx).conn == Conn::Live {
+                        if this.slot().state.read(cx).conn == Conn::Live {
                             this.open_rename(window, cx);
                         }
                     }))
                     .on_action(cx.listener(|this, _: &ForkSession, _window, cx| {
-                        if let Some(file) = this.state.read(cx).session_file.clone() {
-                            this.state.update(cx, |s, cx| s.fork_session(&file, cx));
+                        if let Some(file) = this.slot().state.read(cx).session_file.clone() {
+                            this.slot()
+                                .state
+                                .update(cx, |s, cx| s.fork_session(&file, cx));
                         }
                     }))
                     .on_action(cx.listener(|this, _: &ArchiveSession, _window, cx| {
-                        if let Some(file) = this.state.read(cx).session_file.clone() {
-                            this.state.update(cx, |s, cx| s.toggle_archive(&file, cx));
+                        if let Some(file) = this.slot().state.read(cx).session_file.clone() {
+                            this.slot()
+                                .state
+                                .update(cx, |s, cx| s.toggle_archive(&file, cx));
                         }
                     })),
             )
@@ -696,7 +749,7 @@ impl PidoApp {
         match tab {
             RightTab::Diff => {
                 // Reopen on the newest file rather than a stale pick.
-                self.diff_selected = None;
+                self.slot_mut().diff_selected = None;
             }
             RightTab::Terminal => {
                 self.ensure_terminal(cx);
@@ -704,7 +757,8 @@ impl PidoApp {
             RightTab::Tree => {
                 // Fresh every open: the tree is one cheap request, and a
                 // stale one would misrender the branches.
-                self.state
+                self.slot()
+                    .state
                     .update(cx, |state, cx| state.refresh_session_tree(cx));
             }
         }
@@ -728,13 +782,13 @@ impl PidoApp {
         if self.modal_open(cx) {
             return;
         }
-        if let Some(find) = &self.find {
+        if let Some(find) = &self.slot().find {
             let focus = find.field.read(cx).focus().clone();
             window.focus(&focus, cx);
             cx.notify();
             return;
         }
-        if self.state.read(cx).transcript.is_empty() {
+        if self.slot().state.read(cx).transcript.is_empty() {
             return;
         }
         let field = cx.new(|cx| TextInput::new(window, cx).placeholder_key("find_placeholder"));
@@ -746,7 +800,7 @@ impl PidoApp {
         .detach();
         let focus = field.read(cx).focus().clone();
         window.focus(&focus, cx);
-        self.find = Some(FindState {
+        self.slot_mut().find = Some(FindState {
             field,
             query: String::new(),
             matches: Vec::new(),
@@ -759,7 +813,7 @@ impl PidoApp {
     }
 
     pub fn close_find(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.find.take().is_some() {
+        if self.slot_mut().find.take().is_some() {
             self.focus_composer(window, cx);
             cx.notify();
         }
@@ -767,7 +821,7 @@ impl PidoApp {
 
     /// Put focus back in the composer after a transient overlay closes.
     fn focus_composer(&self, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(draft) = &self.draft {
+        if let Some(draft) = &self.slot().draft {
             let focus = draft.read(cx).focus().clone();
             window.focus(&focus, cx);
         }
@@ -775,7 +829,7 @@ impl PidoApp {
 
     /// Step to the next (or previous) match and reveal its row.
     pub fn find_step(&mut self, forward: bool, cx: &mut Context<Self>) {
-        let Some(find) = &mut self.find else {
+        let Some(find) = &mut self.slot_mut().find else {
             return;
         };
         if find.matches.is_empty() {
@@ -791,26 +845,26 @@ impl PidoApp {
         // The index was computed by an earlier frame. If the transcript
         // shrank (a failed send removed a bubble, say), drop the search
         // instead of slicing out of bounds.
-        let len = self.state.read(cx).transcript.len();
+        let len = self.slot().state.read(cx).transcript.len();
         if ix >= len {
-            self.find = None;
+            self.slot_mut().find = None;
             cx.notify();
             return;
         }
         // A match can live inside a folded turn -a tool result, most often.
         // Unfold that turn so the row exists to scroll to and tint.
-        let turn_ix = self.state.read(cx).transcript[..ix]
+        let turn_ix = self.slot().state.read(cx).transcript[..ix]
             .iter()
             .rposition(|item| matches!(item, TranscriptItem::Turn { .. }));
         if let Some(turn_ix) = turn_ix {
-            self.state.update(cx, |s, _| {
+            self.slot().state.update(cx, |s, _| {
                 s.expanded_turns.insert(turn_ix as u64);
             });
         }
-        let visible = self.state.read(cx).visible_rows();
+        let visible = self.slot().state.read(cx).visible_rows();
         // The unfold grew the list: sync its item count now, or the scroll
         // below computes its anchor against the stale, shorter list.
-        if let Some(list) = &self.transcript_list {
+        if let Some(list) = &self.slot().transcript_list {
             let feed_count = list.item_count();
             if visible.len() > feed_count {
                 list.splice(feed_count..feed_count, visible.len() - feed_count);
@@ -819,7 +873,7 @@ impl PidoApp {
             }
         }
         let pos = visible.iter().position(|&row| row == ix);
-        if let (Some(list), Some(pos)) = (&self.transcript_list, pos) {
+        if let (Some(list), Some(pos)) = (&self.slot().transcript_list, pos) {
             // Rows far from the viewport were never painted, so their cached
             // heights are estimates; remeasure before seeking or the jump
             // lands on a garbage offset.
@@ -831,7 +885,7 @@ impl PidoApp {
 
     /// Close the command palette.
     pub fn close_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.palette.take().is_some() {
+        if self.slot_mut().palette.take().is_some() {
             self.focus_composer(window, cx);
             cx.notify();
         }
@@ -844,14 +898,14 @@ impl PidoApp {
             return;
         }
         log::info!("open_palette: enter");
-        self.palette_gen = self.palette_gen.wrapping_add(1);
-        self.palette_selected = 0;
+        self.slot_mut().palette_gen = self.slot().palette_gen.wrapping_add(1);
+        self.slot_mut().palette_selected = 0;
         let field = cx.new(|cx| TextInput::new(window, cx).placeholder_key("palette_placeholder"));
         let focus = field.read(cx).focus().clone();
         window.focus(&focus, cx);
-        self.palette = Some(PaletteState {
+        self.slot_mut().palette = Some(PaletteState {
             field,
-            open_gen: self.palette_gen,
+            open_gen: self.slot().palette_gen,
         });
         cx.notify();
     }
@@ -863,7 +917,7 @@ impl PidoApp {
         use ely_gpui_component::forms::{Choice, Down, Enter, Up, marked_row};
         use ely_gpui_component::primitives::IconName;
 
-        let palette = self.palette.as_ref()?;
+        let palette = self.slot().palette.as_ref()?;
         let field = palette.field.clone();
         let gen_id = palette.open_gen;
         let query = field.read(cx).text().to_string();
@@ -889,7 +943,7 @@ impl PidoApp {
                 PaletteAction::CheckUpdate,
             ),
         ];
-        let state = self.state.clone();
+        let state = self.slot().state.clone();
         let files = state.read(cx).workspace_files.clone();
         let items = state.read(cx).palette_items(&query, &files, &actions);
         let kind_label = |kind: PaletteKind| -> gpui::SharedString {
@@ -920,7 +974,7 @@ impl PidoApp {
         let selected = if items.is_empty() {
             0
         } else {
-            self.palette_selected.min(items.len() - 1)
+            self.slot().palette_selected.min(items.len() - 1)
         };
 
         let view = cx.entity();
@@ -930,7 +984,8 @@ impl PidoApp {
                              cx: &mut Context<PidoApp>| {
             let is_command = matches!(item.action, PaletteAction::RunCommand(_));
             let composer_focus = if is_command {
-                this.draft
+                this.slot()
+                    .draft
                     .as_ref()
                     .map(|draft| draft.read(cx).focus().clone())
             } else {
@@ -939,47 +994,52 @@ impl PidoApp {
             this.close_palette(window, cx);
             match &item.action {
                 PaletteAction::SwitchSession(path) => this
+                    .slot()
                     .state
                     .update(cx, |s, cx| s.switch_session(path.clone(), cx)),
                 PaletteAction::SetModel { provider, model_id } => this
+                    .slot()
                     .state
                     .update(cx, |s, cx| s.set_model(provider, model_id, cx)),
-                PaletteAction::SetThinking(level) => {
-                    this.state.update(cx, |s, cx| s.set_thinking(*level, cx))
-                }
+                PaletteAction::SetThinking(level) => this
+                    .slot()
+                    .state
+                    .update(cx, |s, cx| s.set_thinking(*level, cx)),
                 PaletteAction::RunCommand(command) => {
-                    if let Some(draft) = &this.draft {
+                    if let Some(draft) = &this.slot().draft {
                         draft.update(cx, |field, cx| field.set_text(format!("{command} "), cx));
                     }
                 }
                 PaletteAction::ShellTemplate => {
-                    if let Some(draft) = &this.draft {
+                    if let Some(draft) = &this.slot().draft {
                         draft.update(cx, |field, cx| field.set_text("!", cx));
                     }
                 }
                 PaletteAction::CheckUpdate => {
-                    this.state.update(cx, |s, cx| s.check_for_updates(true, cx));
+                    this.slot()
+                        .state
+                        .update(cx, |s, cx| s.check_for_updates(true, cx));
                 }
                 PaletteAction::InsertFile(file) => {
-                    if let Some(draft) = &this.draft {
+                    if let Some(draft) = &this.slot().draft {
                         let at = format!("@{file} ");
                         draft.update(cx, |field, cx| field.insert(&at, cx));
                     }
                 }
                 PaletteAction::NewChat => {
-                    this.state.update(cx, |s, cx| s.new_chat(cx));
+                    this.slot().state.update(cx, |s, cx| s.new_chat(cx));
                 }
                 PaletteAction::ExportHtml => {
-                    this.state.update(cx, |s, cx| s.export_html(cx));
+                    this.slot().state.update(cx, |s, cx| s.export_html(cx));
                 }
                 PaletteAction::Compact => {
-                    this.state.update(cx, |s, cx| s.compact_now(cx));
+                    this.slot().state.update(cx, |s, cx| s.compact_now(cx));
                 }
                 PaletteAction::ToggleTheme => toggle_theme(cx),
             }
             // A picked command lands in the composer for editing; pi expands
             // it on send.
-            if let (Some(draft), Some(focus)) = (&this.draft, composer_focus) {
+            if let (Some(draft), Some(focus)) = (&this.slot().draft, composer_focus) {
                 window.focus(&draft.read(cx).focus().clone(), cx);
                 let _ = focus;
             }
@@ -1072,8 +1132,8 @@ impl PidoApp {
                                     move |_: &Up, _, cx| {
                                         cx.stop_propagation();
                                         view.update(cx, |this, cx| {
-                                            if this.palette_selected > 0 {
-                                                this.palette_selected -= 1;
+                                            if this.slot().palette_selected > 0 {
+                                                this.slot_mut().palette_selected -= 1;
                                                 cx.notify();
                                             }
                                         });
@@ -1085,8 +1145,8 @@ impl PidoApp {
                                     move |_: &Down, _, cx| {
                                         cx.stop_propagation();
                                         view.update(cx, |this, cx| {
-                                            if this.palette_selected + 1 < items_len {
-                                                this.palette_selected += 1;
+                                            if this.slot().palette_selected + 1 < items_len {
+                                                this.slot_mut().palette_selected += 1;
                                                 cx.notify();
                                             }
                                         });
@@ -1098,7 +1158,8 @@ impl PidoApp {
                                     move |_: &Enter, window, cx| {
                                         cx.stop_propagation();
                                         view.update(cx, |this, cx| {
-                                            let Some(item) = items.get(this.palette_selected)
+                                            let Some(item) =
+                                                items.get(this.slot().palette_selected)
                                             else {
                                                 return;
                                             };
@@ -1136,7 +1197,7 @@ impl PidoApp {
     /// The panel's shell, spawned on first use; a dead one spawns again.
     fn ensure_terminal(&mut self, cx: &mut Context<Self>) {
         use ely_gpui_component::terminal::{Launch, Terminal};
-        if self.terminal.is_some() {
+        if self.slot().terminal.is_some() {
             return;
         }
         // PowerShell on Windows; the user's login shell elsewhere.
@@ -1148,7 +1209,13 @@ impl PidoApp {
                 Vec::new(),
             ))
         };
-        let cwd = self.state.read(cx).cwd.clone().or_else(dirs::home_dir);
+        let cwd = self
+            .slot()
+            .state
+            .read(cx)
+            .cwd
+            .clone()
+            .or_else(dirs::home_dir);
         let launch = Launch {
             program,
             cwd,
@@ -1174,18 +1241,18 @@ impl PidoApp {
             |this, _, event: &ely_gpui_component::terminal::TerminalEvent, cx| {
                 if let ely_gpui_component::terminal::TerminalEvent::Exited(_) = event {
                     // The shell is gone; the next open spawns a fresh one.
-                    this.terminal = None;
+                    this.slot_mut().terminal = None;
                     cx.notify();
                 }
             },
         )
         .detach();
-        self.terminal = Some(spawned);
+        self.slot_mut().terminal = Some(spawned);
     }
 
     /// Spawn a fresh shell in the session's directory, dropping the old one.
     pub fn restart_terminal(&mut self, cx: &mut Context<Self>) {
-        self.terminal = None;
+        self.slot_mut().terminal = None;
         self.ensure_terminal(cx);
         cx.notify();
     }
@@ -1216,6 +1283,7 @@ impl PidoApp {
         let cwd = self.confirm_remove.clone()?;
         let me = cx.entity();
         let label = self
+            .slot()
             .state
             .read(cx)
             .project_labels
@@ -1243,7 +1311,9 @@ impl PidoApp {
             .on_confirm(move |_, cx| {
                 confirm_me.update(cx, |this, cx| {
                     let cwd = this.confirm_remove.take().unwrap_or_default();
-                    this.state.update(cx, |s, cx| s.remove_project(&cwd, cx));
+                    this.slot()
+                        .state
+                        .update(cx, |s, cx| s.remove_project(&cwd, cx));
                     cx.notify();
                 });
             })
@@ -1254,7 +1324,7 @@ impl PidoApp {
     /// Open the rename dialog over the current session's name.
     pub fn open_rename(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let (target, current) = {
-            let state = self.state.read(cx);
+            let state = self.slot().state.read(cx);
             (
                 state.session_file.clone(),
                 state.session_name.clone().unwrap_or_default(),
@@ -1274,7 +1344,7 @@ impl PidoApp {
         cx: &mut Context<Self>,
     ) {
         let prefill = {
-            let state = self.state.read(cx);
+            let state = self.slot().state.read(cx);
             let open = state.session_file.as_deref().is_some_and(|current| {
                 crate::state::session_key(current) == crate::state::session_key(&path)
             });
@@ -1301,9 +1371,9 @@ impl PidoApp {
             }
             input
         });
-        self.rename_field = Some(field.clone());
-        self.rename_open = true;
-        self.rename_target = target;
+        self.slot_mut().rename_field = Some(field.clone());
+        self.slot_mut().rename_open = true;
+        self.slot_mut().rename_target = target;
         // Enter in the field saves, the same path the Save button takes.
         cx.subscribe(&field, move |this, field, event: &InputEvent, cx| {
             if *event != InputEvent::Submit {
@@ -1320,21 +1390,24 @@ impl PidoApp {
     fn finish_rename(&mut self, field: &gpui::Entity<TextInput>, cx: &mut Context<Self>) {
         let name = field.read(cx).text().to_string();
         if let Some(cwd) = self.rename_project.clone() {
-            self.state
+            self.slot()
+                .state
                 .update(cx, |state, cx| state.rename_project(&cwd, &name, cx));
         } else {
-            match self.rename_target.clone() {
+            match self.slot().rename_target.clone() {
                 Some(path) => self
+                    .slot()
                     .state
                     .update(cx, |state, cx| state.rename_session_at(&path, name, cx)),
                 None => self
+                    .slot()
                     .state
                     .update(cx, |state, cx| state.rename_session(name, cx)),
             }
         }
-        self.rename_open = false;
-        self.rename_field = None;
-        self.rename_target = None;
+        self.slot_mut().rename_open = false;
+        self.slot_mut().rename_field = None;
+        self.slot_mut().rename_target = None;
         self.rename_project = None;
         cx.notify();
     }
@@ -1344,9 +1417,9 @@ impl PidoApp {
     /// the dialog's close paths go through this — a cancel button that
     /// misses a field would rename the wrong thing next time.
     fn close_rename(&mut self, cx: &mut Context<Self>) {
-        self.rename_open = false;
-        self.rename_field = None;
-        self.rename_target = None;
+        self.slot_mut().rename_open = false;
+        self.slot_mut().rename_field = None;
+        self.slot_mut().rename_target = None;
         self.rename_project = None;
         cx.notify();
     }
@@ -1354,19 +1427,19 @@ impl PidoApp {
     /// Whether a dialog owns the keyboard right now. Overlays that open from
     /// shortcuts must not stack themselves on top of one.
     fn modal_open(&self, cx: &App) -> bool {
-        self.rename_open
+        self.slot().rename_open
             || self.confirm_remove.is_some()
-            || self.state.read(cx).pending_dialog.is_some()
+            || self.slot().state.read(cx).pending_dialog.is_some()
     }
 
     fn rename_dialog(&mut self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
         use ely_gpui_component::buttons::{Button, ButtonVariant};
         use ely_gpui_component::overlays::Dialog;
 
-        if !self.rename_open {
+        if !self.slot().rename_open {
             return None;
         }
-        let field = self.rename_field.clone()?;
+        let field = self.slot().rename_field.clone()?;
         let close_me = cx.entity();
         let shut = move |_: &mut Window, cx: &mut App| {
             close_me.update(cx, |this, cx| this.close_rename(cx));
@@ -1430,8 +1503,8 @@ impl PidoApp {
         let request = state.read(cx).pending_dialog.clone()?;
 
         // Keep one field alive per request; rebuild when the request changes.
-        if self.dialog_field_for.as_deref() != Some(request.id.as_str()) {
-            self.dialog_field_for = Some(request.id.clone());
+        if self.slot().dialog_field_for.as_deref() != Some(request.id.as_str()) {
+            self.slot_mut().dialog_field_for = Some(request.id.clone());
             let field = cx.new(|cx| {
                 let mut input = match request.method {
                     pi_rpc::protocol::ExtensionUiMethod::Editor => {
@@ -1445,7 +1518,7 @@ impl PidoApp {
                 }
                 input
             });
-            self.dialog_field = Some(field.clone());
+            self.slot_mut().dialog_field = Some(field.clone());
 
             // Enter (or the multi-line submit key) answers the dialog; this
             // is the same path the buttons take.
@@ -1473,7 +1546,7 @@ impl PidoApp {
             .to_string()
         });
 
-        let field = self.dialog_field.clone()?;
+        let field = self.slot().dialog_field.clone()?;
         let cancel_state = state.clone();
         let cancel_id = request.id.clone();
         let shut = move |_: &mut Window, cx: &mut App| {
