@@ -150,6 +150,12 @@ pub struct PidoApp {
     right_open: bool,
     /// The sidebar's session-search field, created once in setup.
     pub search_field: Option<gpui::Entity<TextInput>>,
+    /// The update banner's state; `None` while nothing is worth showing.
+    /// Shell-owned: it outlives any one session slot.
+    pub update: Option<crate::update::UpdateStatus>,
+    /// Set once a manual check asked for visible feedback when there is
+    /// nothing new (a background check stays silent).
+    update_manual: bool,
 }
 
 /// The transcript find bar: the query field, the rows that match and which
@@ -198,7 +204,13 @@ pub enum RightTab {
 impl PidoApp {
     pub fn new(cx: &mut Context<Self>) -> Self {
         let focus = cx.focus_handle();
-        let state = AppState::new(cx);
+        // One scanner serves every slot the shell will ever hold.
+        let state = AppState::new(
+            cx,
+            std::sync::Arc::new(std::sync::Mutex::new(
+                pi_rpc::sessions::SessionScanner::default(),
+            )),
+        );
         // Re-render whenever the active slot's state entity changes, and
         // drain any text a cancelled/failed action wants restored into the
         // composer. Later milestones re-subscribe when the active slot
@@ -272,6 +284,8 @@ impl PidoApp {
             right_tab: RightTab::Diff,
             right_open,
             search_field: None,
+            update: None,
+            update_manual: false,
         };
         app.observe_window_for_quit(cx);
         app
@@ -286,6 +300,248 @@ impl PidoApp {
     /// The active slot for mutation; same single-slot guarantee.
     pub fn slot_mut(&mut self) -> &mut SessionSlot {
         self.slots.get_mut(self.active).expect("active slot")
+    }
+
+    // -- update --------------------------------------------------------------
+
+    /// Ask GitHub for the newest release. `manual` checks surface a notice
+    /// when nothing is new; the startup check stays silent unless there is an
+    /// update worth showing. Network failures never interrupt the user unless
+    /// the check was manual.
+    pub fn check_for_updates(&mut self, manual: bool, cx: &mut Context<Self>) {
+        if std::env::var_os("PIDO_NO_UPDATE_CHECK").is_some() {
+            return;
+        }
+        if !manual
+            && crate::settings::Settings::load()
+                .update_check
+                .is_some_and(|enabled| !enabled)
+        {
+            return;
+        }
+        // One check at a time; a second would race the first's banner.
+        if matches!(
+            self.update,
+            Some(
+                crate::update::UpdateStatus::Downloading { .. }
+                    | crate::update::UpdateStatus::ReadyToRestart { .. }
+            )
+        ) {
+            return;
+        }
+        self.update_manual = manual;
+        cx.spawn(async move |this, cx| {
+            let fetched = cx
+                .background_executor()
+                .spawn(async { crate::update::fetch_latest() })
+                .await;
+            this.update(cx, |s, cx| {
+                // Manual-check feedback rides the active session's notice
+                // queue, exactly where a v0.4.0 user saw it.
+                let announce = |s: &mut Self, cx: &mut Context<Self>, kind, text: String| {
+                    s.slot()
+                        .state
+                        .update(cx, |state, _| state.push_notice(kind, text));
+                };
+                match fetched {
+                    Ok(release) if crate::update::is_newer(&release.tag) => {
+                        log::info!(
+                            "update: {} is newer than {}",
+                            release.tag,
+                            crate::update::CURRENT
+                        );
+                        s.update = Some(crate::update::UpdateStatus::Available {
+                            version: release.tag.trim_start_matches('v').to_string(),
+                            page: release.page,
+                            asset_url: release.asset_url,
+                            asset_size: release.asset_size,
+                            checksum_url: release.checksum_url,
+                            installable: crate::update::appimage_path().is_some(),
+                            dismissed: false,
+                        });
+                    }
+                    Ok(release) => {
+                        log::info!("update: {} is the latest release", release.tag);
+                        if s.update_manual {
+                            announce(
+                                s,
+                                cx,
+                                crate::state::NoticeKind::Info,
+                                i18n::t_arg(cx, "update_none", "v", crate::update::CURRENT)
+                                    .to_string(),
+                            );
+                        }
+                    }
+                    Err(error) => {
+                        log::info!("update check failed: {error:#}");
+                        if s.update_manual {
+                            announce(
+                                s,
+                                cx,
+                                crate::state::NoticeKind::Warn,
+                                i18n::t_arg(cx, "update_check_failed", "e", &error.to_string())
+                                    .to_string(),
+                            );
+                        }
+                    }
+                }
+                s.update_manual = false;
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Hide the update banner: "not now" on an available release, or "later"
+    /// on one already swapped in (it takes effect at the next launch).
+    pub fn dismiss_update(&mut self, cx: &mut Context<Self>) {
+        match &mut self.update {
+            Some(crate::update::UpdateStatus::Available { dismissed, .. }) => {
+                *dismissed = true;
+                cx.notify();
+            }
+            Some(
+                crate::update::UpdateStatus::Failed { .. }
+                | crate::update::UpdateStatus::ReadyToRestart { .. },
+            ) => {
+                self.update = None;
+                cx.notify();
+            }
+            _ => {}
+        }
+    }
+
+    /// Fetch the new AppImage beside the running one, verify its checksum and
+    /// swap it in. Only meaningful when this build runs as an AppImage.
+    pub fn start_update_download(&mut self, cx: &mut Context<Self>) {
+        let Some(crate::update::UpdateStatus::Available {
+            version,
+            asset_url: Some(url),
+            checksum_url,
+            ..
+        }) = &self.update
+        else {
+            return;
+        };
+        let (version, url, checksum_url) = (version.clone(), url.clone(), checksum_url.clone());
+        let Some(target) = crate::update::appimage_path() else {
+            return;
+        };
+        // `.part` lives beside the AppImage so the final rename is atomic.
+        let part = target.with_extension("AppImage.part");
+        self.update = Some(crate::update::UpdateStatus::Downloading {
+            received: 0,
+            total: 0,
+        });
+        cx.notify();
+
+        // Progress crosses from the blocking download to the UI through
+        // plain atomics; the ticker below turns them into banner updates a
+        // few times a second.
+        let received = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let total = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        {
+            let (received, total, done) = (received.clone(), total.clone(), done.clone());
+            cx.spawn(async move |this, cx| {
+                loop {
+                    cx.background_executor()
+                        .timer(std::time::Duration::from_millis(250))
+                        .await;
+                    let finished = done.load(std::sync::atomic::Ordering::Relaxed);
+                    let (got, size) = (
+                        received.load(std::sync::atomic::Ordering::Relaxed),
+                        total.load(std::sync::atomic::Ordering::Relaxed),
+                    );
+                    this.update(cx, |s, cx| {
+                        if matches!(
+                            s.update,
+                            Some(crate::update::UpdateStatus::Downloading { .. })
+                        ) {
+                            s.update = Some(crate::update::UpdateStatus::Downloading {
+                                received: got,
+                                total: size,
+                            });
+                            cx.notify();
+                        }
+                    })
+                    .ok();
+                    if finished {
+                        break;
+                    }
+                }
+            })
+            .detach();
+        }
+        let part_for_cleanup = part.clone();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn({
+                    let part = part.clone();
+                    let (received, total, done) = (received.clone(), total.clone(), done.clone());
+                    async move {
+                        let outcome = (|| {
+                            let checksum = match &checksum_url {
+                                Some(url) => {
+                                    let text = crate::update::fetch_text(url)?;
+                                    crate::update::parse_sha256(&text).ok_or_else(|| {
+                                        anyhow::anyhow!("unreadable checksum file")
+                                    })?
+                                }
+                                None => anyhow::bail!("release carries no checksum"),
+                            };
+                            crate::update::download(&url, &part, |got, size| {
+                                received.store(got, std::sync::atomic::Ordering::Relaxed);
+                                total.store(size, std::sync::atomic::Ordering::Relaxed);
+                            })?;
+                            crate::update::verify_sha256(&part, &checksum)?;
+                            crate::update::replace_in_place(&part, &target)?;
+                            Ok::<(), anyhow::Error>(())
+                        })();
+                        done.store(true, std::sync::atomic::Ordering::Relaxed);
+                        outcome
+                    }
+                })
+                .await;
+            this.update(cx, |s, cx| {
+                match result {
+                    Ok(()) => {
+                        s.update = Some(crate::update::UpdateStatus::ReadyToRestart { version });
+                    }
+                    Err(error) => {
+                        let _ = std::fs::remove_file(&part_for_cleanup);
+                        s.update = Some(crate::update::UpdateStatus::Failed {
+                            message: error.to_string(),
+                        });
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Relaunch the (already replaced) AppImage and quit this process.
+    pub fn restart_into_update(&mut self, cx: &mut Context<Self>) {
+        let Some(path) = crate::update::appimage_path() else {
+            return;
+        };
+        let mut command = std::process::Command::new(&path);
+        if let Some(cwd) = self.slot().state.read(cx).cwd.clone() {
+            command.current_dir(cwd);
+        }
+        match command.spawn() {
+            Ok(_) => cx.quit(),
+            Err(error) => {
+                self.update = Some(crate::update::UpdateStatus::Failed {
+                    message: format!("{}: {error}", path.display()),
+                });
+                cx.notify();
+            }
+        }
     }
 
     /// Stash the window size on every render and persist it when the app
@@ -334,9 +590,7 @@ impl PidoApp {
         }
         // Look for a newer release in the background; the banner appears when
         // one exists. A failure stays silent — the user did not ask.
-        self.slot()
-            .state
-            .update(cx, |s, cx| s.check_for_updates(false, cx));
+        self.check_for_updates(false, cx);
         cx.notify();
     }
 
@@ -1016,9 +1270,7 @@ impl PidoApp {
                     }
                 }
                 PaletteAction::CheckUpdate => {
-                    this.slot()
-                        .state
-                        .update(cx, |s, cx| s.check_for_updates(true, cx));
+                    this.check_for_updates(true, cx);
                 }
                 PaletteAction::InsertFile(file) => {
                     if let Some(draft) = &this.slot().draft {

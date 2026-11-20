@@ -17,6 +17,35 @@ use sha2::{Digest as _, Sha256};
 /// step at release time.
 pub const CURRENT: &str = env!("CARGO_PKG_VERSION");
 
+/// Where an update check stands. The shell's banner reads this instead of a
+/// session's notice queue, which a reconnect would clear.
+#[derive(Debug, Clone, PartialEq)]
+pub enum UpdateStatus {
+    /// A newer release exists. `installable` is false on builds that cannot
+    /// replace themselves (a source build, or a platform without an updater).
+    Available {
+        version: String,
+        page: String,
+        asset_url: Option<String>,
+        asset_size: u64,
+        checksum_url: Option<String>,
+        installable: bool,
+        dismissed: bool,
+    },
+    /// Fetching the new AppImage; `total` is 0 when the server sent no length.
+    Downloading {
+        received: u64,
+        total: u64,
+    },
+    /// The verified AppImage is in place; the next launch is the new version.
+    ReadyToRestart {
+        version: String,
+    },
+    Failed {
+        message: String,
+    },
+}
+
 /// The repo's latest-release page. It redirects to `/releases/tag/<tag>`,
 /// which needs no API token and is not subject to the API's per-IP rate
 /// limit (shared egress IPs hit that limit quickly).

@@ -5,6 +5,7 @@
 //! `~/Library/Application Support/pido` on macOS).
 
 use std::path::PathBuf;
+use std::sync::{Mutex, OnceLock};
 
 use serde::{Deserialize, Serialize};
 
@@ -105,8 +106,22 @@ impl Settings {
     }
 }
 
+/// Serializes every read-modify-write of the settings file. Later
+/// milestones back several sessions with one process; two of them saving
+/// at once would otherwise drop each other's fields, since a save replaces
+/// the whole file (and the Windows path removes the old file first).
+fn settings_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
+
 /// Load, mutate, and persist in one call: `save_setting(|s| s.theme = ...)`.
 pub fn save_setting(apply: impl FnOnce(&mut Settings)) {
+    // A poisoned lock only means a previous writer panicked mid-apply; the
+    // file itself is intact, so carry on rather than deadlock later saves.
+    let _guard = settings_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let mut settings = Settings::load();
     apply(&mut settings);
     settings.save();

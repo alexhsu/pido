@@ -278,7 +278,7 @@ pub fn render_transcript(
             .collect::<Vec<_>>();
         (empty, notices, s.visible_rows(), s.session_epoch)
     };
-    let update_banner = render_update_banner(state, cx);
+    let update_banner = render_update_banner(app, view, cx);
     let version_banner = render_version_banner(state, cx);
     let count = visible.len();
 
@@ -1086,17 +1086,21 @@ fn compact_tokens(tokens: u64) -> String {
 
 /// The update banner: a newer release exists, is downloading, is ready to
 /// launch, or failed. One row; its buttons depend on the state.
-fn render_update_banner(state: &Entity<AppState>, cx: &App) -> Option<AnyElement> {
+fn render_update_banner(
+    shell: &crate::ui::app::PidoApp,
+    view: &Entity<crate::ui::app::PidoApp>,
+    cx: &App,
+) -> Option<AnyElement> {
     use ely_gpui_component::buttons::{Button, IconButton};
     use ely_gpui_component::primitives::IconName;
 
-    let status = state.read(cx).update.clone()?;
+    let status = shell.update.clone()?;
     let theme = cx.theme();
     let (fill, ink) = (theme.colors.info_subtle, theme.colors.info);
 
     let mut actions: Vec<AnyElement> = Vec::new();
     let text: String = match status {
-        crate::state::UpdateStatus::Available {
+        crate::update::UpdateStatus::Available {
             version,
             page,
             asset_url,
@@ -1109,12 +1113,12 @@ fn render_update_banner(state: &Entity<AppState>, cx: &App) -> Option<AnyElement
                 return None;
             }
             if installable && asset_url.is_some() && checksum_url.is_some() {
-                let app = state.clone();
+                let banner_view_1 = view.clone();
                 actions.push(
                     Button::new("update-now", i18n::t(cx, "update_now"))
                         .primary()
                         .on_click(move |_, _, cx| {
-                            app.update(cx, |s, cx| s.start_update_download(cx));
+                            banner_view_1.update(cx, |this, cx| this.start_update_download(cx));
                         })
                         .into_any_element(),
                 );
@@ -1128,18 +1132,18 @@ fn render_update_banner(state: &Entity<AppState>, cx: &App) -> Option<AnyElement
             }
             // "Not now" must exist: without it the banner would stay until
             // the user updates or restarts.
-            let app = state.clone();
+            let banner_view_2 = view.clone();
             actions.push(
                 IconButton::new("update-not-now", IconName::X)
                     .tooltip(i18n::t(cx, "later"))
                     .on_click(move |_, _, cx| {
-                        app.update(cx, |s, cx| s.dismiss_update(cx));
+                        banner_view_2.update(cx, |this, cx| this.dismiss_update(cx));
                     })
                     .into_any_element(),
             );
             i18n::t_arg(cx, "update_available", "v", &version).to_string()
         }
-        crate::state::UpdateStatus::Downloading { received, total } => {
+        crate::update::UpdateStatus::Downloading { received, total } => {
             if let Some(percent) = received.saturating_mul(100).checked_div(total) {
                 i18n::t_arg(cx, "update_downloading", "p", &percent.to_string()).to_string()
             } else {
@@ -1152,41 +1156,41 @@ fn render_update_banner(state: &Entity<AppState>, cx: &App) -> Option<AnyElement
                 .to_string()
             }
         }
-        crate::state::UpdateStatus::ReadyToRestart { version } => {
-            let app = state.clone();
+        crate::update::UpdateStatus::ReadyToRestart { version } => {
+            let banner_view_3 = view.clone();
             actions.push(
                 Button::new("update-restart", i18n::t(cx, "restart_now"))
                     .primary()
                     .on_click(move |_, _, cx| {
-                        app.update(cx, |s, cx| s.restart_into_update(cx));
+                        banner_view_3.update(cx, |this, cx| this.restart_into_update(cx));
                     })
                     .into_any_element(),
             );
-            let app = state.clone();
+            let banner_view_4 = view.clone();
             actions.push(
                 Button::new("update-later", i18n::t(cx, "later"))
                     .on_click(move |_, _, cx| {
-                        app.update(cx, |s, cx| s.dismiss_update(cx));
+                        banner_view_4.update(cx, |this, cx| this.dismiss_update(cx));
                     })
                     .into_any_element(),
             );
             i18n::t_arg(cx, "update_ready", "v", &version).to_string()
         }
-        crate::state::UpdateStatus::Failed { message } => {
-            let app = state.clone();
+        crate::update::UpdateStatus::Failed { message } => {
+            let banner_view_5 = view.clone();
             actions.push(
                 Button::new("update-retry", i18n::t(cx, "retry"))
                     .on_click(move |_, _, cx| {
-                        app.update(cx, |s, cx| s.start_update_download(cx));
+                        banner_view_5.update(cx, |this, cx| this.start_update_download(cx));
                     })
                     .into_any_element(),
             );
-            let app = state.clone();
+            let banner_view_6 = view.clone();
             actions.push(
                 IconButton::new("update-dismiss", IconName::X)
                     .tooltip(i18n::t(cx, "dismiss"))
                     .on_click(move |_, _, cx| {
-                        app.update(cx, |s, cx| s.dismiss_update(cx));
+                        banner_view_6.update(cx, |this, cx| this.dismiss_update(cx));
                     })
                     .into_any_element(),
             );

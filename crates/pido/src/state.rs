@@ -27,35 +27,6 @@ use crate::i18n;
 /// window "connecting" for minutes.
 const INIT_TIMEOUT: Duration = Duration::from_secs(20);
 
-/// Where an update check stands. The banner reads this instead of the
-/// notice queue, which a reconnect would clear.
-#[derive(Debug, Clone, PartialEq)]
-pub enum UpdateStatus {
-    /// A newer release exists. `installable` is false on builds that cannot
-    /// replace themselves (a source build, or a platform without an updater).
-    Available {
-        version: String,
-        page: String,
-        asset_url: Option<String>,
-        asset_size: u64,
-        checksum_url: Option<String>,
-        installable: bool,
-        dismissed: bool,
-    },
-    /// Fetching the new AppImage; `total` is 0 when the server sent no length.
-    Downloading {
-        received: u64,
-        total: u64,
-    },
-    /// The verified AppImage is in place; the next launch is the new version.
-    ReadyToRestart {
-        version: String,
-    },
-    Failed {
-        message: String,
-    },
-}
-
 /// How the connection to pi stands.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Conn {
@@ -1040,11 +1011,6 @@ pub struct AppState {
     /// a generation that retires stale background content searches.
     search_query: String,
     search_gen: u64,
-    /// The update banner's state; `None` while nothing is worth showing.
-    pub update: Option<UpdateStatus>,
-    /// Set once a manual check asked for visible feedback when there is
-    /// nothing new (a background check stays silent).
-    update_manual: bool,
     /// Content-search hits: session file path → the snippet that matched.
     content_hits: Vec<(String, String)>,
     /// Why the client last died, for the give-up banner.
@@ -1152,7 +1118,13 @@ pub struct AppState {
 }
 
 impl AppState {
-    pub fn new(cx: &mut App) -> Entity<Self> {
+    /// `session_scan` is shared across the app's session slots, so their
+    /// background scans reuse one incremental cache instead of each slot
+    /// re-reading every file.
+    pub fn new(
+        cx: &mut App,
+        session_scan: std::sync::Arc<std::sync::Mutex<sessions::SessionScanner>>,
+    ) -> Entity<Self> {
         let persisted = crate::settings::Settings::load();
         let last_project = persisted.last_project;
         let queue_mode = persisted
@@ -1235,10 +1207,8 @@ impl AppState {
                 steer_mode: None,
                 follow_up_mode: None,
                 search_gen: 0,
-                update: None,
-                update_manual: false,
                 content_hits: Vec::new(),
-                session_scan: Arc::new(Mutex::new(sessions::SessionScanner::default())),
+                session_scan,
                 client: None,
             };
             state.probe_environment(cx);
@@ -1261,7 +1231,27 @@ impl AppState {
     /// screen. Only providers present in `auth.json` (plus the common ones
     /// for env-var auth) are checked, in parallel so startup is not serialized
     /// behind several Node processes.
+    ///
+    /// The result is stored process-wide: every session slot would otherwise
+    /// re-run the `pi --version` + `pi auth check` fleet. Slots are created
+    /// seconds apart by user action, so a first-caller-wins race here is
+    /// harmless — the loser re-probes and overwrites with fresher data.
     fn probe_environment(&self, cx: &Context<Self>) {
+        if let Ok(cached) = Self::shared_environment().lock()
+            && let Some(env) = cached.clone()
+        {
+            let auto_retry = env.auto_retry;
+            cx.spawn(async move |this, cx| {
+                this.update(cx, |s, cx| {
+                    s.auto_retry = Some(auto_retry);
+                    s.environment = env;
+                    cx.notify();
+                })
+                .ok();
+            })
+            .detach();
+            return;
+        }
         let cwd = self.cwd.clone();
         cx.spawn(async move |this, cx| {
             let found = cx
@@ -1305,6 +1295,9 @@ impl AppState {
                     }
                 })
                 .await;
+            if let Ok(mut cached) = Self::shared_environment().lock() {
+                *cached = Some(found.clone());
+            }
             this.update(cx, |s, cx| {
                 s.auto_retry = Some(found.auto_retry);
                 s.environment = found;
@@ -1313,6 +1306,13 @@ impl AppState {
             .ok();
         })
         .detach();
+    }
+
+    /// The process-wide environment probe store; see `probe_environment`.
+    fn shared_environment() -> &'static std::sync::Mutex<Option<Environment>> {
+        static CELL: std::sync::OnceLock<std::sync::Mutex<Option<Environment>>> =
+            std::sync::OnceLock::new();
+        CELL.get_or_init(|| std::sync::Mutex::new(None))
     }
 
     // -- session lifecycle --------------------------------------------------
@@ -3617,226 +3617,6 @@ impl AppState {
 
     // -- updates ------------------------------------------------------------
 
-    /// Ask GitHub for the newest release. `manual` checks surface a notice
-    /// when nothing is new; the startup check stays silent unless there is an
-    /// update worth showing. Network failures never interrupt the user unless
-    /// the check was manual.
-    pub fn check_for_updates(&mut self, manual: bool, cx: &mut Context<Self>) {
-        if std::env::var_os("PIDO_NO_UPDATE_CHECK").is_some() {
-            return;
-        }
-        if !manual
-            && crate::settings::Settings::load()
-                .update_check
-                .is_some_and(|enabled| !enabled)
-        {
-            return;
-        }
-        // One check at a time; a second would race the first's banner.
-        if matches!(
-            self.update,
-            Some(UpdateStatus::Downloading { .. } | UpdateStatus::ReadyToRestart { .. })
-        ) {
-            return;
-        }
-        self.update_manual = manual;
-        cx.spawn(async move |this, cx| {
-            let fetched = cx
-                .background_executor()
-                .spawn(async { crate::update::fetch_latest() })
-                .await;
-            this.update(cx, |s, cx| {
-                match fetched {
-                    Ok(release) if crate::update::is_newer(&release.tag) => {
-                        log::info!(
-                            "update: {} is newer than {}",
-                            release.tag,
-                            crate::update::CURRENT
-                        );
-                        s.update = Some(UpdateStatus::Available {
-                            version: release.tag.trim_start_matches('v').to_string(),
-                            page: release.page,
-                            asset_url: release.asset_url,
-                            asset_size: release.asset_size,
-                            checksum_url: release.checksum_url,
-                            installable: crate::update::appimage_path().is_some(),
-                            dismissed: false,
-                        });
-                    }
-                    Ok(release) => {
-                        log::info!("update: {} is the latest release", release.tag);
-                        if s.update_manual {
-                            s.push_notice(
-                                NoticeKind::Info,
-                                i18n::t_arg(cx, "update_none", "v", crate::update::CURRENT)
-                                    .to_string(),
-                            );
-                        }
-                    }
-                    Err(error) => {
-                        log::info!("update check failed: {error:#}");
-                        if s.update_manual {
-                            s.push_notice(
-                                NoticeKind::Warn,
-                                i18n::t_arg(cx, "update_check_failed", "e", &error.to_string())
-                                    .to_string(),
-                            );
-                        }
-                    }
-                }
-                s.update_manual = false;
-                cx.notify();
-            })
-            .ok();
-        })
-        .detach();
-    }
-
-    /// Hide the update banner: "not now" on an available release, or "later"
-    /// on one already swapped in (it takes effect at the next launch).
-    pub fn dismiss_update(&mut self, cx: &mut Context<Self>) {
-        match &mut self.update {
-            Some(UpdateStatus::Available { dismissed, .. }) => {
-                *dismissed = true;
-                cx.notify();
-            }
-            Some(UpdateStatus::Failed { .. } | UpdateStatus::ReadyToRestart { .. }) => {
-                self.update = None;
-                cx.notify();
-            }
-            _ => {}
-        }
-    }
-
-    /// Fetch the new AppImage beside the running one, verify its checksum and
-    /// swap it in. Only meaningful when this build runs as an AppImage.
-    pub fn start_update_download(&mut self, cx: &mut Context<Self>) {
-        let Some(UpdateStatus::Available {
-            version,
-            asset_url: Some(url),
-            checksum_url,
-            ..
-        }) = &self.update
-        else {
-            return;
-        };
-        let (version, url, checksum_url) = (version.clone(), url.clone(), checksum_url.clone());
-        let Some(target) = crate::update::appimage_path() else {
-            return;
-        };
-        // `.part` lives beside the AppImage so the final rename is atomic.
-        let part = target.with_extension("AppImage.part");
-        self.update = Some(UpdateStatus::Downloading {
-            received: 0,
-            total: 0,
-        });
-        cx.notify();
-
-        // Progress crosses from the blocking download to the UI through
-        // plain atomics; the ticker below turns them into banner updates a
-        // few times a second.
-        let received = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
-        let total = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
-        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        {
-            let (received, total, done) = (received.clone(), total.clone(), done.clone());
-            cx.spawn(async move |this, cx| {
-                loop {
-                    cx.background_executor()
-                        .timer(std::time::Duration::from_millis(250))
-                        .await;
-                    let finished = done.load(std::sync::atomic::Ordering::Relaxed);
-                    let (got, size) = (
-                        received.load(std::sync::atomic::Ordering::Relaxed),
-                        total.load(std::sync::atomic::Ordering::Relaxed),
-                    );
-                    this.update(cx, |s, cx| {
-                        if matches!(s.update, Some(UpdateStatus::Downloading { .. })) {
-                            s.update = Some(UpdateStatus::Downloading {
-                                received: got,
-                                total: size,
-                            });
-                            cx.notify();
-                        }
-                    })
-                    .ok();
-                    if finished {
-                        break;
-                    }
-                }
-            })
-            .detach();
-        }
-        let part_for_cleanup = part.clone();
-        cx.spawn(async move |this, cx| {
-            let result = cx
-                .background_executor()
-                .spawn({
-                    let part = part.clone();
-                    let (received, total, done) = (received.clone(), total.clone(), done.clone());
-                    async move {
-                        let outcome = (|| {
-                            let checksum = match &checksum_url {
-                                Some(url) => {
-                                    let text = crate::update::fetch_text(url)?;
-                                    crate::update::parse_sha256(&text).ok_or_else(|| {
-                                        anyhow::anyhow!("unreadable checksum file")
-                                    })?
-                                }
-                                None => anyhow::bail!("release carries no checksum"),
-                            };
-                            crate::update::download(&url, &part, |got, size| {
-                                received.store(got, std::sync::atomic::Ordering::Relaxed);
-                                total.store(size, std::sync::atomic::Ordering::Relaxed);
-                            })?;
-                            crate::update::verify_sha256(&part, &checksum)?;
-                            crate::update::replace_in_place(&part, &target)?;
-                            Ok::<(), anyhow::Error>(())
-                        })();
-                        done.store(true, std::sync::atomic::Ordering::Relaxed);
-                        outcome
-                    }
-                })
-                .await;
-            this.update(cx, |s, cx| {
-                match result {
-                    Ok(()) => {
-                        s.update = Some(UpdateStatus::ReadyToRestart { version });
-                    }
-                    Err(error) => {
-                        let _ = std::fs::remove_file(&part_for_cleanup);
-                        s.update = Some(UpdateStatus::Failed {
-                            message: error.to_string(),
-                        });
-                    }
-                }
-                cx.notify();
-            })
-            .ok();
-        })
-        .detach();
-    }
-
-    /// Relaunch the (already replaced) AppImage and quit this process.
-    pub fn restart_into_update(&mut self, cx: &mut Context<Self>) {
-        let Some(path) = crate::update::appimage_path() else {
-            return;
-        };
-        let mut command = std::process::Command::new(&path);
-        if let Some(cwd) = &self.cwd {
-            command.current_dir(cwd);
-        }
-        match command.spawn() {
-            Ok(_) => cx.quit(),
-            Err(error) => {
-                self.update = Some(UpdateStatus::Failed {
-                    message: format!("{}: {error}", path.display()),
-                });
-                cx.notify();
-            }
-        }
-    }
-
     pub fn compact_now(&mut self, cx: &Context<Self>) {
         self.check_command(
             Command::Compact {
@@ -5939,8 +5719,6 @@ mod tests {
             steer_mode: None,
             follow_up_mode: None,
             search_gen: 0,
-            update: None,
-            update_manual: false,
             content_hits: Vec::new(),
             session_scan: Arc::new(Mutex::new(sessions::SessionScanner::default())),
             client: None,
