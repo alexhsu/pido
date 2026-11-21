@@ -211,6 +211,9 @@ const ZH_STRINGS: &[(&str, &str)] = &[
     ("tree_fork_here", "从这里分叉"),
     ("tree_empty", "此会话还没有分支记录"),
     ("tree_no_session", "打开会话后可查看分支树"),
+    ("stop_session_run", "停止后台运行"),
+    ("close_session_slot", "关闭后台会话"),
+    ("slot_cap", "后台会话已达上限(4),先关闭一个再继续"),
 ];
 
 /// The English catalog.
@@ -421,6 +424,12 @@ const EN_STRINGS: &[(&str, &str)] = &[
     ("tree_fork_here", "Fork from here"),
     ("tree_empty", "No branches recorded in this session yet"),
     ("tree_no_session", "Open a session to see its branch tree"),
+    ("stop_session_run", "Stop the background run"),
+    ("close_session_slot", "Close the background session"),
+    (
+        "slot_cap",
+        "At the 4-session cap — close one before starting another",
+    ),
 ];
 
 /// Install the catalogs with `default` as the starting locale (the persisted

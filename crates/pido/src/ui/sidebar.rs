@@ -25,7 +25,8 @@ use gpui::{
 
 use crate::i18n;
 use crate::state::{AppState, Conn, NoticeKind, SidebarRow};
-use crate::ui::app::PidoApp;
+use crate::ui::app::{PidoApp, SlotStatus};
+use ely_gpui_component::motion::Spinner;
 
 /// Render the whole sidebar. Session clicks switch the running pi process to
 /// that session file; a right click opens its menu.
@@ -33,6 +34,7 @@ pub fn render(
     state: &Entity<AppState>,
     view: &Entity<PidoApp>,
     search_field: Option<gpui::Entity<ely_gpui_component::forms::TextInput>>,
+    status: &SlotStatus,
     window: &Window,
     cx: &App,
 ) -> impl IntoElement + use<> {
@@ -243,6 +245,7 @@ pub fn render(
                     let rows = s.sidebar_rows.clone();
                     let state = state.clone();
                     let view = view.clone();
+                    let status = status.clone();
                     let (text_sm, text_xs, radius_md) = (text_sm, text_xs, radius_md);
                     this.child(
                         VirtualList::new("sessions", rows.len(), move |ix, _, cx| {
@@ -280,6 +283,7 @@ pub fn render(
                                     ix,
                                     &state,
                                     &view,
+                                    &status,
                                     path.clone(),
                                     session_id.clone(),
                                     title.clone(),
@@ -443,11 +447,19 @@ fn project_menu(
 /// one step per generation, under the session they were forked from; a
 /// session with forks carries a fold caret.
 #[allow(clippy::too_many_arguments)]
+/// Route a session click through the shell: the slot holding it comes
+/// forward, or a new slot spawns its own pi for it.
+fn shell_open(view: &Entity<PidoApp>, path: &str, cx: &mut App) {
+    view.update(cx, |shell, cx| shell.open_session(path.to_string(), cx));
+}
+
+#[allow(clippy::too_many_arguments)]
 fn session_row(
     cx: &App,
     ix: usize,
     state: &Entity<AppState>,
     view: &Entity<PidoApp>,
+    status: &SlotStatus,
     path: SharedString,
     session_id: SharedString,
     title: SharedString,
@@ -487,7 +499,10 @@ fn session_row(
         .collapsed_sessions
         .contains(crate::state::session_key(&path).as_str());
     let age = i18n::relative_time(cx, updated);
-    let app = state.clone();
+    let row_key = crate::state::session_key(&path);
+    let running = status.running.contains(&row_key);
+    let unread = status.unread.contains(&row_key);
+    let in_slot = status.open.contains(&row_key);
     let click_path = path.clone();
     let fold_path = path.clone();
     let fold_state = state.clone();
@@ -508,10 +523,10 @@ fn session_row(
         .when(!active, |row| {
             row.cursor_pointer().hover(|style| style.bg(colors.hover))
         })
-        .on_click(move |_, _, cx| {
-            app.update(cx, |s, cx| {
-                s.switch_session(std::path::PathBuf::from(click_path.to_string()), cx)
-            });
+        .on_click({
+            let view = view.clone();
+            let click_path = click_path.clone();
+            move |_, _, cx| shell_open(&view, &click_path, cx)
         })
         .child(
             div()
@@ -539,6 +554,20 @@ fn session_row(
                                 fold_state
                                     .update(cx, |s, cx| s.toggle_session_fold(&fold_path, cx));
                             }),
+                    )
+                })
+                .when(running, |row| {
+                    row.child(Spinner::new(("session-running", ix as u64)).size(IconSize::Xs))
+                })
+                .when(!running && unread, |row| {
+                    // Finished unseen: a dot that says "look at me" without
+                    // claiming anything is still happening.
+                    row.child(
+                        div()
+                            .flex_none()
+                            .size(gpui::px(6.0))
+                            .rounded_full()
+                            .bg(colors.info),
                     )
                 })
                 .child(div().flex_1().min_w_0().child(Ellipsis::new(title.clone())))
@@ -579,6 +608,8 @@ fn session_row(
         archived,
         active,
         draft,
+        running,
+        in_slot,
     );
     ContextMenu::new(("session-menu", ix as u64), menu)
         .w_full()
@@ -600,6 +631,8 @@ fn session_menu(
     archived: bool,
     active: bool,
     draft: bool,
+    running: bool,
+    in_slot: bool,
 ) -> Menu {
     let copy = MenuItem::new(i18n::t(cx, "copy_session_id"))
         .icon(IconName::Copy)
@@ -693,7 +726,7 @@ fn session_menu(
         archive = archive.keys("ctrl-shift-a");
     }
 
-    Menu::new()
+    let mut menu = Menu::new()
         .item(pin)
         .item(rename)
         .item(fork)
@@ -701,7 +734,36 @@ fn session_menu(
         .item(copy)
         .item(reveal)
         .separator()
-        .item(archive)
+        .item(archive);
+    // Slot management rides last: stopping or closing a session that no
+    // slot holds would promise something nothing can deliver.
+    if running {
+        menu = menu.item(
+            MenuItem::new(i18n::t(cx, "stop_session_run"))
+                .icon(IconName::CircleStop)
+                .on_click({
+                    let view = view.clone();
+                    let path = path.to_string();
+                    move |_, cx| {
+                        view.update(cx, |shell, cx| shell.stop_session(path.clone(), cx));
+                    }
+                }),
+        );
+    }
+    if in_slot {
+        menu = menu.item(
+            MenuItem::new(i18n::t(cx, "close_session_slot"))
+                .icon(IconName::X)
+                .on_click({
+                    let view = view.clone();
+                    let path = path.to_string();
+                    move |_, cx| {
+                        view.update(cx, |shell, cx| shell.close_session(path.clone(), cx));
+                    }
+                }),
+        );
+    }
+    menu
 }
 
 /// Compare two session paths without caring about separator style; Windows

@@ -47,6 +47,8 @@ fn clamp_width(width: f32, range: &std::ops::RangeInclusive<f32>) -> f32 {
 /// outlive it. M0 keeps exactly one slot — later milestones grow the Vec
 /// so a switched-away session keeps its pi process running.
 pub struct SessionSlot {
+    /// Identifies the slot across Vec reshuffles; observers capture it.
+    id: u64,
     pub state: gpui::Entity<AppState>,
     /// The composer's multi-line field, owned here so it survives re-renders.
     pub draft: Option<gpui::Entity<TextInput>>,
@@ -87,11 +89,20 @@ pub struct SessionSlot {
     /// The session epoch the find bar and palette were opened for; changing
     /// sessions drops both so their indices cannot outlive the transcript.
     session_seen: u64,
+    /// The shell's observe registration for this slot's state; dropped with
+    /// the slot so a closed session stops talking to the shell.
+    subscription: Option<gpui::Subscription>,
+    /// Whether the slot's session was running at the last observation: the
+    /// transition to idle marks it unread while it is in the background.
+    last_running: bool,
+    /// The session finished work while the window showed another slot.
+    pub unread: bool,
 }
 
 impl SessionSlot {
-    fn new(state: gpui::Entity<AppState>) -> Self {
+    fn new(id: u64, state: gpui::Entity<AppState>) -> Self {
         Self {
+            id,
             state,
             draft: None,
             composer_focused: false,
@@ -111,6 +122,9 @@ impl SessionSlot {
             palette_gen: 0,
             palette_selected: 0,
             session_seen: 0,
+            subscription: None,
+            last_running: false,
+            unread: false,
         }
     }
 }
@@ -128,12 +142,18 @@ pub struct PidoApp {
     snap_since: std::rc::Rc<std::cell::Cell<Option<std::time::Instant>>>,
     snap_flip: std::rc::Rc<std::cell::Cell<u64>>,
     pub focus: FocusHandle,
-    /// The backing sessions. M0 keeps exactly one; the accessors route
-    /// everything through the active one.
+    /// The backing sessions. Slot zero exists from startup; opening a
+    /// session that no slot holds grows the Vec, and the sidebar switches
+    /// between them.
     slots: Vec<SessionSlot>,
     /// Which slot the window shows. Always valid: slots are never removed
     /// while it points there.
     active: usize,
+    /// The session scanner every slot shares, created here and handed to
+    /// each new `AppState`.
+    scanner: std::sync::Arc<std::sync::Mutex<pi_rpc::sessions::SessionScanner>>,
+    /// Monotonic slot ids for the observers.
+    next_slot_id: u64,
     /// The welcome screen's project-directory field, created lazily.
     pub welcome_dir: Option<gpui::Entity<TextInput>>,
     /// Last observed window size, persisted on quit.
@@ -156,6 +176,16 @@ pub struct PidoApp {
     /// Set once a manual check asked for visible feedback when there is
     /// nothing new (a background check stays silent).
     update_manual: bool,
+}
+
+/// What the sidebar's session rows need to know about the slots: which
+/// sessions are running (a spinner on the row), which finished unseen (a
+/// dot), and which are open in some slot (menu management entries).
+#[derive(Default, Clone)]
+pub struct SlotStatus {
+    pub running: std::collections::HashSet<String>,
+    pub unread: std::collections::HashSet<String>,
+    pub open: std::collections::HashSet<String>,
 }
 
 /// The transcript find bar: the query field, the rows that match and which
@@ -205,53 +235,10 @@ impl PidoApp {
     pub fn new(cx: &mut Context<Self>) -> Self {
         let focus = cx.focus_handle();
         // One scanner serves every slot the shell will ever hold.
-        let state = AppState::new(
-            cx,
-            std::sync::Arc::new(std::sync::Mutex::new(
-                pi_rpc::sessions::SessionScanner::default(),
-            )),
-        );
-        // Re-render whenever the active slot's state entity changes, and
-        // drain any text a cancelled/failed action wants restored into the
-        // composer. Later milestones re-subscribe when the active slot
-        // changes; M0 has exactly one.
-        cx.observe(&state, |this, state, cx| {
-            // Find matches and palette rows carry transcript indices; a new
-            // session invalidates both.
-            let epoch = state.read(cx).session_epoch;
-            let slot = this.slot_mut();
-            if slot.session_seen != epoch {
-                slot.session_seen = epoch;
-                slot.find = None;
-                slot.palette = None;
-                slot.palette_selected = 0;
-                // A shell left over from the previous session still sits in
-                // its directory; one that never started spawns in the new
-                // cwd when the panel opens.
-                let has_terminal = slot.terminal.is_some();
-                let open_tree = this.right_open && this.right_tab == RightTab::Tree;
-                if has_terminal {
-                    this.restart_terminal(cx);
-                }
-                // The tree tab must not show the old session's branches.
-                if open_tree {
-                    this.slot()
-                        .state
-                        .update(cx, |state, cx| state.refresh_session_tree(cx));
-                }
-            }
-            let restored = state.update(cx, |state, _| state.take_pending_composer_text());
-            if let (Some(text), Some(draft)) = (restored, this.slot().draft.clone()) {
-                draft.update(cx, |input, cx| {
-                    if !input.text().trim().is_empty() {
-                        input.insert("\n", cx);
-                    }
-                    input.insert(&text, cx);
-                });
-            }
-            cx.notify();
-        })
-        .detach();
+        let scanner = std::sync::Arc::new(std::sync::Mutex::new(
+            pi_rpc::sessions::SessionScanner::default(),
+        ));
+        let state = AppState::new(cx, std::sync::Arc::clone(&scanner));
         let persisted = crate::settings::Settings::load();
         let left_px = std::rc::Rc::new(std::cell::Cell::new(
             persisted
@@ -268,14 +255,16 @@ impl PidoApp {
         let snap_since = std::rc::Rc::new(std::cell::Cell::new(None));
         let snap_flip = std::rc::Rc::new(std::cell::Cell::new(0u64));
         let right_open = persisted.right_open.unwrap_or(false);
-        let app = Self {
+        let mut app = Self {
             left_px,
             right_px,
             snap_since,
             snap_flip,
             focus,
-            slots: vec![SessionSlot::new(state)],
+            slots: vec![SessionSlot::new(0, state)],
             active: 0,
+            scanner,
+            next_slot_id: 1,
             welcome_dir: None,
             window_size: None,
             pane_save_at: std::rc::Rc::new(std::cell::Cell::new(None)),
@@ -288,7 +277,227 @@ impl PidoApp {
             update_manual: false,
         };
         app.observe_window_for_quit(cx);
+        app.attach_slot_observer(0, &app.slot().state.clone(), cx);
         app
+    }
+
+    /// Register this slot's state with the shell: epoch transitions reset
+    /// the slot's overlays and respawn its terminal, running/idle
+    /// transitions maintain the sidebar's unread marks, and a cancelled
+    /// action's text returns to the slot's own composer.
+    fn attach_slot_observer(
+        &mut self,
+        id: u64,
+        state: &gpui::Entity<AppState>,
+        cx: &mut Context<Self>,
+    ) {
+        let subscription = cx.observe(state, move |this, state, cx| {
+            let Some(ix) = this.slots.iter().position(|slot| slot.id == id) else {
+                return;
+            };
+            let right_open = this.right_open;
+            let right_tab = this.right_tab;
+            let is_active = this.active == ix;
+            let epoch = state.read(cx).session_epoch;
+            let running = state.read(cx).is_running();
+            let slot = &mut this.slots[ix];
+            // Find matches and palette rows carry transcript indices; a new
+            // session invalidates both.
+            let epoch_changed = slot.session_seen != epoch;
+            if epoch_changed {
+                slot.session_seen = epoch;
+                slot.find = None;
+                slot.palette = None;
+                slot.palette_selected = 0;
+            }
+            // The session finished its work while the window showed
+            // another slot: mark it so the sidebar can point back.
+            let became_idle = slot.last_running && !running && !is_active;
+            if became_idle {
+                slot.unread = true;
+            }
+            slot.last_running = running;
+            let has_terminal = slot.terminal.is_some();
+            let open_tree = right_open && right_tab == RightTab::Tree;
+
+            if became_idle || epoch_changed || is_active {
+                cx.notify();
+            }
+            // A shell left over from the previous session still sits in its
+            // directory; one that never started spawns in the new cwd when
+            // the panel opens.
+            if epoch_changed && has_terminal {
+                this.restart_terminal_for(ix, cx);
+            }
+            // The tree tab must not show the old session's branches.
+            if epoch_changed && open_tree {
+                this.slots[ix]
+                    .state
+                    .update(cx, |state, cx| state.refresh_session_tree(cx));
+            }
+            // A cancelled action's text returns to this slot's composer; a
+            // slot that has not rendered yet keeps it pending until it has
+            // one, so nothing is lost.
+            if this.slots[ix].draft.is_some() {
+                let restored = state.update(cx, |state, _| state.take_pending_composer_text());
+                if let Some(text) = restored {
+                    let draft = this.slots[ix].draft.clone().expect("draft checked above");
+                    draft.update(cx, |input, cx| {
+                        if !input.text().trim().is_empty() {
+                            input.insert("\n", cx);
+                        }
+                        input.insert(&text, cx);
+                    });
+                }
+            }
+        });
+        let slot = self
+            .slots
+            .iter_mut()
+            .find(|slot| slot.id == id)
+            .expect("slot exists");
+        slot.subscription = Some(subscription);
+    }
+
+    // -- slots ---------------------------------------------------------------
+
+    /// The largest fleet of live pi processes; each costs roughly a hundred
+    /// megabytes, and four parallel tasks is already generous.
+    const MAX_LIVE_SLOTS: usize = 4;
+
+    /// Open a session file: the slot that already holds it comes forward
+    /// (instantly — its transcript, draft and panel state are all in
+    /// memory), and otherwise a new slot spawns its own pi for it.
+    pub fn open_session(&mut self, path: String, cx: &mut Context<Self>) {
+        let key = crate::state::session_key(&path);
+        if let Some(ix) = self.slots.iter().position(|slot| {
+            slot.state
+                .read(cx)
+                .session_file
+                .as_deref()
+                .is_some_and(|file| crate::state::session_key(file) == key)
+        }) {
+            self.set_active(ix, cx);
+            return;
+        }
+        let cwd = pi_rpc::sessions::read_session_cwd(std::path::Path::new(&path))
+            .map(std::path::PathBuf::from)
+            .or_else(dirs::home_dir)
+            .unwrap_or_default();
+        self.create_slot(cwd, Some(path), cx);
+    }
+
+    /// Back a new session with a fresh slot: a fresh pi, its own composer
+    /// draft, and its own view state. Evicts the oldest idle live slot when
+    /// the fleet is at capacity; streaming slots are never evicted.
+    fn create_slot(
+        &mut self,
+        cwd: std::path::PathBuf,
+        resume: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        let is_live = |this: &Self, cx: &App| {
+            this.slots
+                .iter()
+                .filter(|slot| {
+                    matches!(
+                        slot.state.read(cx).conn,
+                        crate::state::Conn::Live
+                            | crate::state::Conn::Connecting
+                            | crate::state::Conn::Reconnecting { .. }
+                    )
+                })
+                .count()
+        };
+        while is_live(self, cx) >= Self::MAX_LIVE_SLOTS {
+            let victim = self.slots.iter().position(|slot| {
+                let state = slot.state.read(cx);
+                matches!(
+                    state.conn,
+                    crate::state::Conn::Live
+                        | crate::state::Conn::Connecting
+                        | crate::state::Conn::Reconnecting { .. }
+                ) && !state.is_running()
+            });
+            match victim {
+                Some(ix) => self.close_slot(ix, cx),
+                // Every live slot is busy: say so on the slot the user sees.
+                None => {
+                    self.slot().state.update(cx, |s, cx| {
+                        s.push_notice(
+                            crate::state::NoticeKind::Warn,
+                            i18n::t(cx, "slot_cap").to_string(),
+                        );
+                        cx.notify();
+                    });
+                    return;
+                }
+            }
+        }
+        let id = self.next_slot_id;
+        self.next_slot_id += 1;
+        let state = AppState::new(cx, std::sync::Arc::clone(&self.scanner));
+        let slot = SessionSlot::new(id, state.clone());
+        self.slots.push(slot);
+        let ix = self.slots.len() - 1;
+        self.set_active(ix, cx);
+        let state = self.slots[ix].state.clone();
+        self.attach_slot_observer(id, &state, cx);
+        self.slots[ix].state.update(cx, |s, cx| {
+            s.connect(cwd, resume, crate::state::extra_args(), cx)
+        });
+    }
+
+    /// Show slot `ix`: its view state is already in memory, so this is a
+    /// pointer move plus a sidebar resync — the settings-backed data may
+    /// have moved while this slot slept.
+    fn set_active(&mut self, ix: usize, cx: &mut Context<Self>) {
+        self.active = ix;
+        self.slots[ix].unread = false;
+        self.slots[ix].state.update(cx, |s, cx| s.sync_sidebar(cx));
+        cx.notify();
+    }
+
+    /// Drop a slot entirely: its `AppState` goes with it, and dropping the
+    /// last client handle shuts that pi down.
+    fn close_slot(&mut self, ix: usize, cx: &mut Context<Self>) {
+        let slot = self.slots.remove(ix);
+        drop(slot);
+        if self.active >= self.slots.len() {
+            self.active = self.slots.len().saturating_sub(1);
+        } else if ix < self.active {
+            self.active -= 1;
+        }
+        cx.notify();
+    }
+
+    /// Stop the run in the slot holding `path`, without bringing it forward.
+    pub fn stop_session(&mut self, path: String, cx: &mut Context<Self>) {
+        let key = crate::state::session_key(&path);
+        let Some(ix) = self.slot_index_of_key(&key, cx) else {
+            return;
+        };
+        self.slots[ix].state.update(cx, |s, cx| s.stop(cx));
+    }
+
+    /// Close the slot holding `path`: its pi shuts down and its place in
+    /// the fleet goes to the next task.
+    pub fn close_session(&mut self, path: String, cx: &mut Context<Self>) {
+        let key = crate::state::session_key(&path);
+        let Some(ix) = self.slot_index_of_key(&key, cx) else {
+            return;
+        };
+        self.close_slot(ix, cx);
+    }
+
+    fn slot_index_of_key(&self, key: &str, cx: &App) -> Option<usize> {
+        self.slots.iter().position(|slot| {
+            slot.state
+                .read(cx)
+                .session_file
+                .as_deref()
+                .is_some_and(|file| crate::state::session_key(file) == key)
+        })
     }
 
     /// The session the window shows. M0 keeps exactly one slot, so this is
@@ -629,6 +838,38 @@ impl PidoApp {
                 .update(cx, |s, cx| s.connect(path, resume, extra, cx));
         }
     }
+
+    /// The active slot's composer field, created on first render — slots
+    /// are born without one so a background slot keeps pending text pending.
+    fn ensure_draft_for_active(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.slot().draft.is_none() {
+            let draft = cx.new(|cx| {
+                TextInput::new(window, cx)
+                    .multi_line(1, 8)
+                    .placeholder_key("idle_hint")
+            });
+            self.slot_mut().draft = Some(draft);
+        }
+    }
+
+    fn slot_status(&self, cx: &App) -> SlotStatus {
+        let mut status = SlotStatus::default();
+        for slot in &self.slots {
+            let state = slot.state.read(cx);
+            let Some(file) = state.session_file.clone() else {
+                continue;
+            };
+            let key = crate::state::session_key(&file);
+            if state.is_running() {
+                status.running.insert(key.clone());
+            }
+            if slot.unread {
+                status.unread.insert(key.clone());
+            }
+            status.open.insert(key);
+        }
+        status
+    }
 }
 
 impl Render for PidoApp {
@@ -638,6 +879,8 @@ impl Render for PidoApp {
         let column = theme.container_width(ContainerSize::Md);
         let bounds = window.bounds();
         self.window_size = Some((f32::from(bounds.size.width), f32::from(bounds.size.height)));
+        self.ensure_draft_for_active(window, cx);
+        let slot_status = self.slot_status(cx);
         let state = self.slot().state.clone();
         let live = matches!(state.read(cx).conn, Conn::Live | Conn::Reconnecting { .. });
 
@@ -798,6 +1041,7 @@ impl Render for PidoApp {
                                 &state,
                                 &cx.entity(),
                                 self.search_field.clone(),
+                                &slot_status,
                                 window,
                                 cx,
                             ))
@@ -1247,10 +1491,9 @@ impl PidoApp {
             };
             this.close_palette(window, cx);
             match &item.action {
-                PaletteAction::SwitchSession(path) => this
-                    .slot()
-                    .state
-                    .update(cx, |s, cx| s.switch_session(path.clone(), cx)),
+                PaletteAction::SwitchSession(path) => {
+                    this.open_session(path.to_string_lossy().into_owned(), cx)
+                }
                 PaletteAction::SetModel { provider, model_id } => this
                     .slot()
                     .state
@@ -1448,8 +1691,13 @@ impl PidoApp {
 
     /// The panel's shell, spawned on first use; a dead one spawns again.
     fn ensure_terminal(&mut self, cx: &mut Context<Self>) {
+        let ix = self.active;
+        self.ensure_terminal_for(ix, cx);
+    }
+
+    fn ensure_terminal_for(&mut self, ix: usize, cx: &mut Context<Self>) {
         use ely_gpui_component::terminal::{Launch, Terminal};
-        if self.slot().terminal.is_some() {
+        if self.slots[ix].terminal.is_some() {
             return;
         }
         // PowerShell on Windows; the user's login shell elsewhere.
@@ -1461,8 +1709,7 @@ impl PidoApp {
                 Vec::new(),
             ))
         };
-        let cwd = self
-            .slot()
+        let cwd = self.slots[ix]
             .state
             .read(cx)
             .cwd
@@ -1488,24 +1735,32 @@ impl PidoApp {
                 }
             }
         });
+        let id = self.slots[ix].id;
         cx.subscribe(
             &spawned,
-            |this, _, event: &ely_gpui_component::terminal::TerminalEvent, cx| {
+            move |this, _, event: &ely_gpui_component::terminal::TerminalEvent, cx| {
                 if let ely_gpui_component::terminal::TerminalEvent::Exited(_) = event {
                     // The shell is gone; the next open spawns a fresh one.
-                    this.slot_mut().terminal = None;
+                    if let Some(slot) = this.slots.iter_mut().find(|slot| slot.id == id) {
+                        slot.terminal = None;
+                    }
                     cx.notify();
                 }
             },
         )
         .detach();
-        self.slot_mut().terminal = Some(spawned);
+        self.slots[ix].terminal = Some(spawned);
     }
 
     /// Spawn a fresh shell in the session's directory, dropping the old one.
     pub fn restart_terminal(&mut self, cx: &mut Context<Self>) {
-        self.slot_mut().terminal = None;
-        self.ensure_terminal(cx);
+        let ix = self.active;
+        self.restart_terminal_for(ix, cx);
+    }
+
+    fn restart_terminal_for(&mut self, ix: usize, cx: &mut Context<Self>) {
+        self.slots[ix].terminal = None;
+        self.ensure_terminal_for(ix, cx);
         cx.notify();
     }
 

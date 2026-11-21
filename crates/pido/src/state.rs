@@ -1959,6 +1959,33 @@ impl AppState {
 
     /// Whether `path` is the unsaved session `new_chat` just opened: its row
     /// keeps a draft title until pi writes the file.
+    /// Whether a run is in flight — streaming deltas or a working turn.
+    /// The shell's sidebar status marks read this per slot.
+    pub fn is_running(&self) -> bool {
+        self.streaming || self.turn_running
+    }
+
+    /// Re-read the settings-backed sidebar data (pins, archives, projects,
+    /// labels) and rebuild the rows. Called when a slot becomes active:
+    /// another slot may have changed them while this one slept, and the
+    /// shared scanner cache makes the follow-up scan cheap.
+    pub fn sync_sidebar(&mut self, cx: &mut Context<Self>) {
+        let persisted = crate::settings::Settings::load();
+        self.user_projects = persisted.projects.clone();
+        self.project_labels = persisted.project_labels.iter().cloned().collect();
+        self.pinned_sessions = persisted
+            .pinned_sessions
+            .iter()
+            .map(|path| session_key(path))
+            .collect();
+        self.archived_sessions = persisted
+            .archived_sessions
+            .iter()
+            .map(|path| session_key(path))
+            .collect();
+        self.sidebar_rows = self.sidebar_rows_now();
+        self.refresh_sessions(cx);
+    }
     pub fn is_draft_session(&self, path: &str) -> bool {
         self.draft_session_file
             .as_deref()
