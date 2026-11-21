@@ -50,9 +50,10 @@ pub fn render(
     // mark in front of it. gap_1p5 is 0.375rem at the theme's base size.
     let gap = gpui::Rems(0.375);
     let label_lead = (theme.icon_size(IconSize::Sm) + gap).to_pixels(window.rem_size());
-    let app = state.clone();
     let s = state.read(cx);
-    let can_start = s.conn == Conn::Live && !s.streaming;
+    // Running or not, a new chat has somewhere to go: an idle slot gets
+    // it in place, a running one hands it to a fresh slot.
+    let can_start = s.conn == Conn::Live;
     let empty = s.sidebar_rows.is_empty();
     // The new-chat action is the sidebar's lead button, so it stands half a
     // control taller than a standard button and keeps clear of the edges.
@@ -93,7 +94,6 @@ pub fn render(
                 ),
         )
         .child({
-            let app = app.clone();
             // Ely's `Button` fixes its height to the theme's control size, so
             // this lead action is drawn here with the same surface to sit at
             // 1.5x that height.
@@ -121,7 +121,12 @@ pub fn render(
                             .on_mouse_down(MouseButton::Left, |_, window, _| {
                                 window.prevent_default()
                             })
-                            .on_click(move |_, _, cx| app.update(cx, |s, cx| s.new_chat(cx)))
+                            .on_click({
+                                let view = view.clone();
+                                move |_, _, cx| {
+                                    view.update(cx, |shell, cx| shell.new_chat(cx));
+                                }
+                            })
                     })
                     .when(!can_start, |el| el.opacity(0.45).cursor_not_allowed())
                     .child(

@@ -396,20 +396,7 @@ impl PidoApp {
         resume: Option<String>,
         cx: &mut Context<Self>,
     ) {
-        let is_live = |this: &Self, cx: &App| {
-            this.slots
-                .iter()
-                .filter(|slot| {
-                    matches!(
-                        slot.state.read(cx).conn,
-                        crate::state::Conn::Live
-                            | crate::state::Conn::Connecting
-                            | crate::state::Conn::Reconnecting { .. }
-                    )
-                })
-                .count()
-        };
-        while is_live(self, cx) >= Self::MAX_LIVE_SLOTS {
+        while self.live_slot_count(cx) >= Self::MAX_LIVE_SLOTS {
             let victim = self.slots.iter().position(|slot| {
                 let state = slot.state.read(cx);
                 matches!(
@@ -434,18 +421,46 @@ impl PidoApp {
                 }
             }
         }
+        let ix = self.spawn_slot(cwd, resume, cx);
+        self.set_active(ix, cx);
+    }
+
+    /// Add a slot without touching which one the window shows: used by the
+    /// startup restore, which must not steal the foreground from the slot
+    /// autoconnect just put there.
+    fn spawn_slot(
+        &mut self,
+        cwd: std::path::PathBuf,
+        resume: Option<String>,
+        cx: &mut Context<Self>,
+    ) -> usize {
         let id = self.next_slot_id;
         self.next_slot_id += 1;
         let state = AppState::new(cx, std::sync::Arc::clone(&self.scanner));
         let slot = SessionSlot::new(id, state.clone());
         self.slots.push(slot);
         let ix = self.slots.len() - 1;
-        self.set_active(ix, cx);
         let state = self.slots[ix].state.clone();
         self.attach_slot_observer(id, &state, cx);
         self.slots[ix].state.update(cx, |s, cx| {
             s.connect(cwd, resume, crate::state::extra_args(), cx)
         });
+        ix
+    }
+
+    /// How many slots currently hold a pi process.
+    fn live_slot_count(&self, cx: &App) -> usize {
+        self.slots
+            .iter()
+            .filter(|slot| {
+                matches!(
+                    slot.state.read(cx).conn,
+                    crate::state::Conn::Live
+                        | crate::state::Conn::Connecting
+                        | crate::state::Conn::Reconnecting { .. }
+                )
+            })
+            .count()
     }
 
     /// Show slot `ix`: its view state is already in memory, so this is a
@@ -469,6 +484,25 @@ impl PidoApp {
             self.active -= 1;
         }
         cx.notify();
+    }
+
+    /// Start a new chat. The active slot gets it when it is idle (the user
+    /// is looking at it and it is free); a slot in the middle of a run
+    /// hands the new chat to a fresh slot, so nothing is cut off.
+    pub fn new_chat(&mut self, cx: &mut Context<Self>) {
+        let busy = self.slot().state.read(cx).is_running();
+        if !busy {
+            self.slot().state.update(cx, |s, cx| s.new_chat(cx));
+            return;
+        }
+        let cwd = self
+            .slot()
+            .state
+            .read(cx)
+            .cwd
+            .clone()
+            .unwrap_or_else(|| dirs::home_dir().unwrap_or_default());
+        self.create_slot(cwd, None, cx);
     }
 
     /// Stop the run in the slot holding `path`, without bringing it forward.
@@ -756,15 +790,23 @@ impl PidoApp {
     /// Stash the window size on every render and persist it when the app
     /// quits, so the window reopens where the user left it.
     fn observe_window_for_quit(&self, cx: &mut Context<Self>) {
-        cx.on_app_quit(|this, _cx| {
+        cx.on_app_quit(|this, cx| {
             let (left, right, right_open) =
                 (this.left_px.get(), this.right_px.get(), this.right_open);
+            // The open fleet rides along: the next startup brings every
+            // session back in its own slot.
+            let open_slots: Vec<String> = this
+                .slots
+                .iter()
+                .filter_map(|slot| slot.state.read(cx).session_file.clone())
+                .collect();
             if let Some((width, height)) = this.window_size {
                 crate::settings::save_setting(|s| {
                     s.window = Some(crate::settings::WindowState { width, height });
                     s.sidebar_width = Some(left);
                     s.right_width = Some(right);
                     s.right_open = Some(right_open);
+                    s.open_slots = Some(open_slots);
                 });
             }
             async {}
@@ -835,7 +877,46 @@ impl PidoApp {
         if let Some(path) = dir {
             self.slot()
                 .state
-                .update(cx, |s, cx| s.connect(path, resume, extra, cx));
+                .update(cx, |s, cx| s.connect(path, resume.clone(), extra, cx));
+        }
+        // Bring back the sessions that were open at quit as background
+        // slots; the foreground stays where autoconnect put it. Skipped
+        // under PIDO_AUTOCONNECT (automated checks must not spawn a fleet),
+        // and the fleet keeps one slot of headroom - no eviction at
+        // startup.
+        if std::env::var_os("PIDO_AUTOCONNECT").is_some() {
+            return;
+        }
+        let open = crate::settings::Settings::load()
+            .open_slots
+            .unwrap_or_default();
+        let resumed = resume.as_deref().map(crate::state::session_key);
+        for path in open {
+            if !std::path::Path::new(&path).is_file() {
+                continue;
+            }
+            let key = crate::state::session_key(&path);
+            if resumed.as_deref() == Some(key.as_str()) {
+                continue;
+            }
+            if self.slots.iter().any(|slot| {
+                slot.state
+                    .read(cx)
+                    .session_file
+                    .as_deref()
+                    .is_some_and(|file| crate::state::session_key(file) == key)
+            }) {
+                continue;
+            }
+            if self.live_slot_count(cx) >= Self::MAX_LIVE_SLOTS - 1 {
+                break;
+            }
+            let Some(cwd) = pi_rpc::sessions::read_session_cwd(std::path::Path::new(&path))
+                .map(std::path::PathBuf::from)
+            else {
+                continue;
+            };
+            self.spawn_slot(cwd, Some(path), cx);
         }
     }
 

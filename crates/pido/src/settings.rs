@@ -45,6 +45,9 @@ pub struct Settings {
     pub queue_mode: Option<String>,
     /// Whether to look for a newer release at startup. Absent means yes.
     pub update_check: Option<bool>,
+    /// Sessions open when the app last quit; each restarts in its own slot.
+    #[serde(default)]
+    pub open_slots: Option<Vec<String>>,
     pub window: Option<WindowState>,
 }
 

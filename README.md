@@ -20,6 +20,7 @@ A native desktop client for the [Pi coding agent](https://github.com/earendil-wo
 - **状态同步** — pi 侧的改名/换思考级别即时反映到侧栏与选择器;重试显示「第 2/3 次(2s 后):错误详情」;压缩启动有提示
 - **运行控制** — 队列投递方式可选(全部一次 / 每轮一条);头部「复制最后回答」一键复制;流式中实时显示累计 token
 - **富展示** — 工具返回的图片(read 截图等)直接在卡片下渲染;工具结果一键复制;回答里的代码块自带复制按钮与折叠
+- **并行会话** — 侧栏就是任务管理器:切走的会话在后台继续跑(每个会话独立 pi 进程),列表行前有运行中的 spinner 与完成后的未读点;右键可停止后台运行或关闭后台会话;同时最多 4 个活进程,满员自动让位给最旧的空闲会话;退出时的会话编队在下次启动原样回归
 - **会话分支树** — 右侧栏「会话树」标签画出当前会话的分叉结构:活跃分支高亮,离开的分支带摘要标记(`branch_summary`);活跃分支的提问可在节点上一键「从这里分叉」;未连接时直接读会话文件建树
 - **自动重试控制** — 头部重试菜单可开关 pi 的自动重试(写入 pi 的全局设置);重试等待中的横幅与菜单都能一键停止
 - **版本提示** — pi 低于 pido 支持的最低版本时,转录上方给出升级提醒
@@ -42,6 +43,7 @@ A native desktop client for the [Pi coding agent](https://github.com/earendil-wo
 - **State sync** — renames and thinking-level picks made in pi reach the sidebar and picker live; retries name their attempt and delay; compaction start announces itself
 - **Run controls** — queue delivery is all-at-once or one-per-turn; the header copies the last answer; a streaming answer shows its cumulative token count as it grows
 - **Rich results** — images a tool returns (screenshot reads) render under the card; results copy in one click; code blocks in answers carry their own copy button and folding
+- **Parallel sessions** — the sidebar doubles as the task manager: a session you switch away from keeps running in the background (each with its own pi process), rows carry a running spinner and an after-settle unread dot, the session menu stops a background run or closes its slot, at most four processes live at once with the oldest idle one giving way, and the fleet that was open at quit comes back on the next start
 - **Branch tree** — the right panel's "Session tree" tab draws the open session's fork structure: the active branch highlighted, abandoned ones marked with their summaries (`branch_summary`); a user prompt on the active branch forks from its node in one click; with no live pi the tree is built from the session file itself
 - **Retry control** — the header retry menu flips pi's auto-retry (persisted into pi's own global settings); a retry's backoff stops from the banner or the menu
 - **Version notice** — when the pi CLI is older than the minimum pido expects, a banner above the transcript says so
@@ -139,11 +141,11 @@ PI_SMOKE_PROMPT="hi" cargo run -p pi-rpc --example real_pi -- /tmp   # 完整流
 
 ## 状态与路线 / Status
 
-MVP(核心聊天客户端)已完成,扩展 UI 原生对话框(权限审批类扩展)、队列可视化、会话重命名、改动审查(右侧栏 diff)、内置终端、会话分支树均已支持。checkpoint 回溯仍不可行(pi 的 RPC 无法移动 leaf)。
+MVP(核心聊天客户端)已完成,扩展 UI 原生对话框(权限审批类扩展)、队列可视化、会话重命名、改动审查(右侧栏 diff)、内置终端、会话分支树、多会话并行(每会话独立 pi 进程)均已支持。checkpoint 回溯仍不可行(pi 的 RPC 无法移动 leaf)。
 
 依赖固定:`ely-gpui-component` 锁定 rev `e0f355a`,`gpui-pre =0.3.11`;升级视为显式变更。
 
-多标签页、每项目独立 pi 进程的可行性设计与分期方案见 [docs/multi-tab.md](docs/multi-tab.md)(设计文档,未实施)。A design for parallel tabs with one pi process per project lives there too.
+多会话并行已落地为「侧栏即任务管理器」:不设 tab 栏,切走的会话在后台继续跑,列表行带运行中 spinner 与未读点。早期 tab 栏方案的设计文档见 [docs/multi-tab.md](docs/multi-tab.md)(已被否,留作决策记录)。Parallel sessions shipped as a sidebar-driven slot model; the earlier tab-strip design doc is kept as a decision record.
 
 ## License
 
