@@ -30,7 +30,8 @@ pub fn render(state: &Entity<AppState>, app: &mut PidoApp, cx: &App) -> impl Int
     let Some(draft) = app.slot().draft.clone() else {
         return div().into_any_element();
     };
-    let image_only = !s.pending_images.is_empty() && draft.read(cx).text().trim().is_empty();
+    let draft_empty = draft.read(cx).text().trim().is_empty();
+    let image_only = !s.pending_images.is_empty() && draft_empty;
 
     let send_state = state.clone();
     let paste_state = state.clone();
@@ -237,13 +238,18 @@ pub fn render(state: &Entity<AppState>, app: &mut PidoApp, cx: &App) -> impl Int
             .tooltip(i18n::t(cx, "send"))
             .on_click(move |_, _, cx| send_state.update(cx, |s, cx| s.send_text(String::new(), cx)))
     });
-    let stop = if streaming {
+    // The right-side action is contextual: with an empty field while the
+    // agent runs it is the stop button (aborting just the turn; whatever
+    // was queued stays queued), and the moment the user types anything it
+    // gives way to the send button, whose message queues for the next
+    // turn. With images staged the explicit send affordance wins too.
+    let stop = if streaming && draft_empty && s.pending_images.is_empty() {
         let stop_state = state.clone();
         Some(
             IconButton::new("composer-stop", IconName::Square)
                 .variant(ButtonVariant::Secondary)
                 .tooltip(i18n::t(cx, "stop"))
-                .on_click(move |_, _, cx| stop_state.update(cx, |s, cx| s.stop(cx))),
+                .on_click(move |_, _, cx| stop_state.update(cx, |s, cx| s.abort_turn(cx))),
         )
     } else {
         None

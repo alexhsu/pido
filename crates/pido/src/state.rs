@@ -3290,6 +3290,40 @@ impl AppState {
         });
     }
 
+    /// Abort the running turn but leave the queue alone: whatever the user
+    /// submitted while the agent ran stays queued and becomes the next
+    /// turn's input. The composer's contextual stop button uses this; Esc
+    /// keeps the full stop (queue cleared, texts restored to the composer).
+    pub fn abort_turn(&mut self, cx: &mut Context<Self>) {
+        let Some(client) = self.client() else {
+            // No client to ask, but the UI must not keep claiming a run.
+            self.streaming = false;
+            self.finish_running_turn();
+            self.finalize_open_views();
+            cx.notify();
+            return;
+        };
+        cx.spawn(async move |this, cx| {
+            let aborted = cx
+                .background_executor()
+                .spawn(async move { client.request(Command::Abort) })
+                .await;
+            this.update(cx, |s, cx| {
+                if let Ok(response) = aborted
+                    && !response.success
+                {
+                    s.push_notice(
+                        NoticeKind::Error,
+                        format!("abort: {}", response.error.unwrap_or_default()),
+                    );
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     /// Interactive Esc semantics: drop queued steering, then abort the run.
     ///
     /// pi returns the cleared messages' text, and the documented Esc behavior
