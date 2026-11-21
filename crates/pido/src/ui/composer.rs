@@ -36,7 +36,7 @@ pub fn render(state: &Entity<AppState>, app: &mut PidoApp, cx: &App) -> impl Int
     let send_state = state.clone();
     let paste_state = state.clone();
     let owned_draft = draft.clone();
-    let input = PromptInput::new("composer", &draft, move |_, cx| {
+    let mut input = PromptInput::new("composer", &draft, move |_, cx| {
         let text = owned_draft.read(cx).text().to_string();
         // A message may be image-only: the field may be empty while images
         // are staged.
@@ -45,11 +45,15 @@ pub fn render(state: &Entity<AppState>, app: &mut PidoApp, cx: &App) -> impl Int
             send_state.update(cx, |s, cx| s.send_text(text, cx));
         }
     });
-
-    // Do not use PromptInput::busy here: it also swallows Enter, which is
-    // exactly how a running agent should be steered. The send button stays a
-    // send button while streaming (it sends `steer`), and a separate Stop
-    // tool aborts the run.
+    // With an empty field mid-run, the in-field send becomes the stop
+    // button (aborting just the turn; whatever was queued stays queued).
+    // The moment the user types, busy turns off: the send button lights up
+    // and Enter steers again. Staged images keep the explicit send in the
+    // tool row working while the stop shows.
+    if streaming && draft_empty {
+        let stop_state = state.clone();
+        input = input.busy(move |_, cx| stop_state.update(cx, |s, cx| s.abort_turn(cx)));
+    }
 
     // `/` offers pi's extension commands, prompt templates and skills. The
     // component strips the typed `/query` and hands us the value; commands
@@ -238,23 +242,6 @@ pub fn render(state: &Entity<AppState>, app: &mut PidoApp, cx: &App) -> impl Int
             .tooltip(i18n::t(cx, "send"))
             .on_click(move |_, _, cx| send_state.update(cx, |s, cx| s.send_text(String::new(), cx)))
     });
-    // The right-side action is contextual: with an empty field while the
-    // agent runs it is the stop button (aborting just the turn; whatever
-    // was queued stays queued), and the moment the user types anything it
-    // gives way to the send button, whose message queues for the next
-    // turn. With images staged the explicit send affordance wins too.
-    let stop = if streaming && draft_empty && s.pending_images.is_empty() {
-        let stop_state = state.clone();
-        Some(
-            IconButton::new("composer-stop", IconName::Square)
-                .variant(ButtonVariant::Secondary)
-                .tooltip(i18n::t(cx, "stop"))
-                .on_click(move |_, _, cx| stop_state.update(cx, |s, cx| s.abort_turn(cx))),
-        )
-    } else {
-        None
-    };
-
     let stats_line = stats_caption(s, cx);
 
     div()
@@ -299,7 +286,6 @@ pub fn render(state: &Entity<AppState>, app: &mut PidoApp, cx: &App) -> impl Int
                     .gap_1()
                     .children(queue_pick)
                     .children(image_send)
-                    .children(stop)
                     .child(pill),
             ),
         )
