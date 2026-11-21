@@ -509,19 +509,28 @@ impl PidoApp {
     /// already in that project comes forward instead of being duplicated;
     /// a project whose slots are all running earns a fresh parallel one.
     pub fn start_in_project(&mut self, project: std::path::PathBuf, cx: &mut Context<Self>) {
+        // The button always means "a new chat here". The project's newest
+        // idle *live* slot hosts it (a background one comes forward, the
+        // active one starts it in place); a project whose slots are all
+        // running earns a fresh parallel slot, and a dead one is replaced
+        // by a fresh pi rather than reused.
         let candidates: Vec<usize> = self
             .slots
             .iter()
             .enumerate()
-            .filter(|(_, slot)| slot.state.read(cx).cwd.as_deref() == Some(project.as_path()))
+            .filter(|(_, slot)| {
+                let state = slot.state.read(cx);
+                state.cwd.as_deref() == Some(project.as_path())
+                    && state.conn == crate::state::Conn::Live
+                    && !state.is_running()
+            })
             .map(|(ix, _)| ix)
             .collect();
-        if let Some(ix) = candidates
-            .into_iter()
-            .rev()
-            .find(|&ix| !self.slots[ix].state.read(cx).is_running())
-        {
-            self.set_active(ix, cx);
+        if let Some(ix) = candidates.into_iter().next_back() {
+            if self.active != ix {
+                self.set_active(ix, cx);
+            }
+            self.slots[ix].state.update(cx, |s, cx| s.new_chat(cx));
             return;
         }
         self.create_slot(project, None, cx);
