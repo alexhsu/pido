@@ -505,6 +505,28 @@ impl PidoApp {
         self.create_slot(cwd, None, cx);
     }
 
+    /// Start (or return to) a session in `project`. The newest idle slot
+    /// already in that project comes forward instead of being duplicated;
+    /// a project whose slots are all running earns a fresh parallel one.
+    pub fn start_in_project(&mut self, project: std::path::PathBuf, cx: &mut Context<Self>) {
+        let candidates: Vec<usize> = self
+            .slots
+            .iter()
+            .enumerate()
+            .filter(|(_, slot)| slot.state.read(cx).cwd.as_deref() == Some(project.as_path()))
+            .map(|(ix, _)| ix)
+            .collect();
+        if let Some(ix) = candidates
+            .into_iter()
+            .rev()
+            .find(|&ix| !self.slots[ix].state.read(cx).is_running())
+        {
+            self.set_active(ix, cx);
+            return;
+        }
+        self.create_slot(project, None, cx);
+    }
+
     /// Stop the run in the slot holding `path`, without bringing it forward.
     pub fn stop_session(&mut self, path: String, cx: &mut Context<Self>) {
         let key = crate::state::session_key(&path);
@@ -1602,9 +1624,7 @@ impl PidoApp {
                         draft.update(cx, |field, cx| field.insert(&at, cx));
                     }
                 }
-                PaletteAction::NewChat => {
-                    this.slot().state.update(cx, |s, cx| s.new_chat(cx));
-                }
+                PaletteAction::NewChat => this.new_chat(cx),
                 PaletteAction::ExportHtml => {
                     this.slot().state.update(cx, |s, cx| s.export_html(cx));
                 }

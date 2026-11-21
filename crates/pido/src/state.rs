@@ -2405,23 +2405,6 @@ impl AppState {
         self.pending_writes.clear();
     }
 
-    /// Start a fresh session in `project`: a new chat when pi is already there,
-    /// a reconnect to that directory otherwise.
-    pub fn new_session_in(&mut self, project: PathBuf, cx: &mut Context<Self>) {
-        if self.conn == Conn::Live && self.cwd.as_deref() == Some(project.as_path()) {
-            self.new_chat(cx);
-        } else {
-            // Swapping to another project kills the running pi mid-turn;
-            // new_chat guards this and so must the cross-project path.
-            if self.streaming || self.turn_running {
-                self.push_notice(NoticeKind::Warn, i18n::t(cx, "agent_busy").to_string());
-                cx.notify();
-                return;
-            }
-            self.connect(project, None, extra_args(), cx);
-        }
-    }
-
     /// Stage an image for the next prompt, localizing the failure reason.
     pub fn stage_image(&mut self, name: Option<String>, bytes: Vec<u8>, cx: &App) -> bool {
         match self.stage_image_impl(name, bytes) {

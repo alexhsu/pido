@@ -330,7 +330,6 @@ fn group_row(
     let group = SharedString::from(format!("project-{ix}"));
     let fold_state = state.clone();
     let fold_cwd = cwd.to_string();
-    let new_state = state.clone();
     let new_cwd = cwd.to_string();
     let shown = if archived {
         i18n::t(cx, "archived")
@@ -372,10 +371,14 @@ fn group_row(
                     .invisible()
                     .group_hover(group, |style| style.visible())
                     .on_mouse_down(MouseButton::Left, |_, window, _| window.prevent_default())
-                    .on_click(move |_, _, cx| {
-                        cx.stop_propagation();
-                        let cwd = std::path::PathBuf::from(&new_cwd);
-                        new_state.update(cx, |s, cx| s.new_session_in(cwd, cx));
+                    .on_click({
+                        let view = view.clone();
+                        let new_cwd = new_cwd.clone();
+                        move |_, _, cx| {
+                            cx.stop_propagation();
+                            let cwd = std::path::PathBuf::from(&new_cwd);
+                            view.update(cx, |shell, cx| shell.start_in_project(cwd, cx));
+                        }
                     })
                     .child(
                         Icon::new(IconName::FilePlus)
