@@ -31,6 +31,7 @@ A native desktop client for the [Pi coding agent](https://github.com/earendil-wo
 - **内置终端** — 右侧栏终端页运行真实 shell(Windows 为 PowerShell,Linux/macOS 为 `$SHELL`,ConPTY/PTY 驱动),可新建、随会话目录启动;切换会话时自动在新目录重生
 - **统计** — token 用量、成本、上下文占用,每轮结束后刷新
 - **亮暗主题 + 中英双语** — 一键切换,偏好持久化(含窗口尺寸、最近项目)
+- **系统设置** — 头部齿轮打开设置窗口:通用(外观深色/浅色/跟随系统、语言、pi 的自动压缩与自动重试、队列投递默认值、启动检查更新、思考等级)、模型(当前模型、pi 启动默认值、provider 登录状态)、Skill 与扩展(只读列表 + 打开配置/目录),其余项一键跳转 pi 的配置文件
 - **A complete chat loop** — pick a project directory, stream replies, thinking, and tool-call cards live
 - **Steering** — typing while the agent runs steers it, or switches to queueing it as a follow-up; queued messages show as chips over the composer and can be cleared in one click; Esc or the stop button clears the queue and aborts
 - **Model & thinking switching** — the model pill at the composer's right opens two levels: model and thinking level
@@ -54,6 +55,7 @@ A native desktop client for the [Pi coding agent](https://github.com/earendil-wo
 - **Built-in terminal** — the right panel's terminal tab runs a real shell (PowerShell on Windows, `$SHELL` on Linux/macOS) via ConPTY/PTY; spawn a fresh one any time, and it respawns in the new directory when the session switches
 - **Stats** — tokens, cost, and context usage refresh after every run
 - **Dark/light + 中文/English** — one-click toggle, persisted along with window size and last project
+- **Settings** — the header gear opens a settings window: General (appearance dark/light/system, language, pi's auto-compaction and auto-retry, queue delivery default, update checks, thinking level), Models (current model, pi's startup defaults, provider sign-in status), and Skills & Extensions (read-only lists with one-click reveal of the backing files and directories)
 
 ## 前置条件 / Prerequisites
 

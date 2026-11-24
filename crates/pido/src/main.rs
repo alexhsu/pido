@@ -7,10 +7,7 @@ mod state;
 mod ui;
 mod update;
 
-use ely_gpui_component::{
-    Assets,
-    theme::{Mode, Theme},
-};
+use ely_gpui_component::Assets;
 use gpui::{App, AppContext, Bounds, TitlebarOptions, WindowBounds, WindowOptions, px, size};
 
 fn main() {
@@ -33,10 +30,7 @@ fn main() {
             // The terminal's own chords (copy/paste/clear/find) are scoped to
             // the terminal's focus, so they sit alongside the app's.
             ely_gpui_component::terminal::bind_keys(cx);
-            match settings.theme.as_deref() {
-                Some("light") => Theme::set_mode_now(Mode::Light, cx),
-                _ => Theme::set_mode_now(Mode::Dark, cx),
-            }
+            settings::apply_theme_pref(settings.theme_pref(), cx);
             let start_locale = settings
                 .locale
                 .clone()

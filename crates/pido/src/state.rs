@@ -1309,7 +1309,7 @@ impl AppState {
     }
 
     /// The process-wide environment probe store; see `probe_environment`.
-    fn shared_environment() -> &'static std::sync::Mutex<Option<Environment>> {
+    pub(crate) fn shared_environment() -> &'static std::sync::Mutex<Option<Environment>> {
         static CELL: std::sync::OnceLock<std::sync::Mutex<Option<Environment>>> =
             std::sync::OnceLock::new();
         CELL.get_or_init(|| std::sync::Mutex::new(None))

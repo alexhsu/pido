@@ -57,7 +57,38 @@ pub struct WindowState {
     pub height: f32,
 }
 
+/// The user's appearance preference. `"system"` follows the OS setting and
+/// re-applies whenever the platform reports an appearance change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThemePref {
+    Dark,
+    Light,
+    System,
+}
+
 impl Settings {
+    /// The stored appearance, with legacy values (missing, or the old
+    /// dark-by-default `null`) folded into [`ThemePref::Dark`].
+    pub fn theme_pref(&self) -> ThemePref {
+        match self.theme.as_deref() {
+            Some("light") => ThemePref::Light,
+            Some("system") => ThemePref::System,
+            _ => ThemePref::Dark,
+        }
+    }
+
+    /// Persist a new appearance preference; call [`apply_theme_pref`] to
+    /// make it take effect on screen.
+    pub fn set_theme_pref(&mut self, pref: ThemePref) {
+        self.theme = Some(
+            match pref {
+                ThemePref::Dark => "dark",
+                ThemePref::Light => "light",
+                ThemePref::System => "system",
+            }
+            .to_string(),
+        );
+    }
     pub fn path() -> Option<PathBuf> {
         dirs::config_dir().map(|dir| dir.join("pido").join("settings.json"))
     }
@@ -128,4 +159,16 @@ pub fn save_setting(apply: impl FnOnce(&mut Settings)) {
     let mut settings = Settings::load();
     apply(&mut settings);
     settings.save();
+}
+
+/// Put `pref` on screen: an explicit mode switches at once, and `System`
+/// resolves through the platform's current appearance.
+pub fn apply_theme_pref(pref: ThemePref, cx: &mut gpui::App) {
+    use ely_gpui_component::theme::{Mode, Theme};
+    let mode = match pref {
+        ThemePref::Dark => Mode::Dark,
+        ThemePref::Light => Mode::Light,
+        ThemePref::System => Mode::from(cx.window_appearance()),
+    };
+    Theme::set_mode_now(mode, cx);
 }

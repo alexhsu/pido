@@ -11,7 +11,7 @@ use gpui::{
 
 use crate::i18n;
 use crate::state::{AppState, Conn, PaletteAction, PaletteItem, PaletteKind, TranscriptItem};
-use crate::ui::{chat, composer, sidebar, welcome};
+use crate::ui::{chat, composer, settings, sidebar, welcome};
 
 actions!(
     pido,
@@ -165,6 +165,12 @@ pub struct PidoApp {
     rename_project: Option<String>,
     /// The remove-project confirmation: which path it is about.
     confirm_remove: Option<String>,
+    /// The settings window: the page it shows, or `None` when closed.
+    pub settings_open: Option<settings::SettingsPage>,
+    /// What the settings window shows, read once per open.
+    pub settings_snapshot: Option<settings::SettingsSnapshot>,
+    /// Keeps the appearance observer alive so `system` tracks the OS theme.
+    appearance_sub: Option<gpui::Subscription>,
     /// Which right-panel tab shows, and whether the panel is open at all.
     pub right_tab: RightTab,
     right_open: bool,
@@ -270,6 +276,9 @@ impl PidoApp {
             pane_save_at: std::rc::Rc::new(std::cell::Cell::new(None)),
             rename_project: None,
             confirm_remove: None,
+            settings_open: None,
+            settings_snapshot: None,
+            appearance_sub: None,
             right_tab: RightTab::Diff,
             right_open,
             search_field: None,
@@ -991,6 +1000,18 @@ impl Render for PidoApp {
         let column = theme.container_width(ContainerSize::Md);
         let bounds = window.bounds();
         self.window_size = Some((f32::from(bounds.size.width), f32::from(bounds.size.height)));
+        // Track the OS appearance once a window exists, so an appearance
+        // preference of "system" follows it live.
+        if self.appearance_sub.is_none() {
+            self.appearance_sub =
+                Some(window.observe_window_appearance(|_, cx| {
+                    if crate::settings::Settings::load().theme_pref()
+                        == crate::settings::ThemePref::System
+                    {
+                        crate::settings::apply_theme_pref(crate::settings::ThemePref::System, cx);
+                    }
+                }));
+        }
         self.ensure_draft_for_active(window, cx);
         let slot_status = self.slot_status(cx);
         let state = self.slot().state.clone();
@@ -1088,11 +1109,16 @@ impl Render for PidoApp {
             };
 
         // Extension and rename dialogs ride at the root, above every pane;
-        // the remove-project confirmation joins them.
+        // the remove-project confirmation joins them, then the settings
+        // window, then the palette.
         let overlay = self
             .extension_dialog_overlay(&state, window, cx)
             .or_else(|| self.rename_dialog(cx))
             .or_else(|| self.remove_project_dialog(cx))
+            .or_else(|| {
+                let view = cx.entity();
+                settings::settings_overlay(self, &view, window, cx)
+            })
             .or_else(|| self.palette_overlay(cx));
         // The right panel mounts into the split when open; closing drops the
         // pane, so the two-pane layout gets the full width back.
@@ -1242,6 +1268,10 @@ impl Render for PidoApp {
                             this.slot()
                                 .state
                                 .update(cx, |s, cx| s.cancel_dialog(&dialog.id, cx));
+                            return;
+                        }
+                        if this.settings_open.is_some() {
+                            this.close_settings(cx);
                             return;
                         }
                         // In the terminal, Escape is the \x1b key the shell
@@ -2046,7 +2076,45 @@ impl PidoApp {
     fn modal_open(&self, cx: &App) -> bool {
         self.slot().rename_open
             || self.confirm_remove.is_some()
+            || self.settings_open.is_some()
             || self.slot().state.read(cx).pending_dialog.is_some()
+    }
+
+    /// Open the settings window on `page`, snapshotting what it shows.
+    /// A no-op while another modal owns the window.
+    pub fn open_settings(
+        &mut self,
+        page: settings::SettingsPage,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.modal_open(cx) {
+            return;
+        }
+        let ready = crate::state::AppState::shared_environment()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .map(|environment| environment.ready_providers.clone())
+            .unwrap_or_default();
+        let project_cwd = self.slot().state.read(cx).cwd.clone();
+        self.settings_snapshot = Some(settings::SettingsSnapshot::load(project_cwd.as_deref(), ready));
+        self.settings_open = Some(page);
+        cx.notify();
+    }
+
+    pub fn close_settings(&mut self, cx: &mut Context<Self>) {
+        self.settings_open = None;
+        self.settings_snapshot = None;
+        cx.notify();
+    }
+
+    /// Switch pages inside the open settings window.
+    pub fn set_settings_page(&mut self, page: settings::SettingsPage, cx: &mut Context<Self>) {
+        if self.settings_open != Some(page) {
+            self.settings_open = Some(page);
+            cx.notify();
+        }
     }
 
     fn rename_dialog(&mut self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {

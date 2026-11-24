@@ -838,13 +838,11 @@ pub fn pi_retry_enabled(cwd: Option<&Path>) -> bool {
             .ok()
             .and_then(|settings| settings.get("retry")?.get("enabled")?.as_bool())
     };
-    if let Some(home) = dirs::home_dir() {
-        let global = home.join(".pi").join("agent").join("settings.json");
-        if let Ok(text) = std::fs::read_to_string(global)
-            && let Some(enabled) = pick(&text)
-        {
-            return enabled;
-        }
+    if let Some(global) = pi_agent_dir().map(|dir| dir.join("settings.json"))
+        && let Ok(text) = std::fs::read_to_string(global)
+        && let Some(enabled) = pick(&text)
+    {
+        return enabled;
     }
     if let Some(cwd) = cwd {
         let project = cwd.join(".pi").join("settings.json");
@@ -855,6 +853,49 @@ pub fn pi_retry_enabled(cwd: Option<&Path>) -> bool {
         }
     }
     true
+}
+
+/// The pi agent directory: `PI_CODING_AGENT_DIR` when set, else the default
+/// `~/.pi/agent`. pi itself resolves the variable the same way.
+pub fn pi_agent_dir() -> Option<PathBuf> {
+    if let Some(dir) = std::env::var_os("PI_CODING_AGENT_DIR")
+        && !dir.is_empty()
+    {
+        return Some(PathBuf::from(dir));
+    }
+    dirs::home_dir().map(|home| home.join(".pi").join("agent"))
+}
+
+/// Providers with stored credentials in pi's `auth.json`, as sorted
+/// top-level keys. Only the names are read; the credentials stay untouched.
+pub fn pi_auth_provider_keys() -> Vec<String> {
+    let Some(path) = pi_agent_dir().map(|dir| dir.join("auth.json")) else {
+        return Vec::new();
+    };
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return Vec::new();
+    };
+    let mut keys = value
+        .as_object()
+        .map(|object| object.keys().cloned().collect::<Vec<_>>())
+        .unwrap_or_default();
+    keys.sort();
+    keys
+}
+
+/// pi's global settings.json as raw JSON; `Value::Null` when absent or
+/// unreadable, so callers treat every field as optional.
+pub fn pi_agent_settings() -> serde_json::Value {
+    let Some(path) = pi_agent_dir().map(|dir| dir.join("settings.json")) else {
+        return serde_json::Value::Null;
+    };
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or(serde_json::Value::Null)
 }
 
 impl PiProbe {

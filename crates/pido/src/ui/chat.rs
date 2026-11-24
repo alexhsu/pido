@@ -241,6 +241,19 @@ pub fn render_header(
                 cx,
             )
         })
+        .child({
+            let view = view.clone();
+            let settings_page = crate::ui::settings::SettingsPage::General;
+            ely_gpui_component::buttons::IconButton::new(
+                "open-settings",
+                ely_gpui_component::primitives::IconName::Settings,
+            )
+            .variant(ely_gpui_component::buttons::ButtonVariant::Ghost)
+            .tooltip(i18n::t(cx, "settings"))
+            .on_click(move |_, window, cx| {
+                view.update(cx, |shell, cx| shell.open_settings(settings_page, window, cx));
+            })
+        })
 }
 
 /// The scrollable transcript area with the notice banner and empty state.

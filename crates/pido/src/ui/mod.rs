@@ -5,6 +5,7 @@ pub mod changes;
 pub mod chat;
 pub mod composer;
 pub mod panel;
+pub mod settings;
 pub mod sidebar;
 pub mod tree;
 pub mod welcome;
