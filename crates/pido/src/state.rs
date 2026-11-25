@@ -2142,6 +2142,56 @@ impl AppState {
         cx.notify();
     }
 
+    /// Expand or collapse a finished turn, and remember the choice per
+    /// session so a reopened session reopens the same turns.
+    pub fn toggle_turn_expanded(&mut self, ix: usize, cx: &mut Context<Self>) {
+        let ix = ix as u64;
+        if !self.expanded_turns.remove(&ix) {
+            self.expanded_turns.insert(ix);
+        }
+        self.persist_expanded_turns();
+        cx.notify();
+    }
+
+    /// Write the expanded-turn set of the current session into settings.
+    /// A toggle is rare, so the little file write rides the click.
+    fn persist_expanded_turns(&self) {
+        let Some(file) = self.session_file.clone() else {
+            return;
+        };
+        let key = session_key(&file);
+        let mut turns: Vec<u64> = self.expanded_turns.iter().copied().collect();
+        turns.sort_unstable();
+        crate::settings::save_setting(|settings| {
+            let list = &mut settings.expanded_turns;
+            list.retain(|(existing, _)| *existing != key);
+            if !turns.is_empty() {
+                list.push((key, turns));
+            }
+            // Sessions whose every turn is folded again stop taking space;
+            // the store stays bounded instead of growing forever.
+            list.retain(|(_, turns)| !turns.is_empty());
+            while list.len() > 128 {
+                list.remove(0);
+            }
+        });
+    }
+
+    /// Reload the persisted expanded-turn set of the current session file;
+    /// runs at the end of a history rebuild, the one point every open path
+    /// (connect, switch, fork, clone) funnels through.
+    fn restore_expanded_turns(&mut self) {
+        self.expanded_turns.clear();
+        let Some(file) = self.session_file.clone() else {
+            return;
+        };
+        let key = session_key(&file);
+        let persisted = crate::settings::Settings::load().expanded_turns;
+        if let Some((_, turns)) = persisted.iter().find(|(existing, _)| *existing == key) {
+            self.expanded_turns = turns.iter().copied().collect();
+        }
+    }
+
     /// Rename a session by path: the open one through Pi, any other by
     /// appending a `session_info` entry to its file.
     pub fn rename_session_at(&mut self, path: &str, name: String, cx: &mut Context<Self>) {
@@ -2194,6 +2244,113 @@ impl AppState {
         self.queued_steers.clear();
         self.queued_follow_ups.clear();
         cx.notify();
+    }
+
+    /// Send one message through the normal path while pinning which queue
+    /// it lands in — the recall path re-queues the untouched chips on their
+    /// original side regardless of the current delivery preference.
+    fn send_text_as(&mut self, text: String, side: QueueChoice, cx: &mut Context<Self>) {
+        let preference = self.queue_mode;
+        self.queue_mode = side;
+        self.send_text(text, cx);
+        self.queue_mode = preference;
+    }
+
+    /// Recall one queued chip into the composer for editing. pi has no
+    /// remove-one command, so the whole queue is cleared (pi echoes the
+    /// texts back), the other chips re-queue on their original sides while
+    /// the agent still runs, and the recalled text returns to the draft.
+    /// If the agent settled during the round trip, re-sending would run
+    /// those messages — the whole queue lands in the draft instead, joined
+    /// after the recalled text.
+    pub fn recall_queued(&mut self, side: QueueChoice, index: usize, cx: &mut Context<Self>) {
+        let Some(text) = (match side {
+            QueueChoice::Steer => self.queued_steers.get(index),
+            QueueChoice::FollowUp => self.queued_follow_ups.get(index),
+        })
+        .cloned() else {
+            return;
+        };
+        let Some(client) = self.client() else {
+            return;
+        };
+        cx.spawn(async move |this, cx| {
+            let cleared = cx
+                .background_executor()
+                .spawn(async move { client.request(Command::ClearQueue) })
+                .await;
+            this.update(cx, |s, cx| {
+                let Ok(response) = cleared else {
+                    let error = cleared.unwrap_err().to_string();
+                    s.push_notice(NoticeKind::Error, error);
+                    return;
+                };
+                if !response.success {
+                    s.push_notice(
+                        NoticeKind::Error,
+                        i18n::t_arg(
+                            cx,
+                            "clear_queue_failed",
+                            "e",
+                            &response.error.unwrap_or_default(),
+                        )
+                        .to_string(),
+                    );
+                    return;
+                }
+                let Ok(Some(queue)) = response.data_as::<ClearedQueue>() else {
+                    return;
+                };
+                // Pick the clicked text out of pi's echo (authoritative
+                // order), keeping every other message with its side.
+                let mut clicked = text.to_string();
+                let mut others: Vec<(QueueChoice, String)> = Vec::new();
+                for (ix, entry) in queue.steering.iter().enumerate() {
+                    if side == QueueChoice::Steer && ix == index {
+                        clicked = entry.clone();
+                    }
+                }
+                for (ix, entry) in queue.follow_up.iter().enumerate() {
+                    if side == QueueChoice::FollowUp && ix == index {
+                        clicked = entry.clone();
+                    }
+                }
+                for (ix, entry) in queue.steering.iter().enumerate() {
+                    if !(side == QueueChoice::Steer && ix == index) {
+                        others.push((QueueChoice::Steer, entry.clone()));
+                    }
+                }
+                for (ix, entry) in queue.follow_up.iter().enumerate() {
+                    if !(side == QueueChoice::FollowUp && ix == index) {
+                        others.push((QueueChoice::FollowUp, entry.clone()));
+                    }
+                }
+                // These optimistic rows leave with the queue; re-queued
+                // messages come back through `send_text`, which re-adds
+                // both the row and its pending mirror.
+                for echoed in queue.steering.iter().chain(queue.follow_up.iter()) {
+                    s.remove_last_user_text(echoed);
+                }
+                if s.streaming || s.turn_running {
+                    for (queue_side, entry) in others {
+                        s.send_text_as(entry, queue_side, cx);
+                    }
+                    s.restore_to_composer(&clicked);
+                } else {
+                    let mut merged = clicked;
+                    for (_, entry) in &others {
+                        if !merged.is_empty() {
+                            merged.push_str("\n\n");
+                        }
+                        merged.push_str(entry);
+                    }
+                    s.restore_to_composer(&merged);
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     /// Rename the session. Pi keeps the name in the session file and reports
@@ -4897,6 +5054,9 @@ impl AppState {
                 AgentMessage::System(_) | AgentMessage::Unknown => {}
             }
         }
+        // The rebuild is deterministic and append-only, so the persisted
+        // turn indices line up again — reopen what the user had open.
+        self.restore_expanded_turns();
     }
 }
 
@@ -4969,6 +5129,121 @@ pub(crate) fn find_matches(items: &[TranscriptItem], query: &str) -> Vec<usize> 
         })
         .map(|(ix, _)| ix)
         .collect()
+}
+
+/// Byte ranges of every case-insensitive occurrence of `needle` in
+/// `haystack`, on `haystack`'s own byte offsets — offsets never map
+/// through `to_lowercase`, whose folding can change byte lengths
+/// (multi-char folds simply do not match here).
+pub(crate) fn match_ranges(haystack: &str, needle: &str) -> Vec<std::ops::Range<usize>> {
+    let needle: Vec<char> = needle.chars().collect();
+    if needle.is_empty() {
+        return Vec::new();
+    }
+    let chars: Vec<(usize, char)> = haystack.char_indices().collect();
+    let mut ranges = Vec::new();
+    if chars.len() < needle.len() {
+        return ranges;
+    }
+    'window: for start in 0..=chars.len() - needle.len() {
+        for (offset, (_, hit)) in chars[start..start + needle.len()].iter().enumerate() {
+            if !fold_eq(*hit, needle[offset]) {
+                continue 'window;
+            }
+        }
+        let end = chars
+            .get(start + needle.len())
+            .map_or(haystack.len(), |(byte, _)| *byte);
+        ranges.push(chars[start].0..end);
+    }
+    ranges
+}
+
+fn fold_eq(a: char, b: char) -> bool {
+    a == b || a.to_lowercase().eq(b.to_lowercase())
+}
+
+/// Clone the parsed blocks and mark every case-insensitive occurrence of
+/// `query` inside paragraph-style inline text, so the current find hit
+/// shows its words highlighted, not just its row bar. Ely renders
+/// `Style::Mark` as a background run; fenced code draws through the
+/// renderer's `.code` hook and is skipped.
+pub(crate) fn highlighted_blocks(
+    blocks: &std::rc::Rc<[ely_gpui_component::documents::MarkdownBlock]>,
+    query: &str,
+) -> std::rc::Rc<[ely_gpui_component::documents::MarkdownBlock]> {
+    use ely_gpui_component::documents::MarkdownBlock;
+    if query.is_empty() {
+        return std::rc::Rc::clone(blocks);
+    }
+    let marked: Vec<MarkdownBlock> = blocks.iter().map(|node| mark_node(node, query)).collect();
+    std::rc::Rc::from(marked.as_slice())
+}
+
+fn mark_node(
+    node: &ely_gpui_component::documents::MarkdownBlock,
+    query: &str,
+) -> ely_gpui_component::documents::MarkdownBlock {
+    use ely_gpui_component::documents::MarkdownBlock;
+    match node {
+        MarkdownBlock::Paragraph(inline) => MarkdownBlock::Paragraph(mark_inline(inline, query)),
+        MarkdownBlock::Heading(level, inline) => {
+            MarkdownBlock::Heading(*level, mark_inline(inline, query))
+        }
+        MarkdownBlock::Quote(children) => MarkdownBlock::Quote(
+            children
+                .iter()
+                .map(|child| mark_node(child, query))
+                .collect(),
+        ),
+        MarkdownBlock::List { start, items } => MarkdownBlock::List {
+            start: *start,
+            items: items
+                .iter()
+                .map(|(task, children)| {
+                    (
+                        *task,
+                        children
+                            .iter()
+                            .map(|child| mark_node(child, query))
+                            .collect(),
+                    )
+                })
+                .collect(),
+        },
+        MarkdownBlock::Table { aligns, head, rows } => MarkdownBlock::Table {
+            aligns: aligns.clone(),
+            head: head
+                .iter()
+                .map(|cell| cell.iter().map(|child| mark_node(child, query)).collect())
+                .collect(),
+            rows: rows
+                .iter()
+                .map(|row| {
+                    row.iter()
+                        .map(|cell| cell.iter().map(|child| mark_node(child, query)).collect())
+                        .collect()
+                })
+                .collect(),
+        },
+        MarkdownBlock::Footnote { label, body } => MarkdownBlock::Footnote {
+            label: label.clone(),
+            body: body.iter().map(|child| mark_node(child, query)).collect(),
+        },
+        other => other.clone(),
+    }
+}
+
+fn mark_inline(
+    inline: &ely_gpui_component::documents::Inline,
+    query: &str,
+) -> ely_gpui_component::documents::Inline {
+    use ely_gpui_component::documents::Style;
+    let mut marked = inline.clone();
+    for range in match_ranges(&marked.text, query) {
+        marked.styles.push((range, Style::Mark));
+    }
+    marked
 }
 
 /// Case-insensitive substring-or-subsequence match: `xs` matches "新会话"
@@ -6205,6 +6480,44 @@ mod tests {
             .collect();
         assert_eq!(kinds, [PaletteKind::Session]);
         assert!(state.palette_items("zzz", &[], &actions).is_empty());
+    }
+
+    #[test]
+    fn match_ranges_folds_case_without_shifting_byte_offsets() {
+        // Case folding on ASCII ("PIN" inside "PINNING").
+        assert_eq!(match_ranges("Rust async PINNING", "pin"), vec![11..14]);
+        // Multibyte text before the match must not shift the offsets.
+        let text = "把 pin 固定住";
+        let ranges = match_ranges(text, "pin");
+        assert_eq!(ranges.len(), 1);
+        assert_eq!(&text[ranges[0].clone()], "pin");
+        // Multiple hits, including an adjacent pair.
+        assert_eq!(match_ranges("ab abab", "ab").len(), 3);
+        // A needle longer than the haystack, and an empty needle, match nothing.
+        assert!(match_ranges("pin", "pinned").is_empty());
+        assert!(match_ranges("pin", "").is_empty());
+    }
+
+    #[test]
+    fn highlighted_blocks_mark_matching_inline_runs() {
+        let blocks = parse_markdown("Say **PIN** twice: pin.\n\n```rust\npin\n```");
+        let marked = highlighted_blocks(&blocks, "pin");
+        // The paragraph's inline carries a Mark run for each occurrence; the
+        // code fence keeps its text unstyled (it draws through the code hook).
+        let mut marks = Vec::new();
+        for node in marked.iter() {
+            if let ely_gpui_component::documents::MarkdownBlock::Paragraph(inline) = node {
+                for (range, style) in &inline.styles {
+                    if *style == ely_gpui_component::documents::Style::Mark {
+                        marks.push(inline.text[range.clone()].to_lowercase());
+                    }
+                }
+            }
+        }
+        assert_eq!(marks, vec!["pin".to_string(), "pin".to_string()]);
+        // An empty query returns the blocks untouched.
+        let untouched = highlighted_blocks(&blocks, "");
+        assert_eq!(untouched.len(), blocks.len());
     }
 
     #[test]

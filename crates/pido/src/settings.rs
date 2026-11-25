@@ -27,6 +27,11 @@ pub struct Settings {
     /// Session paths the user archived; they list under the archive fold.
     #[serde(default)]
     pub archived_sessions: Vec<String>,
+    /// Per session (by key), the finished turns the user expanded, so a
+    /// reopened session keeps them open. Transcript indices are stable:
+    /// the rebuild from a session file is deterministic and append-only.
+    #[serde(default)]
+    pub expanded_turns: Vec<(String, Vec<u64>)>,
     /// The sidebar's width in logical pixels, as last dragged.
     pub sidebar_width: Option<f32>,
     /// The right panel's width in logical pixels, as last dragged.

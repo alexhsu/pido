@@ -209,12 +209,14 @@ pub fn render_transcript(
                 .into_any_element()
         } else {
             let visible = std::rc::Rc::new(visible);
-            // The current find match's transcript index, for the row tint.
+            // The current find match's transcript index, for the row tint,
+            // and the query itself for that row's word-level marks.
             let hit_ix = app
                 .slot()
                 .find
                 .as_ref()
                 .and_then(|find| find.matches.get(find.current).copied());
+            let find_query = app.slot().find.as_ref().map(|find| find.query.clone());
             div()
                 .flex_1()
                 .w_full()
@@ -258,6 +260,9 @@ pub fn render_transcript(
                                             &s.transcript[ix],
                                             folded,
                                             ix,
+                                            // The current hit row also marks its
+                                            // words; every other row draws plain.
+                                            if hit { find_query.as_deref() } else { None },
                                             cx,
                                         )),
                                 )
@@ -437,6 +442,7 @@ fn render_item(
     item: &TranscriptItem,
     folded: bool,
     ix: usize,
+    hit_query: Option<&str>,
     cx: &App,
 ) -> AnyElement {
     let theme = cx.theme();
@@ -477,14 +483,7 @@ fn render_item(
                     this.cursor_pointer()
                         .hover(|style| style.text_color(theme.colors.fg))
                         .on_click(move |_, _, cx| {
-                            app.update(cx, |s, cx| {
-                                if s.expanded_turns.contains(&(ix as u64)) {
-                                    s.expanded_turns.remove(&(ix as u64));
-                                } else {
-                                    s.expanded_turns.insert(ix as u64);
-                                }
-                                cx.notify();
-                            });
+                            app.update(cx, |s, cx| s.toggle_turn_expanded(ix, cx));
                         })
                 })
                 .child(text)
@@ -573,10 +572,14 @@ fn render_item(
                 ));
             }
             if !text.is_empty() {
-                bubble = bubble.child(ely_gpui_component::typography::SelectableText::new(
-                    ("user-text", ix),
-                    text.clone(),
-                ));
+                bubble = bubble.child(match hit_query {
+                    Some(query) => highlight_plain(text.as_ref(), query, cx),
+                    None => ely_gpui_component::typography::SelectableText::new(
+                        ("user-text", ix),
+                        text.clone(),
+                    )
+                    .into_any_element(),
+                });
             }
             div()
                 .group(group)
@@ -618,27 +621,35 @@ fn render_item(
                 // streams, which has to re-read its source each frame.
                 let cached = view.cached();
                 bubble = bubble.child(match cached {
-                    Some(cached) => ely_gpui_component::documents::MarkdownRenderer::blocks(
-                        ("text", ix),
-                        cached.blocks.clone(),
-                    )
-                    // Finished text picks up pointer selection: drag to
-                    // select, Ctrl-C copies, A selects all. A right press
-                    // copies the selection straight away when there is one.
-                    .selectable(|press, _, cx| {
-                        if let Some(selected) = press.selected {
-                            cx.write_to_clipboard(gpui::ClipboardItem::new_string(selected));
-                        }
-                    })
-                    // Fenced code goes to Ely's CodeBlock, which carries its
-                    // own copy button, highlight colors and folding — the
-                    // prose renderer's plain block has none of those.
-                    .code(move |id, language, code| {
-                        ely_gpui_component::chat::CodeBlock::new(id, code)
-                            .when_some(language, |block, language| block.language(language))
-                            .into_any_element()
-                    })
-                    .into_any_element(),
+                    Some(cached) => {
+                        // The current hit row re-renders from a copy whose
+                        // matching inline runs carry `Style::Mark`.
+                        let blocks = match hit_query {
+                            Some(query) => crate::state::highlighted_blocks(&cached.blocks, query),
+                            None => cached.blocks.clone(),
+                        };
+                        ely_gpui_component::documents::MarkdownRenderer::blocks(
+                            ("text", ix),
+                            blocks,
+                        )
+                        // Finished text picks up pointer selection: drag to
+                        // select, Ctrl-C copies, A selects all. A right press
+                        // copies the selection straight away when there is one.
+                        .selectable(|press, _, cx| {
+                            if let Some(selected) = press.selected {
+                                cx.write_to_clipboard(gpui::ClipboardItem::new_string(selected));
+                            }
+                        })
+                        // Fenced code goes to Ely's CodeBlock, which carries its
+                        // own copy button, highlight colors and folding — the
+                        // prose renderer's plain block has none of those.
+                        .code(move |id, language, code| {
+                            ely_gpui_component::chat::CodeBlock::new(id, code)
+                                .when_some(language, |block, language| block.language(language))
+                                .into_any_element()
+                        })
+                        .into_any_element()
+                    }
                     None => ely_gpui_component::chat::StreamingMarkdown::new(
                         ("text", ix),
                         text,
@@ -806,10 +817,14 @@ fn render_item(
                             .min_w_0()
                             .font_family("monospace")
                             .text_size(theme.text_size(TextSize::Sm))
-                            .child(ely_gpui_component::typography::SelectableText::new(
-                                ("shell-cmd", ix),
-                                gpui::SharedString::from(format!("$ {command}")),
-                            )),
+                            .child(match hit_query {
+                                Some(query) => highlight_plain(&format!("$ {command}"), query, cx),
+                                None => ely_gpui_component::typography::SelectableText::new(
+                                    ("shell-cmd", ix),
+                                    gpui::SharedString::from(format!("$ {command}")),
+                                )
+                                .into_any_element(),
+                            }),
                     ),
                 )
                 .when(!output.is_empty(), |this| {
@@ -821,10 +836,14 @@ fn render_item(
                             .font_family("monospace")
                             .text_size(theme.text_size(TextSize::Sm))
                             .text_color(colors.fg_muted)
-                            .child(ely_gpui_component::typography::SelectableText::new(
-                                ("shell-out", ix),
-                                gpui::SharedString::from(output.clone()),
-                            )),
+                            .child(match hit_query {
+                                Some(query) => highlight_plain(output, query, cx),
+                                None => ely_gpui_component::typography::SelectableText::new(
+                                    ("shell-out", ix),
+                                    gpui::SharedString::from(output.clone()),
+                                )
+                                .into_any_element(),
+                            }),
                     )
                 })
                 .when(*running, |this| {
@@ -861,6 +880,29 @@ fn render_item(
 /// Hover group id for a row's wrapper, shared by both message kinds.
 fn group(ix: usize) -> SharedString {
     SharedString::from(format!("msg-{ix}"))
+}
+
+/// A row's text with every occurrence of the find query background-marked —
+/// the word-level view of the current hit row. Drawn as a bare StyledText,
+/// which gives up drag-selection on that one row for as long as it is the
+/// hit; the row bar stays for everything else.
+fn highlight_plain(text: &str, query: &str, cx: &App) -> AnyElement {
+    let color = cx.theme().colors.warning_subtle;
+    let highlights = crate::state::match_ranges(text, query)
+        .into_iter()
+        .map(|range| {
+            (
+                range,
+                gpui::HighlightStyle {
+                    background_color: Some(color),
+                    ..Default::default()
+                },
+            )
+        })
+        .collect::<Vec<_>>();
+    gpui::StyledText::new(text)
+        .with_highlights(highlights)
+        .into_any_element()
 }
 
 /// The action row under a finished assistant message: copy, fork the turn,

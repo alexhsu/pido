@@ -12,7 +12,7 @@ use ely_gpui_component::primitives::IconName;
 use ely_gpui_component::theme::ActiveTheme;
 use gpui::{
     AnyElement, App, ClipboardEntry, Entity, InteractiveElement, IntoElement, ParentElement,
-    SharedString, Styled, div, prelude::FluentBuilder, px,
+    SharedString, StatefulInteractiveElement, Styled, div, prelude::FluentBuilder, px, relative,
 };
 
 use crate::i18n;
@@ -133,6 +133,8 @@ pub fn render(state: &Entity<AppState>, app: &mut PidoApp, cx: &App) -> impl Int
                 ("queued-steer", ix),
                 "queued_steer",
                 text.clone(),
+                state,
+                crate::state::QueueChoice::Steer,
             ));
         }
         for (ix, text) in s.queued_follow_ups.iter().enumerate() {
@@ -141,6 +143,8 @@ pub fn render(state: &Entity<AppState>, app: &mut PidoApp, cx: &App) -> impl Int
                 ("queued-follow", ix),
                 "queued_follow_up",
                 text.clone(),
+                state,
+                crate::state::QueueChoice::FollowUp,
             ));
         }
         div().flex().flex_col().gap_1().children(rows)
@@ -293,13 +297,59 @@ pub fn render(state: &Entity<AppState>, app: &mut PidoApp, cx: &App) -> impl Int
             this.child(
                 div()
                     .flex()
+                    .items_center()
                     .justify_center()
+                    .gap_2()
                     .text_size(px(11.))
                     .text_color(colors.fg_subtle)
+                    .children(context_gauge(s, cx))
                     .child(line),
             )
         })
         .into_any_element()
+}
+
+/// A slim context-occupancy gauge beside the stats line. pi computes
+/// tokens vs the model's window at every settle; the fill turns amber
+/// then red as the window fills, so the compaction moment is visible
+/// before it happens.
+fn context_gauge(s: &AppState, cx: &App) -> Option<AnyElement> {
+    let stats = s.stats.as_ref()?;
+    let ctx = stats.context_usage.as_ref()?;
+    let percent = ctx
+        .percent
+        .or_else(|| match (ctx.tokens, ctx.context_window) {
+            (Some(tokens), Some(window)) if window > 0 => {
+                Some(tokens as f64 / window as f64 * 100.0)
+            }
+            _ => None,
+        })?
+        .clamp(0.0, 100.0);
+    let colors = &cx.theme().colors;
+    let fill = if percent > 90.0 {
+        colors.danger
+    } else if percent > 70.0 {
+        colors.warning
+    } else {
+        colors.success
+    };
+    Some(
+        div()
+            .flex_none()
+            .w(px(72.))
+            .h(px(4.))
+            .rounded_full()
+            .bg(colors.border)
+            .overflow_hidden()
+            .child(
+                div()
+                    .h_full()
+                    .w(relative(percent as f32 / 100.0))
+                    .rounded_full()
+                    .bg(fill),
+            )
+            .into_any_element(),
+    )
 }
 
 /// Delivery granularity for one queue: all messages at once or one per turn.
@@ -491,14 +541,21 @@ fn cache_hit_percent(input: u64, cache_read: u64) -> Option<String> {
 }
 
 /// One message waiting in pi's queue, labelled by which queue it is in.
+/// Clicking recalls it into the composer for editing: pi has no
+/// remove-one command, so the whole queue cycles (see
+/// `AppState::recall_queued`).
 fn queued_chip(
     cx: &App,
     id: (&'static str, usize),
     label_key: &'static str,
     text: gpui::SharedString,
+    state: &gpui::Entity<AppState>,
+    side: crate::state::QueueChoice,
 ) -> AnyElement {
     let theme = cx.theme();
     let colors = &theme.colors;
+    let ix = id.1;
+    let click_state = state.clone();
     div()
         .flex()
         .items_center()
@@ -523,6 +580,11 @@ fn queued_chip(
                 .child(text),
         )
         .id(id)
+        .cursor_pointer()
+        .hover(|style| style.text_color(colors.fg))
+        .on_click(move |_, _, cx| {
+            click_state.update(cx, |s, cx| s.recall_queued(side, ix, cx));
+        })
         .into_any_element()
 }
 

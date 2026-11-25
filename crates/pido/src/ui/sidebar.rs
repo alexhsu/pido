@@ -771,6 +771,21 @@ fn session_menu(
                 }),
         );
     }
+    // Deletion rides last, past a separator: the most destructive action
+    // belongs where a slipsy click cannot reach it.
+    menu = menu.separator().item(
+        MenuItem::new(i18n::t(cx, "delete_session"))
+            .icon(IconName::Trash2)
+            .on_click({
+                let view = view.clone();
+                let path = path.to_string();
+                move |_, cx| {
+                    view.update(cx, |shell, cx| {
+                        shell.confirm_delete_session(path.clone(), cx);
+                    });
+                }
+            }),
+    );
     menu
 }
 

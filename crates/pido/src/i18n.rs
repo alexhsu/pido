@@ -212,6 +212,12 @@ const ZH_STRINGS: &[(&str, &str)] = &[
     ("stop_session_run", "停止后台运行"),
     ("close_session_slot", "关闭后台会话"),
     ("slot_cap", "后台会话已达上限(4),先关闭一个再继续"),
+    ("delete_session", "删除会话"),
+    (
+        "delete_session_desc",
+        "删除会话「{name}」?它的文件将从磁盘移除,无法恢复。",
+    ),
+    ("session_delete_failed", "删除会话失败:{e}"),
     // Settings window.
     ("settings", "设置"),
     ("open_config_file", "打开配置文件"),
@@ -522,6 +528,12 @@ const EN_STRINGS: &[(&str, &str)] = &[
         "slot_cap",
         "At the 4-session cap — close one before starting another",
     ),
+    ("delete_session", "Delete session"),
+    (
+        "delete_session_desc",
+        "Delete \"{name}\"? Its file is removed from disk; this cannot be undone.",
+    ),
+    ("session_delete_failed", "Failed to delete the session: {e}"),
     // Settings window.
     ("settings", "Settings"),
     ("open_config_file", "Open config file"),

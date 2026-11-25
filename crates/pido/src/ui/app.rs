@@ -165,6 +165,8 @@ pub struct PidoApp {
     rename_project: Option<String>,
     /// The remove-project confirmation: which path it is about.
     confirm_remove: Option<String>,
+    /// The delete-session confirmation: the file path and its display title.
+    confirm_delete: Option<(String, String)>,
     /// The settings window: the page it shows, or `None` when closed.
     pub settings_open: Option<settings::SettingsPage>,
     /// What the settings window shows, read once per open.
@@ -289,6 +291,7 @@ impl PidoApp {
             pane_save_at: std::rc::Rc::new(std::cell::Cell::new(None)),
             rename_project: None,
             confirm_remove: None,
+            confirm_delete: None,
             settings_open: None,
             settings_snapshot: None,
             settings_focus: cx.focus_handle(),
@@ -1246,6 +1249,7 @@ impl Render for PidoApp {
             .extension_dialog_overlay(&state, window, cx)
             .or_else(|| self.rename_dialog(cx))
             .or_else(|| self.remove_project_dialog(cx))
+            .or_else(|| self.confirm_delete_dialog(cx))
             .or_else(|| self.logout_provider_dialog(cx))
             .or_else(|| {
                 let view = cx.entity();
@@ -1393,6 +1397,11 @@ impl Render for PidoApp {
                         }
                         if this.confirm_remove.is_some() {
                             this.confirm_remove = None;
+                            cx.notify();
+                            return;
+                        }
+                        if this.confirm_delete.is_some() {
+                            this.confirm_delete = None;
                             cx.notify();
                             return;
                         }
@@ -2070,6 +2079,110 @@ impl PidoApp {
         cx.notify();
     }
 
+    /// Ask before deleting a session outright. Carries the display title so
+    /// the dialog can name it without re-reading the rows.
+    pub fn confirm_delete_session(&mut self, path: String, cx: &mut Context<Self>) {
+        let title = self
+            .slot()
+            .state
+            .read(cx)
+            .sidebar_rows
+            .iter()
+            .find_map(|row| match row {
+                crate::state::SidebarRow::Session {
+                    path: row_path,
+                    title,
+                    ..
+                } if *row_path == path => Some(title.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| path.clone().into());
+        self.confirm_delete = Some((path, title.to_string()));
+        cx.notify();
+    }
+
+    /// The delete-session confirmation, while one is pending.
+    fn confirm_delete_dialog(&mut self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        use ely_gpui_component::overlays::ConfirmDialog;
+
+        let (path, title) = self.confirm_delete.clone()?;
+        let me = cx.entity();
+        let message = crate::i18n::t_arg(cx, "delete_session_desc", "name", &title).to_string();
+        let shut_me = me.clone();
+        let confirm_me = me.clone();
+        let shut = move |_: &mut Window, cx: &mut App| {
+            shut_me.update(cx, |this, cx| {
+                this.confirm_delete = None;
+                cx.notify();
+            });
+        };
+        // Captured rather than re-read: the dialog closes (clearing the
+        // field) before `on_confirm` runs.
+        let confirm_path = path;
+        Some(
+            ConfirmDialog::new(
+                "delete-session-dialog",
+                crate::i18n::t(cx, "delete_session"),
+                message,
+                shut,
+            )
+            .confirm(crate::i18n::t(cx, "remove_confirm"))
+            .destructive()
+            .on_confirm(move |_, cx| {
+                confirm_me.update(cx, |this, cx| this.delete_session(confirm_path.clone(), cx));
+            })
+            .into_any_element(),
+        )
+    }
+
+    /// Delete a session for real: close any slot holding it first (a pi that
+    /// still appends would keep the file alive on Windows), purge it from
+    /// the pin/archive sets, then unlink the file in the background.
+    pub fn delete_session(&mut self, path: String, cx: &mut Context<Self>) {
+        self.confirm_delete = None;
+        let key = crate::state::session_key(&path);
+        if let Some(ix) = self.slot_index_of_key(&key, cx) {
+            self.close_slot(ix, cx);
+        }
+        crate::settings::save_setting(|settings| {
+            settings
+                .pinned_sessions
+                .retain(|existing| crate::state::session_key(existing) != key);
+            settings
+                .archived_sessions
+                .retain(|existing| crate::state::session_key(existing) != key);
+        });
+        let state = self.slot().state.clone();
+        state.update(cx, |s, _| {
+            s.pinned_sessions.remove(&key);
+            s.archived_sessions.remove(&key);
+        });
+        cx.spawn(async move |this, cx| {
+            let removed = cx
+                .background_executor()
+                .spawn(async move { std::fs::remove_file(&path) })
+                .await;
+            this.update(cx, |_, cx| {
+                state.update(cx, |s, cx| match removed {
+                    Ok(()) => s.refresh_sessions(cx),
+                    Err(error) => {
+                        let text = crate::i18n::t_arg(
+                            cx,
+                            "session_delete_failed",
+                            "e",
+                            &error.to_string(),
+                        )
+                        .to_string();
+                        s.push_notice(crate::state::NoticeKind::Error, text);
+                    }
+                });
+            })
+            .ok();
+        })
+        .detach();
+        cx.notify();
+    }
+
     /// The remove-project confirmation, while one is pending.
     fn remove_project_dialog(&mut self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
         use ely_gpui_component::overlays::ConfirmDialog;
@@ -2226,6 +2339,7 @@ impl PidoApp {
     fn modal_open(&self, cx: &App) -> bool {
         self.slot().rename_open
             || self.confirm_remove.is_some()
+            || self.confirm_delete.is_some()
             || self.confirm_logout.is_some()
             || self.settings_open.is_some()
             || self.slot().state.read(cx).pending_dialog.is_some()
