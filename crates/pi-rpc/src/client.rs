@@ -18,7 +18,7 @@
 //! ```
 
 use std::collections::{HashMap, VecDeque};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
 use std::process::{Child, ChildStdin, Stdio};
@@ -419,13 +419,31 @@ impl PiClient {
             std::thread::Builder::new()
                 .name("pi-rpc-stderr".into())
                 .spawn(move || {
-                    let reader = BufReader::new(stderr);
-                    for line in reader.lines().map_while(Result::ok) {
-                        let line = line.trim_end().to_string();
+                    // Bytes, not `lines()`: that one errors out on the first
+                    // non-UTF-8 byte and would stop draining stderr for the
+                    // rest of the session. The capped reader also bounds a
+                    // progress stream that never sends `\n`.
+                    const MAX_STDERR_LINE: usize = 8 * 1024;
+                    let mut reader = BufReader::new(stderr);
+                    let mut buf = Vec::new();
+                    loop {
+                        let len = match read_line_capped(&mut reader, &mut buf, MAX_STDERR_LINE) {
+                            Ok(0) => break,
+                            Ok(len) => len,
+                            Err(error) => {
+                                log::warn!("pi-rpc: reading pi stderr failed: {error}");
+                                break;
+                            }
+                        };
+                        let line = String::from_utf8_lossy(&buf).trim_end().to_string();
                         if line.is_empty() {
                             continue;
                         }
-                        log::warn!("pi stderr: {line}");
+                        if len > MAX_STDERR_LINE {
+                            log::warn!("pi stderr: {line} … (truncated)");
+                        } else {
+                            log::warn!("pi stderr: {line}");
+                        }
                         let mut tail = inner.stderr_tail.lock().unwrap();
                         if tail.len() >= 40 {
                             tail.pop_front();
@@ -594,12 +612,15 @@ impl PiClient {
     /// delivered to that call only.
     pub fn subscribe(&self) -> Receiver<ClientEvent> {
         let (tx, rx) = unbounded();
-        // A subscriber that arrives after the process is gone must still see
-        // the disconnect, or its pump would wait forever on an empty channel.
+        // Register under the subscribers lock, then read the flag: the reaper
+        // sets `disconnected` *before* taking that lock to fan out, so either
+        // it sees this sender (and delivers the disconnect) or this check sees
+        // the flag. Checking first would leave a window where both miss.
+        let mut subscribers = self.inner.subscribers.lock().unwrap();
         if let Some(reason) = self.inner.disconnected.lock().unwrap().clone() {
             let _ = tx.send(ClientEvent::Disconnected(reason));
         }
-        self.inner.subscribers.lock().unwrap().push(tx);
+        subscribers.push(tx);
         rx
     }
 
@@ -838,12 +859,6 @@ pub fn pi_retry_enabled(cwd: Option<&Path>) -> bool {
             .ok()
             .and_then(|settings| settings.get("retry")?.get("enabled")?.as_bool())
     };
-    if let Some(global) = pi_agent_dir().map(|dir| dir.join("settings.json"))
-        && let Ok(text) = std::fs::read_to_string(global)
-        && let Some(enabled) = pick(&text)
-    {
-        return enabled;
-    }
     if let Some(cwd) = cwd {
         let project = cwd.join(".pi").join("settings.json");
         if let Ok(text) = std::fs::read_to_string(project)
@@ -851,6 +866,12 @@ pub fn pi_retry_enabled(cwd: Option<&Path>) -> bool {
         {
             return enabled;
         }
+    }
+    if let Some(global) = pi_agent_dir().map(|dir| dir.join("settings.json"))
+        && let Ok(text) = std::fs::read_to_string(global)
+        && let Some(enabled) = pick(&text)
+    {
+        return enabled;
     }
     true
 }
@@ -925,6 +946,16 @@ impl PiProbe {
                 }
                 Some(text)
             }
+        }
+    }
+
+    /// The resolved pi executable, when the CLI is ready. Callers that only
+    /// want to run one more pi command (`auth login` in a terminal) reuse it
+    /// instead of re-resolving.
+    pub fn program(&self) -> Option<&std::path::Path> {
+        match self {
+            PiProbe::Ready { program, .. } => Some(program),
+            _ => None,
         }
     }
 }

@@ -169,6 +169,19 @@ pub struct PidoApp {
     pub settings_open: Option<settings::SettingsPage>,
     /// What the settings window shows, read once per open.
     pub settings_snapshot: Option<settings::SettingsSnapshot>,
+    /// The settings overlay's keyboard focus. The card has no text fields, but
+    /// without this the composer behind the scrim keeps the focus and typing
+    /// lands in the chat draft.
+    pub settings_focus: FocusHandle,
+    /// Edit fields for pi's startup defaults and the add-extension row;
+    /// created when the window opens, dropped when it closes.
+    pub settings_provider_input: Option<gpui::Entity<TextInput>>,
+    pub settings_model_input: Option<gpui::Entity<TextInput>>,
+    pub settings_ext_input: Option<gpui::Entity<TextInput>>,
+    /// Which scope the add-extension row writes to.
+    pub ext_add_scope: pi_rpc::resources::Scope,
+    /// The provider sign-out confirmation: which provider it is about.
+    pub confirm_logout: Option<String>,
     /// Keeps the appearance observer alive so `system` tracks the OS theme.
     appearance_sub: Option<gpui::Subscription>,
     /// Which right-panel tab shows, and whether the panel is open at all.
@@ -278,6 +291,12 @@ impl PidoApp {
             confirm_remove: None,
             settings_open: None,
             settings_snapshot: None,
+            settings_focus: cx.focus_handle(),
+            settings_provider_input: None,
+            settings_model_input: None,
+            settings_ext_input: None,
+            ext_add_scope: pi_rpc::resources::Scope::User,
+            confirm_logout: None,
             appearance_sub: None,
             right_tab: RightTab::Diff,
             right_open,
@@ -389,10 +408,22 @@ impl PidoApp {
             self.set_active(ix, cx);
             return;
         }
-        let cwd = pi_rpc::sessions::read_session_cwd(std::path::Path::new(&path))
+        // The session's recorded project directory is where pi must run; a
+        // missing one (moved or deleted project) must not spawn a pi in the
+        // wrong place, and must not leave a slot that no lookup can match.
+        let Some(cwd) = pi_rpc::sessions::read_session_cwd(std::path::Path::new(&path))
             .map(std::path::PathBuf::from)
-            .or_else(dirs::home_dir)
-            .unwrap_or_default();
+            .filter(|dir| dir.is_dir())
+        else {
+            self.slot().state.update(cx, |s, cx| {
+                s.push_notice(
+                    crate::state::NoticeKind::Error,
+                    i18n::t(cx, "dir_invalid").to_string(),
+                );
+                cx.notify();
+            });
+            return;
+        };
         self.create_slot(cwd, Some(path), cx);
     }
 
@@ -406,14 +437,20 @@ impl PidoApp {
         cx: &mut Context<Self>,
     ) {
         while self.live_slot_count(cx) >= Self::MAX_LIVE_SLOTS {
-            let victim = self.slots.iter().position(|slot| {
-                let state = slot.state.read(cx);
-                matches!(
-                    state.conn,
-                    crate::state::Conn::Live
-                        | crate::state::Conn::Connecting
-                        | crate::state::Conn::Reconnecting { .. }
-                ) && !state.is_running()
+            // Never evict the slot the user is looking at: that would drop its
+            // composer draft and panel state under their feet. The oldest
+            // *background* idle slot gives way instead; when every candidate is
+            // the visible one, the caller reports the cap instead.
+            let victim = self.slots.iter().enumerate().position(|(ix, slot)| {
+                ix != self.active && {
+                    let state = slot.state.read(cx);
+                    matches!(
+                        state.conn,
+                        crate::state::Conn::Live
+                            | crate::state::Conn::Connecting
+                            | crate::state::Conn::Reconnecting { .. }
+                    ) && !state.is_running()
+                }
             });
             match victim {
                 Some(ix) => self.close_slot(ix, cx),
@@ -478,13 +515,51 @@ impl PidoApp {
     fn set_active(&mut self, ix: usize, cx: &mut Context<Self>) {
         self.active = ix;
         self.slots[ix].unread = false;
+        // The composer takes focus once per activation. A slot shown before
+        // keeps the flag set, and the render-time autofocus only fires on
+        // `false`, so without this reset a switch back would leave the
+        // window's focus on the previous slot's (now unrendered) field.
+        self.slots[ix].composer_focused = false;
         self.slots[ix].state.update(cx, |s, cx| s.sync_sidebar(cx));
+        // The sidebar's search field belongs to the window while the query
+        // lives in the session: replay the visible text so the rows and the
+        // field agree after a switch.
+        let query = self
+            .search_field
+            .as_ref()
+            .map(|field| field.read(cx).text().to_string())
+            .unwrap_or_default();
+        if !query.trim().is_empty() {
+            self.slots[ix]
+                .state
+                .update(cx, |s, cx| s.set_search(&query, cx));
+        }
+        // The panel's tab is window state but the tree belongs to a session:
+        // a switch must fetch the incoming session's branches.
+        if self.right_open && self.right_tab == RightTab::Tree {
+            self.slots[ix]
+                .state
+                .update(cx, |s, cx| s.refresh_session_tree(cx));
+        }
         cx.notify();
     }
 
     /// Drop a slot entirely: its `AppState` goes with it, and dropping the
     /// last client handle shuts that pi down.
+    ///
+    /// Closing the last session replaces the slot with a fresh, disconnected
+    /// one instead: an empty `slots` would make `slot()` panic on the next
+    /// frame, and the welcome screen is the right place to land.
     fn close_slot(&mut self, ix: usize, cx: &mut Context<Self>) {
+        if self.slots.len() == 1 {
+            let id = self.slots[0].id;
+            let state = AppState::new(cx, std::sync::Arc::clone(&self.scanner));
+            self.slots[0] = SessionSlot::new(id, state.clone());
+            self.attach_slot_observer(id, &state, cx);
+            self.active = 0;
+            cx.notify();
+            return;
+        }
         let slot = self.slots.remove(ix);
         drop(slot);
         if self.active >= self.slots.len() {
@@ -562,6 +637,46 @@ impl PidoApp {
             return;
         };
         self.close_slot(ix, cx);
+    }
+
+    /// Fork a session by path, routed through the slot that holds it.
+    ///
+    /// `fork_session` reaches a non-open session by re-binding its pi with
+    /// `SwitchSession`, so it must run on the pi that already owns that
+    /// session. Running it on another slot would leave two processes bound to
+    /// one `.jsonl` — interleaved appends and a broken `parentId` chain.
+    pub fn fork_session(&mut self, path: String, cx: &mut Context<Self>) {
+        let key = crate::state::session_key(&path);
+        if let Some(ix) = self.slot_index_of_key(&key, cx) {
+            if self.active != ix {
+                self.set_active(ix, cx);
+            }
+            self.slots[ix]
+                .state
+                .update(cx, |s, cx| s.fork_session(&path, cx));
+            return;
+        }
+        self.slot()
+            .state
+            .update(cx, |s, cx| s.fork_session(&path, cx));
+    }
+
+    /// Flip pi's auto-retry for every live session. pi persists the switch in
+    /// its own global settings, so a per-slot write would leave the other
+    /// processes disagreeing with the file and with the settings page.
+    pub fn set_auto_retry(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        for slot in &self.slots {
+            slot.state.update(cx, |s, cx| s.set_auto_retry(enabled, cx));
+        }
+    }
+
+    /// Flip pi's auto-compaction for every live session; same reasoning as
+    /// [`Self::set_auto_retry`].
+    pub fn set_auto_compaction(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        for slot in &self.slots {
+            slot.state
+                .update(cx, |s, cx| s.set_auto_compaction(enabled, cx));
+        }
     }
 
     fn slot_index_of_key(&self, key: &str, cx: &App) -> Option<usize> {
@@ -840,6 +955,20 @@ impl PidoApp {
                 .iter()
                 .filter_map(|slot| slot.state.read(cx).session_file.clone())
                 .collect();
+            // Which session comes back in the foreground is the one that was
+            // in front, not whichever slot happened to connect last: every
+            // slot writes `last_session`/`last_project` when it connects, so
+            // the quit handler is the only place that can settle the order.
+            let (active_session, active_project) = {
+                let state = this.slot().state.read(cx);
+                (
+                    state.session_file.clone(),
+                    state
+                        .cwd
+                        .as_ref()
+                        .map(|cwd| cwd.to_string_lossy().into_owned()),
+                )
+            };
             if let Some((width, height)) = this.window_size {
                 crate::settings::save_setting(|s| {
                     s.window = Some(crate::settings::WindowState { width, height });
@@ -847,6 +976,10 @@ impl PidoApp {
                     s.right_width = Some(right);
                     s.right_open = Some(right_open);
                     s.open_slots = Some(open_slots);
+                    s.last_session = active_session;
+                    if active_project.is_some() {
+                        s.last_project = active_project;
+                    }
                 });
             }
             async {}
@@ -1003,14 +1136,13 @@ impl Render for PidoApp {
         // Track the OS appearance once a window exists, so an appearance
         // preference of "system" follows it live.
         if self.appearance_sub.is_none() {
-            self.appearance_sub =
-                Some(window.observe_window_appearance(|_, cx| {
-                    if crate::settings::Settings::load().theme_pref()
-                        == crate::settings::ThemePref::System
-                    {
-                        crate::settings::apply_theme_pref(crate::settings::ThemePref::System, cx);
-                    }
-                }));
+            self.appearance_sub = Some(window.observe_window_appearance(|_, cx| {
+                if crate::settings::Settings::load().theme_pref()
+                    == crate::settings::ThemePref::System
+                {
+                    crate::settings::apply_theme_pref(crate::settings::ThemePref::System, cx);
+                }
+            }));
         }
         self.ensure_draft_for_active(window, cx);
         let slot_status = self.slot_status(cx);
@@ -1069,12 +1201,11 @@ impl Render for PidoApp {
                     .min_h_0()
                     .flex()
                     .flex_col()
-                    .child(div().flex_none().child(chat::render_header(
-                        &state,
-                        &cx.entity(),
-                        window,
-                        cx,
-                    )))
+                    .child(
+                        div()
+                            .flex_none()
+                            .child(chat::render_header(&state, &cx.entity(), cx)),
+                    )
                     .child(div().flex_1().min_h_0().overflow_hidden().child(
                         chat::render_transcript(&state, &cx.entity(), self, window, cx),
                     ))
@@ -1115,6 +1246,7 @@ impl Render for PidoApp {
             .extension_dialog_overlay(&state, window, cx)
             .or_else(|| self.rename_dialog(cx))
             .or_else(|| self.remove_project_dialog(cx))
+            .or_else(|| self.logout_provider_dialog(cx))
             .or_else(|| {
                 let view = cx.entity();
                 settings::settings_overlay(self, &view, window, cx)
@@ -1264,6 +1396,11 @@ impl Render for PidoApp {
                             cx.notify();
                             return;
                         }
+                        if this.confirm_logout.is_some() {
+                            this.confirm_logout = None;
+                            cx.notify();
+                            return;
+                        }
                         if let Some(dialog) = this.slot().state.read(cx).pending_dialog.clone() {
                             this.slot()
                                 .state
@@ -1320,6 +1457,9 @@ impl Render for PidoApp {
                         }
                     }))
                     .on_action(cx.listener(|this, _: &PinSession, _window, cx| {
+                        if this.modal_open(cx) {
+                            return;
+                        }
                         if let Some(file) = this.slot().state.read(cx).session_file.clone() {
                             this.slot()
                                 .state
@@ -1327,18 +1467,25 @@ impl Render for PidoApp {
                         }
                     }))
                     .on_action(cx.listener(|this, _: &RenameSession, window, cx| {
+                        if this.modal_open(cx) {
+                            return;
+                        }
                         if this.slot().state.read(cx).conn == Conn::Live {
                             this.open_rename(window, cx);
                         }
                     }))
                     .on_action(cx.listener(|this, _: &ForkSession, _window, cx| {
+                        if this.modal_open(cx) {
+                            return;
+                        }
                         if let Some(file) = this.slot().state.read(cx).session_file.clone() {
-                            this.slot()
-                                .state
-                                .update(cx, |s, cx| s.fork_session(&file, cx));
+                            this.fork_session(file, cx);
                         }
                     }))
                     .on_action(cx.listener(|this, _: &ArchiveSession, _window, cx| {
+                        if this.modal_open(cx) {
+                            return;
+                        }
                         if let Some(file) = this.slot().state.read(cx).session_file.clone() {
                             this.slot()
                                 .state
@@ -1946,6 +2093,10 @@ impl PidoApp {
                 cx.notify();
             });
         };
+        // The label is captured rather than re-read from `confirm_remove`:
+        // ConfirmDialog closes (and runs `on_close`, which clears the field)
+        // before `on_confirm`, so reading it there would yield an empty path.
+        let confirm_cwd = cwd.clone();
         Some(
             ConfirmDialog::new(
                 "remove-project-dialog",
@@ -1957,10 +2108,9 @@ impl PidoApp {
             .destructive()
             .on_confirm(move |_, cx| {
                 confirm_me.update(cx, |this, cx| {
-                    let cwd = this.confirm_remove.take().unwrap_or_default();
                     this.slot()
                         .state
-                        .update(cx, |s, cx| s.remove_project(&cwd, cx));
+                        .update(cx, |s, cx| s.remove_project(&confirm_cwd, cx));
                     cx.notify();
                 });
             })
@@ -2076,6 +2226,7 @@ impl PidoApp {
     fn modal_open(&self, cx: &App) -> bool {
         self.slot().rename_open
             || self.confirm_remove.is_some()
+            || self.confirm_logout.is_some()
             || self.settings_open.is_some()
             || self.slot().state.read(cx).pending_dialog.is_some()
     }
@@ -2085,7 +2236,7 @@ impl PidoApp {
     pub fn open_settings(
         &mut self,
         page: settings::SettingsPage,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         if self.modal_open(cx) {
@@ -2098,14 +2249,44 @@ impl PidoApp {
             .map(|environment| environment.ready_providers.clone())
             .unwrap_or_default();
         let project_cwd = self.slot().state.read(cx).cwd.clone();
-        self.settings_snapshot = Some(settings::SettingsSnapshot::load(project_cwd.as_deref(), ready));
+        let snapshot = settings::SettingsSnapshot::load(project_cwd.as_deref(), ready);
+        // Seed the edit fields from the snapshot; the save actions read them
+        // back, so they must exist for as long as the window does.
+        let provider = snapshot.setting_str("defaultProvider").unwrap_or_default();
+        let model = snapshot.setting_str("defaultModel").unwrap_or_default();
+        self.settings_provider_input = Some(cx.new(|cx| {
+            let mut input = TextInput::new(window, cx);
+            if !provider.is_empty() {
+                input.set_text(&provider, cx);
+            }
+            input
+        }));
+        self.settings_model_input = Some(cx.new(|cx| {
+            let mut input = TextInput::new(window, cx);
+            if !model.is_empty() {
+                input.set_text(&model, cx);
+            }
+            input
+        }));
+        self.settings_ext_input = Some(cx.new(|cx| TextInput::new(window, cx)));
+        self.confirm_logout = None;
+        self.settings_snapshot = Some(snapshot);
         self.settings_open = Some(page);
+        // Take the keyboard: otherwise the composer behind the scrim keeps it
+        // and typing (or Enter) lands in the chat draft.
+        window.focus(&self.settings_focus, cx);
         cx.notify();
     }
 
     pub fn close_settings(&mut self, cx: &mut Context<Self>) {
         self.settings_open = None;
         self.settings_snapshot = None;
+        self.settings_provider_input = None;
+        self.settings_model_input = None;
+        self.settings_ext_input = None;
+        self.confirm_logout = None;
+        // Hand the keyboard back to the composer.
+        self.slot_mut().composer_focused = false;
         cx.notify();
     }
 
@@ -2114,6 +2295,428 @@ impl PidoApp {
         if self.settings_open != Some(page) {
             self.settings_open = Some(page);
             cx.notify();
+        }
+    }
+
+    // -- settings window: pi config edits -----------------------------------
+    //
+    // pi has no RPC for its persisted configuration, so every action here
+    // edits one of pi's files directly (atomically, unknown fields intact)
+    // and patches the snapshot in place. pi reads these files at startup, so
+    // running sessions pick changes up only after a restart — the pages say
+    // so.
+
+    /// A failed config write surfaces as a notice on the active slot.
+    fn settings_error(&mut self, error: String, cx: &mut Context<Self>) {
+        log::warn!("settings: {error}");
+        let text = crate::i18n::t_arg(cx, "settings_write_failed", "e", &error).to_string();
+        self.slot().state.update(cx, |state, _| {
+            state.push_notice(crate::state::NoticeKind::Error, text)
+        });
+    }
+
+    pub fn open_logout_confirm(&mut self, provider: String, cx: &mut Context<Self>) {
+        self.confirm_logout = Some(provider);
+        cx.notify();
+    }
+
+    /// Persist the provider/model fields next to pi's own defaults.
+    pub fn save_pi_defaults(&mut self, cx: &mut Context<Self>) {
+        let provider = self
+            .settings_provider_input
+            .as_ref()
+            .map(|field| field.read(cx).text().trim().to_string())
+            .unwrap_or_default();
+        let model = self
+            .settings_model_input
+            .as_ref()
+            .map(|field| field.read(cx).text().trim().to_string())
+            .unwrap_or_default();
+        if provider.is_empty() && model.is_empty() {
+            return;
+        }
+        let Some(agent_dir) = self
+            .settings_snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.agent_dir.clone())
+        else {
+            return;
+        };
+        let path = pi_rpc::config::agent_settings_path(&agent_dir);
+        let result = pi_rpc::config::write_json_atomic(&path, |value| {
+            if !provider.is_empty() {
+                value["defaultProvider"] = serde_json::Value::String(provider);
+            }
+            if !model.is_empty() {
+                value["defaultModel"] = serde_json::Value::String(model);
+            }
+        });
+        self.after_settings_write(result, cx);
+    }
+
+    /// Persist pi's startup thinking level.
+    pub fn set_default_thinking(&mut self, level: String, cx: &mut Context<Self>) {
+        let Some(agent_dir) = self
+            .settings_snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.agent_dir.clone())
+        else {
+            return;
+        };
+        let path = pi_rpc::config::agent_settings_path(&agent_dir);
+        let result = pi_rpc::config::write_json_atomic(&path, |value| {
+            value["defaultThinkingLevel"] = serde_json::Value::String(level);
+        });
+        self.after_settings_write(result, cx);
+    }
+
+    /// Toggle a skill on or off in the settings array of its own scope —
+    /// a user skill flips in the global file, a project skill in `.pi/`.
+    pub fn set_skill_enabled(
+        &mut self,
+        skill: pi_rpc::resources::SkillSummary,
+        enabled: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((path, base_dir)) = self.resource_target(skill.scope) else {
+            return;
+        };
+        let Some(pattern) =
+            pi_rpc::config::resource_pattern(&base_dir, &skill.path.join("SKILL.md"))
+        else {
+            return;
+        };
+        let result = pi_rpc::config::write_json_atomic(&path, |value| {
+            let mut list = pi_rpc::config::string_array(value, "skills");
+            pi_rpc::config::toggle_resource(&mut list, &pattern, enabled);
+            value["skills"] =
+                serde_json::Value::Array(list.into_iter().map(serde_json::Value::String).collect());
+        });
+        match result {
+            Ok(()) => {
+                if let Some(snapshot) = self.settings_snapshot.as_mut() {
+                    for existing in &mut snapshot.skills {
+                        if existing.path == skill.path {
+                            existing.enabled = enabled;
+                        }
+                    }
+                }
+                cx.notify();
+            }
+            Err(error) => self.settings_error(error, cx),
+        }
+    }
+
+    /// Toggle a builtin extension. A project override entry already owns the
+    /// decision, so the flip lands there; otherwise in the global file.
+    pub fn set_builtin_extension_enabled(
+        &mut self,
+        id: &str,
+        enabled: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((current, project_owns)) = self.settings_snapshot.as_ref().map(|snapshot| {
+            pi_rpc::config::builtin_extension_state(
+                &snapshot.pi_settings,
+                &snapshot.project_settings,
+                id,
+            )
+        }) else {
+            return;
+        };
+        if current == enabled {
+            return;
+        }
+        let scope = if project_owns {
+            pi_rpc::resources::Scope::Project
+        } else {
+            pi_rpc::resources::Scope::User
+        };
+        let Some(path) = self.resource_settings_path(scope) else {
+            return;
+        };
+        let id = id.to_string();
+        let result = pi_rpc::config::write_json_atomic(&path, |value| {
+            let mut list = pi_rpc::config::string_array(value, "extensions");
+            pi_rpc::config::toggle_resource(&mut list, &id, enabled);
+            value["extensions"] =
+                serde_json::Value::Array(list.into_iter().map(serde_json::Value::String).collect());
+        });
+        self.after_settings_write(result, cx);
+    }
+
+    /// Toggle a discovered extension file with an explicit override in its
+    /// scope's settings array.
+    pub fn set_extension_enabled(
+        &mut self,
+        entry: pi_rpc::resources::ExtensionEntry,
+        enabled: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if entry.enabled == enabled {
+            return;
+        }
+        let Some(path) = entry.path.clone() else {
+            return;
+        };
+        let Some((settings_path, base_dir)) = self.resource_target(entry.scope) else {
+            return;
+        };
+        let Some(pattern) = pi_rpc::config::resource_pattern(&base_dir, &path) else {
+            return;
+        };
+        let result = pi_rpc::config::write_json_atomic(&settings_path, |value| {
+            let mut list = pi_rpc::config::string_array(value, "extensions");
+            pi_rpc::config::toggle_resource(&mut list, &pattern, enabled);
+            value["extensions"] =
+                serde_json::Value::Array(list.into_iter().map(serde_json::Value::String).collect());
+        });
+        match result {
+            Ok(()) => {
+                if let Some(snapshot) = self.settings_snapshot.as_mut() {
+                    for existing in &mut snapshot.extensions {
+                        if existing.source == entry.source
+                            && existing.scope == entry.scope
+                            && existing.channel == entry.channel
+                        {
+                            existing.enabled = enabled;
+                        }
+                    }
+                }
+                cx.notify();
+            }
+            Err(error) => self.settings_error(error, cx),
+        }
+    }
+
+    /// Drop one configured entry (`extensions` array or `packages`) from its
+    /// scope's settings file — pi's "remove" without uninstalling the copy.
+    pub fn remove_extension(
+        &mut self,
+        entry: pi_rpc::resources::ExtensionEntry,
+        cx: &mut Context<Self>,
+    ) {
+        let key = match entry.channel {
+            pi_rpc::resources::ExtensionChannel::SettingArray => "extensions",
+            pi_rpc::resources::ExtensionChannel::Package => "packages",
+            pi_rpc::resources::ExtensionChannel::Discovered => return,
+        };
+        let Some(path) = self.resource_settings_path(entry.scope) else {
+            return;
+        };
+        let result = pi_rpc::config::write_json_atomic(&path, |value| {
+            pi_rpc::config::remove_list_entry(value, key, &entry.source);
+        });
+        match result {
+            Ok(()) => {
+                if let Some(snapshot) = self.settings_snapshot.as_mut() {
+                    snapshot.extensions.retain(|existing| {
+                        !(existing.source == entry.source
+                            && existing.scope == entry.scope
+                            && existing.channel == entry.channel)
+                    });
+                }
+                cx.notify();
+            }
+            Err(error) => self.settings_error(error, cx),
+        }
+    }
+
+    /// Add the source typed into the add-extension row: remote specs to
+    /// `packages`, existing local paths to `extensions`, in the chosen scope.
+    pub fn add_extension(&mut self, cx: &mut Context<Self>) {
+        let source = self
+            .settings_ext_input
+            .as_ref()
+            .map(|field| field.read(cx).text().trim().to_string())
+            .unwrap_or_default();
+        if source.is_empty() {
+            return;
+        }
+        let remote = ["npm:", "git:", "https://", "http://"]
+            .iter()
+            .any(|prefix| source.starts_with(prefix));
+        if !remote && !std::path::Path::new(&source).exists() {
+            let text = crate::i18n::t(cx, "settings_ext_invalid").to_string();
+            self.slot().state.update(cx, |state, _| {
+                state.push_notice(crate::state::NoticeKind::Warn, text)
+            });
+            return;
+        }
+        let key = if remote { "packages" } else { "extensions" };
+        let scope = self.ext_add_scope;
+        let Some(path) = self.resource_settings_path(scope) else {
+            return;
+        };
+        let result = pi_rpc::config::write_json_atomic(&path, |value| {
+            pi_rpc::config::push_list_entry(value, key, &source);
+        });
+        match result {
+            Ok(()) => {
+                if let Some(snapshot) = self.settings_snapshot.as_mut() {
+                    snapshot.extensions = pi_rpc::resources::pi_extensions(
+                        snapshot.agent_dir.as_deref(),
+                        snapshot.project_cwd.as_deref(),
+                    );
+                }
+                if let Some(field) = self.settings_ext_input.clone() {
+                    field.update(cx, |input, cx| input.set_text("", cx));
+                }
+                cx.notify();
+            }
+            Err(error) => self.settings_error(error, cx),
+        }
+    }
+
+    /// Re-run the provider probes in the background and refresh the status
+    /// dots; also updates the process-wide environment cache.
+    pub fn refresh_providers(&mut self, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            let ready = cx
+                .background_executor()
+                .spawn(async { crate::state::probe_ready_providers_blocking() })
+                .await;
+            if let Ok(mut cached) = AppState::shared_environment().lock()
+                && let Some(environment) = cached.as_mut()
+            {
+                environment.ready_providers = ready.clone();
+            }
+            this.update(cx, |this, cx| {
+                if let Some(snapshot) = this.settings_snapshot.as_mut() {
+                    snapshot.ready_providers = ready;
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Sign out: delete the provider's entry from pi's auth.json. pi
+    /// re-reads that file on every credential use, so this applies at once.
+    pub fn logout_provider(&mut self, provider: String, cx: &mut Context<Self>) {
+        self.confirm_logout = None;
+        let Some(agent_dir) = self
+            .settings_snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.agent_dir.clone())
+        else {
+            return;
+        };
+        match pi_rpc::config::auth_remove_provider(&agent_dir, &provider) {
+            Ok(_) => {
+                if let Some(snapshot) = self.settings_snapshot.as_mut() {
+                    snapshot.auth_providers.retain(|name| *name != provider);
+                }
+                self.refresh_providers(cx);
+            }
+            Err(error) => self.settings_error(error, cx),
+        }
+        cx.notify();
+    }
+
+    /// Sign in: run `pi auth login <provider>` in the built-in terminal and
+    /// bring that tab forward. The interactive flow (browser, key paste)
+    /// happens there; pido never touches the credentials themselves.
+    pub fn login_provider(&mut self, provider: String, cx: &mut Context<Self>) {
+        // Resolve pi the way the session spawner does — desktop launches
+        // often miss the installer's PATH entries.
+        let probe = pi_rpc::client::probe_pi_install(None);
+        let program = probe
+            .program()
+            .map(|program| program.display().to_string())
+            .unwrap_or_else(|| "pi".to_string());
+        let quoted = if cfg!(windows) {
+            format!("& '{program}'")
+        } else {
+            format!("'{program}'")
+        };
+        let command = format!("{quoted} auth login {provider}\r\n");
+        self.right_open = true;
+        self.right_tab = RightTab::Terminal;
+        self.ensure_terminal(cx);
+        if let Some(terminal) = self.slot().terminal.clone() {
+            terminal.update(cx, |terminal, _| terminal.write(command.into_bytes()));
+        }
+        cx.notify();
+    }
+
+    /// The provider sign-out confirmation, while one is pending.
+    fn logout_provider_dialog(&mut self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        use ely_gpui_component::overlays::ConfirmDialog;
+
+        let provider = self.confirm_logout.clone()?;
+        let me = cx.entity();
+        let message =
+            crate::i18n::t_arg(cx, "provider_logout_confirm", "name", &provider).to_string();
+        let shut_me = me.clone();
+        let confirm_me = me.clone();
+        let shut = move |_: &mut Window, cx: &mut App| {
+            shut_me.update(cx, |this, cx| {
+                this.confirm_logout = None;
+                cx.notify();
+            });
+        };
+        // Captured for the same reason as the remove-project dialog:
+        // ConfirmDialog closes before `on_confirm` runs.
+        let confirm_provider = provider;
+        Some(
+            ConfirmDialog::new(
+                "logout-provider-dialog",
+                crate::i18n::t(cx, "provider_logout_title"),
+                message,
+                shut,
+            )
+            .confirm(crate::i18n::t(cx, "provider_logout_do"))
+            .destructive()
+            .on_confirm(move |_, cx| {
+                confirm_me.update(cx, |this, cx| {
+                    this.logout_provider(confirm_provider.clone(), cx)
+                });
+            })
+            .into_any_element(),
+        )
+    }
+
+    /// Where a scope's resource toggle writes: the settings file plus the
+    /// base dir patterns are relative to.
+    fn resource_target(
+        &self,
+        scope: pi_rpc::resources::Scope,
+    ) -> Option<(std::path::PathBuf, std::path::PathBuf)> {
+        let snapshot = self.settings_snapshot.as_ref()?;
+        match scope {
+            pi_rpc::resources::Scope::User => snapshot
+                .agent_dir
+                .as_ref()
+                .map(|dir| (pi_rpc::config::agent_settings_path(dir), dir.clone())),
+            pi_rpc::resources::Scope::Project => {
+                let cwd = snapshot.project_cwd.as_ref()?;
+                let base = cwd.join(".pi");
+                Some((pi_rpc::config::project_settings_path(cwd), base))
+            }
+        }
+    }
+
+    /// Just the settings file for a scope, for edits that need no base dir.
+    fn resource_settings_path(
+        &self,
+        scope: pi_rpc::resources::Scope,
+    ) -> Option<std::path::PathBuf> {
+        self.resource_target(scope).map(|(path, _)| path)
+    }
+
+    /// Shared tail of a settings write: refresh the snapshot's file views on
+    /// success, surface a notice on failure.
+    fn after_settings_write(&mut self, result: Result<(), String>, cx: &mut Context<Self>) {
+        match result {
+            Ok(()) => {
+                if let Some(snapshot) = self.settings_snapshot.as_mut() {
+                    snapshot.refresh_settings_files();
+                }
+                cx.notify();
+            }
+            Err(error) => self.settings_error(error, cx),
         }
     }
 
@@ -2183,7 +2786,7 @@ impl PidoApp {
         cx: &mut Context<Self>,
     ) -> Option<gpui::AnyElement> {
         use ely_gpui_component::buttons::{Button, ButtonVariant};
-        use ely_gpui_component::overlays::{ConfirmDialog, Dialog};
+        use ely_gpui_component::overlays::Dialog;
 
         let request = state.read(cx).pending_dialog.clone()?;
 
@@ -2281,20 +2884,38 @@ impl PidoApp {
                     .into_any_element()
             }
             pi_rpc::protocol::ExtensionUiMethod::Confirm => {
+                // A hand-built dialog rather than ConfirmDialog: that one
+                // closes (which reads as a cancel) *before* handing over the
+                // answer, so every confirmation reached pi as `cancelled`.
                 let confirm_state = state.clone();
                 let confirm_id = request.id.clone();
-                ConfirmDialog::new(
+                let confirm_label = confirm_label.clone();
+                let cancel_label = cancel_label_for_closure.clone();
+                let mut confirm_dialog = Dialog::new(
                     ("ext-dialog", dialog_slot(request.id.as_str())),
                     title,
-                    request.message.clone().unwrap_or_default(),
                     shut,
-                )
-                .confirm(confirm_label)
-                .on_confirm(move |_, cx| {
-                    confirm_state
-                        .update(cx, |s, cx| s.answer_dialog_confirm(&confirm_id, true, cx));
-                })
-                .into_any_element()
+                );
+                if let Some(message) = request.message.clone() {
+                    confirm_dialog = confirm_dialog.detail(message);
+                }
+                confirm_dialog
+                    .action(move |close| {
+                        Button::new("ext-confirm-cancel", cancel_label.clone())
+                            .variant(ButtonVariant::Ghost)
+                            .on_click(move |_, window, cx| close(window, cx))
+                    })
+                    .action(move |close| {
+                        Button::new("ext-confirm-yes", confirm_label.clone())
+                            .primary()
+                            .on_click(move |_, window, cx| {
+                                confirm_state.update(cx, |s, cx| {
+                                    s.answer_dialog_confirm(&confirm_id, true, cx)
+                                });
+                                close(window, cx);
+                            })
+                    })
+                    .into_any_element()
             }
             pi_rpc::protocol::ExtensionUiMethod::Input => {
                 // A hand-built dialog rather than PromptDialog: that one

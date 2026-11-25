@@ -2,22 +2,28 @@
 //! column (general / models / skills / extensions) and a content pane.
 //!
 //! The General page edits pido's own preferences and the active session's
-//! pi-side toggles; the other three pages are read-only views of pi's
-//! configuration, with buttons that reveal the backing files. Everything
-//! shown was snapshotted once when the window opened ([`SettingsSnapshot`]).
+//! pi-side toggles. The other three pages edit pi's configuration files
+//! directly (pi has no RPC for them): pi startup defaults, skill toggles,
+//! extension entries, and provider sign-in/-out. pi reads those files at
+//! startup, so edits name themselves on the page with a restart hint.
+//! Everything shown was snapshotted once when the window opened
+//! ([`SettingsSnapshot`]); writes patch the snapshot in place.
 
 use std::path::{Path, PathBuf};
 
 use ely_gpui_component::buttons::{Button, ButtonVariant, IconButton};
-use ely_gpui_component::forms::Switch;
+use ely_gpui_component::forms::{Input, Switch, TextInput};
 use ely_gpui_component::primitives::{Icon, IconName};
-use ely_gpui_component::theme::{ActiveTheme, IconSize};
+use ely_gpui_component::theme::{ActiveTheme, ControlSize, IconSize};
 use gpui::{
     AnyElement, App, Div, Entity, FontWeight, InteractiveElement, IntoElement, ParentElement,
-    SharedString, StatefulInteractiveElement, Styled, Window, div, px, relative, rgba,
-    prelude::FluentBuilder,
+    SharedString, StatefulInteractiveElement, Styled, Window, div, prelude::FluentBuilder, px,
+    relative, rgba,
 };
-use pi_rpc::resources::{BUILTIN_EXTENSIONS, ExtensionSource, Scope, SkillSummary};
+use pi_rpc::config;
+use pi_rpc::resources::{
+    BUILTIN_EXTENSIONS, ExtensionChannel, ExtensionEntry, Scope, SkillSummary,
+};
 
 use crate::i18n;
 use crate::settings::{Settings, ThemePref, apply_theme_pref, save_setting};
@@ -77,36 +83,44 @@ impl SettingsPage {
 /// Everything the window shows, read once per open. Files are tiny, so a
 /// synchronous read on the click path is fine — and keeps the render path
 /// free of file IO.
+#[derive(Clone)]
 pub struct SettingsSnapshot {
     pub theme_pref: ThemePref,
     pub locale: String,
     pub queue_mode: String,
     pub update_check: bool,
     pub agent_dir: Option<PathBuf>,
+    /// The active session's project directory, when one is open; project
+    /// scope writes land in its `.pi/settings.json`.
+    pub project_cwd: Option<PathBuf>,
     /// pi's global settings.json, raw.
     pub pi_settings: serde_json::Value,
+    /// The project's `.pi/settings.json`, raw; `Null` when absent.
+    pub project_settings: serde_json::Value,
     /// Providers with stored credentials (auth.json keys).
     pub auth_providers: Vec<String>,
     /// Providers whose `pi auth check` passed at probe time.
     pub ready_providers: Vec<String>,
     pub skills: Vec<SkillSummary>,
-    pub extensions: Vec<ExtensionSource>,
+    pub extensions: Vec<ExtensionEntry>,
 }
 
 impl SettingsSnapshot {
     pub fn load(project_cwd: Option<&Path>, ready_providers: Vec<String>) -> Self {
         let persisted = Settings::load();
         let agent_dir = pi_rpc::client::pi_agent_dir();
+        let project_settings = project_cwd
+            .map(config::project_settings_path)
+            .and_then(|path| config::read_json(&path).ok())
+            .unwrap_or(serde_json::Value::Null);
         Self {
             theme_pref: persisted.theme_pref(),
-            locale: persisted
-                .locale
-                .unwrap_or_else(|| i18n::ZH.to_string()),
-            queue_mode: persisted
-                .queue_mode
-                .unwrap_or_else(|| "steer".to_string()),
+            locale: persisted.locale.unwrap_or_else(|| i18n::ZH.to_string()),
+            queue_mode: persisted.queue_mode.unwrap_or_else(|| "steer".to_string()),
             update_check: persisted.update_check.unwrap_or(true),
+            project_cwd: project_cwd.map(Path::to_path_buf),
             pi_settings: pi_rpc::client::pi_agent_settings(),
+            project_settings,
             auth_providers: pi_rpc::client::pi_auth_provider_keys(),
             ready_providers,
             skills: pi_rpc::resources::pi_skills(agent_dir.as_deref(), project_cwd),
@@ -115,7 +129,19 @@ impl SettingsSnapshot {
         }
     }
 
-    fn setting_str(&self, key: &str) -> Option<String> {
+    /// Re-read both settings files into the snapshot after a write, so the
+    /// next frame shows exactly what pi will read at its next startup.
+    pub(crate) fn refresh_settings_files(&mut self) {
+        self.pi_settings = pi_rpc::client::pi_agent_settings();
+        self.project_settings = self
+            .project_cwd
+            .as_deref()
+            .map(config::project_settings_path)
+            .and_then(|path| config::read_json(&path).ok())
+            .unwrap_or(serde_json::Value::Null);
+    }
+
+    pub(crate) fn setting_str(&self, key: &str) -> Option<String> {
         self.pi_settings
             .get(key)
             .and_then(|value| value.as_str())
@@ -137,6 +163,9 @@ pub fn settings_overlay(
 
     let scrim = div()
         .id("settings-overlay")
+        // The overlay owns the keyboard while it is up: without this the
+        // composer behind it keeps the focus and typing reaches the chat.
+        .track_focus(&shell.settings_focus)
         .absolute()
         .inset_0()
         .occlude()
@@ -159,9 +188,7 @@ pub fn settings_overlay(
                 .child(
                     div()
                         .id("settings-card")
-                        .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| {
-                            cx.stop_propagation()
-                        })
+                        .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
                         .w(relative(0.82))
                         .max_w(px(1000.))
                         .min_w(px(760.))
@@ -237,11 +264,7 @@ fn config_file_target(snapshot: &SettingsSnapshot) -> PathBuf {
         .clone()
         .unwrap_or_else(|| PathBuf::from("."));
     let settings = dir.join("settings.json");
-    if settings.is_file() {
-        settings
-    } else {
-        dir
-    }
+    if settings.is_file() { settings } else { dir }
 }
 
 /// The nav column: one row per page, the active one highlighted.
@@ -276,12 +299,17 @@ fn nav_column(active: SettingsPage, view: &Entity<PidoApp>, cx: &App) -> Div {
                     row.bg(colors.selection).text_color(colors.fg)
                 })
                 .when(!selected, |row| {
-                    row.text_color(colors.fg_muted).hover(|row| row.bg(colors.hover))
+                    row.text_color(colors.fg_muted)
+                        .hover(|row| row.bg(colors.hover))
                 })
                 .child(
                     Icon::new(page.icon())
                         .size(IconSize::Sm)
-                        .color(if selected { colors.info } else { colors.fg_subtle }),
+                        .color(if selected {
+                            colors.info
+                        } else {
+                            colors.fg_subtle
+                        }),
                 )
                 .child(div().text_sm().child(page.title(cx).to_string()))
                 .on_click({
@@ -304,9 +332,9 @@ fn content_pane(
     let colors = &cx.theme().colors;
     let body = match page {
         SettingsPage::General => general_page(shell, snapshot, view, cx).into_any_element(),
-        SettingsPage::Models => models_page(shell, snapshot, cx).into_any_element(),
-        SettingsPage::Skills => skills_page(snapshot, cx).into_any_element(),
-        SettingsPage::Extensions => extensions_page(snapshot, cx).into_any_element(),
+        SettingsPage::Models => models_page(shell, snapshot, view, cx).into_any_element(),
+        SettingsPage::Skills => skills_page(snapshot, view, cx).into_any_element(),
+        SettingsPage::Extensions => extensions_page(shell, snapshot, view, cx).into_any_element(),
     };
     div()
         .id("settings-content")
@@ -343,17 +371,13 @@ fn content_pane(
 /// A titled block of rows.
 fn section(title: impl Into<SharedString>, cx: &App) -> Div {
     let colors = &cx.theme().colors;
-    div()
-        .flex()
-        .flex_col()
-        .gap_2()
-        .child(
-            div()
-                .text_sm()
-                .font_weight(FontWeight::SEMIBOLD)
-                .text_color(colors.fg)
-                .child(title.into().to_string()),
-        )
+    div().flex().flex_col().gap_2().child(
+        div()
+            .text_sm()
+            .font_weight(FontWeight::SEMIBOLD)
+            .text_color(colors.fg)
+            .child(title.into().to_string()),
+    )
 }
 
 /// One settings row: a title, optional description, and a control at the
@@ -437,14 +461,16 @@ fn general_page(
     cx: &App,
 ) -> Div {
     let connected = live_connection(shell, cx);
-    div().flex().flex_col().gap_4()
+    div()
+        .flex()
+        .flex_col()
+        .gap_4()
         // 外观
         .child({
             let mut block = section(i18n::t(cx, "settings_appearance"), cx);
             block = block.child(
-                row(i18n::t(cx, "settings_appearance_detail"), None, cx).child(
-                    seg_group_children(snapshot, view, cx),
-                ),
+                row(i18n::t(cx, "settings_appearance_detail"), None, cx)
+                    .child(seg_group_children(snapshot, view, cx)),
             );
             block
         })
@@ -460,26 +486,22 @@ fn general_page(
                         .border_1()
                         .border_color(cx.theme().colors.border)
                         .p_1()
-                        .child(
-                            seg(
-                                "lang-zh",
-                                "中文",
-                                snapshot.locale == i18n::ZH,
-                                view,
-                                cx,
-                                locale_click(i18n::ZH.to_string()),
-                            ),
-                        )
-                        .child(
-                            seg(
-                                "lang-en",
-                                "English",
-                                snapshot.locale == i18n::EN,
-                                view,
-                                cx,
-                                locale_click(i18n::EN.to_string()),
-                            ),
-                        ),
+                        .child(seg(
+                            "lang-zh",
+                            "中文",
+                            snapshot.locale == i18n::ZH,
+                            view,
+                            cx,
+                            locale_click(i18n::ZH.to_string()),
+                        ))
+                        .child(seg(
+                            "lang-en",
+                            "English",
+                            snapshot.locale == i18n::EN,
+                            view,
+                            cx,
+                            locale_click(i18n::EN.to_string()),
+                        )),
                 ),
             ),
         )
@@ -492,72 +514,98 @@ fn general_page(
             let s = shell.slot().state.read(cx);
             let auto_compact = s.auto_compaction.unwrap_or(true);
             let auto_retry = s.auto_retry.unwrap_or(true);
-            block.child(
-                row(
-                    i18n::t(cx, "auto_compact"),
-                    Some(i18n::t(cx, "auto_compact_detail")),
-                    cx,
+            block
+                .child(
+                    row(
+                        i18n::t(cx, "auto_compact"),
+                        Some(i18n::t(cx, "auto_compact_detail")),
+                        cx,
+                    )
+                    .child(switch_row(
+                        "switch-auto-compact",
+                        auto_compact,
+                        connected,
+                        view,
+                    )),
                 )
-                .child(switch_row("switch-auto-compact", auto_compact, connected, view)),
-            )
-            .child(
-                row(
-                    i18n::t(cx, "auto_retry"),
-                    Some(i18n::t(cx, "auto_retry_detail")),
-                    cx,
+                .child(
+                    row(
+                        i18n::t(cx, "compact_now"),
+                        Some(i18n::t(cx, "compact_now_detail")),
+                        cx,
+                    )
+                    .child(
+                        Button::new("settings-compact-now", i18n::t(cx, "run_now"))
+                            .variant(ButtonVariant::Secondary)
+                            .disabled(!connected)
+                            .on_click({
+                                let view = view.clone();
+                                move |_, _, cx| {
+                                    view.update(cx, |shell, cx| {
+                                        shell.slot().state.update(cx, |s, cx| s.compact_now(cx));
+                                    });
+                                }
+                            }),
+                    ),
                 )
-                .child(switch_row("switch-auto-retry", auto_retry, connected, view)),
-            )
+                .child(
+                    row(
+                        i18n::t(cx, "auto_retry"),
+                        Some(i18n::t(cx, "auto_retry_detail")),
+                        cx,
+                    )
+                    .child(switch_row(
+                        "switch-auto-retry",
+                        auto_retry,
+                        connected,
+                        view,
+                    )),
+                )
         })
         // 队列与更新
         .child(
-            section(i18n::t(cx, "settings_queue_update"), cx).child(
-                row(
-                    i18n::t(cx, "settings_queue_default"),
-                    Some(i18n::t(cx, "settings_queue_default_detail")),
-                    cx,
-                )
+            section(i18n::t(cx, "settings_queue_update"), cx)
                 .child(
-                    div()
-                        .flex()
-                        .flex_none()
-                        .gap_1()
-                        .rounded_md()
-                        .border_1()
-                        .border_color(cx.theme().colors.border)
-                        .p_1()
-                        .child(
-                            seg(
+                    row(
+                        i18n::t(cx, "settings_queue_default"),
+                        Some(i18n::t(cx, "settings_queue_default_detail")),
+                        cx,
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_none()
+                            .gap_1()
+                            .rounded_md()
+                            .border_1()
+                            .border_color(cx.theme().colors.border)
+                            .p_1()
+                            .child(seg(
                                 "queue-steer",
                                 i18n::t(cx, "queued_steer"),
                                 snapshot.queue_mode == "steer",
                                 view,
                                 cx,
                                 queue_mode_click("steer".to_string()),
-                            ),
-                        )
-                        .child(
-                            seg(
+                            ))
+                            .child(seg(
                                 "queue-followup",
                                 i18n::t(cx, "queued_follow_up"),
                                 snapshot.queue_mode == "follow_up",
                                 view,
                                 cx,
                                 queue_mode_click("follow_up".to_string()),
-                            ),
-                        ),
-                ),
-            )
-            .child(
-                row(i18n::t(cx, "settings_update_check"), None, cx).child(
-                    switch_row(
+                            )),
+                    ),
+                )
+                .child(
+                    row(i18n::t(cx, "settings_update_check"), None, cx).child(switch_row(
                         "switch-update-check",
                         snapshot.update_check,
                         true,
                         view,
-                    ),
+                    )),
                 ),
-            ),
         )
         // 思考等级
         .child(thinking_section(shell, view, cx))
@@ -565,11 +613,7 @@ fn general_page(
 
 /// The three appearance segments. Kept as a helper because the surrounding
 /// row builder already holds a `cx` borrow.
-fn seg_group_children(
-    snapshot: &SettingsSnapshot,
-    view: &Entity<PidoApp>,
-    cx: &App,
-) -> Div {
+fn seg_group_children(snapshot: &SettingsSnapshot, view: &Entity<PidoApp>, cx: &App) -> Div {
     div()
         .flex()
         .flex_none()
@@ -578,36 +622,30 @@ fn seg_group_children(
         .border_1()
         .border_color(cx.theme().colors.border)
         .p_1()
-        .child(
-            seg(
-                "theme-dark",
-                i18n::t(cx, "appearance_dark"),
-                snapshot.theme_pref == ThemePref::Dark,
-                view,
-                cx,
-                theme_click(ThemePref::Dark),
-            ),
-        )
-        .child(
-            seg(
-                "theme-light",
-                i18n::t(cx, "appearance_light"),
-                snapshot.theme_pref == ThemePref::Light,
-                view,
-                cx,
-                theme_click(ThemePref::Light),
-            ),
-        )
-        .child(
-            seg(
-                "theme-system",
-                i18n::t(cx, "appearance_system"),
-                snapshot.theme_pref == ThemePref::System,
-                view,
-                cx,
-                theme_click(ThemePref::System),
-            ),
-        )
+        .child(seg(
+            "theme-dark",
+            i18n::t(cx, "appearance_dark"),
+            snapshot.theme_pref == ThemePref::Dark,
+            view,
+            cx,
+            theme_click(ThemePref::Dark),
+        ))
+        .child(seg(
+            "theme-light",
+            i18n::t(cx, "appearance_light"),
+            snapshot.theme_pref == ThemePref::Light,
+            view,
+            cx,
+            theme_click(ThemePref::Light),
+        ))
+        .child(seg(
+            "theme-system",
+            i18n::t(cx, "appearance_system"),
+            snapshot.theme_pref == ThemePref::System,
+            view,
+            cx,
+            theme_click(ThemePref::System),
+        ))
 }
 
 /// Whether the active slot has a pi that can take runtime toggles.
@@ -618,9 +656,7 @@ fn live_connection(shell: &PidoApp, cx: &App) -> bool {
     )
 }
 
-fn theme_click(
-    pref: ThemePref,
-) -> impl Fn(&mut PidoApp, &mut gpui::Context<PidoApp>) + 'static {
+fn theme_click(pref: ThemePref) -> impl Fn(&mut PidoApp, &mut gpui::Context<PidoApp>) + 'static {
     move |shell, cx| {
         save_setting(|settings| settings.set_theme_pref(pref));
         apply_theme_pref(pref, cx);
@@ -631,9 +667,7 @@ fn theme_click(
     }
 }
 
-fn locale_click(
-    locale: String,
-) -> impl Fn(&mut PidoApp, &mut gpui::Context<PidoApp>) + 'static {
+fn locale_click(locale: String) -> impl Fn(&mut PidoApp, &mut gpui::Context<PidoApp>) + 'static {
     move |shell, cx| {
         save_setting(|settings| settings.locale = Some(locale.clone()));
         ely_gpui_component::i18n::I18n::set_locale(&locale, cx);
@@ -644,9 +678,7 @@ fn locale_click(
     }
 }
 
-fn queue_mode_click(
-    mode: String,
-) -> impl Fn(&mut PidoApp, &mut gpui::Context<PidoApp>) + 'static {
+fn queue_mode_click(mode: String) -> impl Fn(&mut PidoApp, &mut gpui::Context<PidoApp>) + 'static {
     move |shell, cx| {
         save_setting(|settings| settings.queue_mode = Some(mode.clone()));
         if let Some(snapshot) = shell.settings_snapshot.as_mut() {
@@ -674,17 +706,13 @@ fn switch_row(id: &'static str, on: bool, enabled: bool, view: &Entity<PidoApp>)
         "switch-auto-compact" => {
             let view = view.clone();
             switch = switch.on_change(move |on, _, cx| {
-                view.update(cx, |shell, cx| {
-                    shell.slot().state.update(cx, |s, cx| s.set_auto_compaction(on, cx));
-                });
+                view.update(cx, |shell, cx| shell.set_auto_compaction(on, cx));
             });
         }
         "switch-auto-retry" => {
             let view = view.clone();
             switch = switch.on_change(move |on, _, cx| {
-                view.update(cx, |shell, cx| {
-                    shell.slot().state.update(cx, |s, cx| s.set_auto_retry(on, cx));
-                });
+                view.update(cx, |shell, cx| shell.set_auto_retry(on, cx));
             });
         }
         "switch-update-check" => {
@@ -731,7 +759,10 @@ fn thinking_section(shell: &PidoApp, view: &Entity<PidoApp>, cx: &App) -> Div {
                         view,
                         cx,
                         move |shell, cx| {
-                            shell.slot().state.update(cx, |s, cx| s.set_thinking(level, cx));
+                            shell
+                                .slot()
+                                .state
+                                .update(cx, |s, cx| s.set_thinking(level, cx));
                         },
                     )
                 })),
@@ -748,10 +779,15 @@ fn hint(text: impl Into<SharedString>, cx: &App) -> Div {
 }
 
 // ---------------------------------------------------------------------------
-// 模型设置（只读）
+// 模型设置（可编辑 pi 启动默认值 + 提供商登录管理）
 // ---------------------------------------------------------------------------
 
-fn models_page(shell: &PidoApp, snapshot: &SettingsSnapshot, cx: &App) -> Div {
+fn models_page(
+    shell: &PidoApp,
+    snapshot: &SettingsSnapshot,
+    view: &Entity<PidoApp>,
+    cx: &App,
+) -> Div {
     let colors = &cx.theme().colors;
     let current = shell
         .slot()
@@ -770,33 +806,66 @@ fn models_page(shell: &PidoApp, snapshot: &SettingsSnapshot, cx: &App) -> Div {
         )),
     );
 
-    // pi's startup defaults, as configured in its settings.json.
-    let defaults = [
-        (
-            i18n::t(cx, "settings_default_provider"),
-            snapshot.setting_str("defaultProvider"),
-        ),
-        (
-            i18n::t(cx, "settings_default_model"),
-            snapshot.setting_str("defaultModel"),
-        ),
-        (
-            i18n::t(cx, "settings_default_thinking"),
-            snapshot.setting_str("defaultThinkingLevel"),
-        ),
-    ];
-    let mut defaults_block = section(i18n::t(cx, "settings_pi_defaults"), cx);
-    for (label, value) in defaults {
-        defaults_block = defaults_block.child(row(
-            label,
-            Some(SharedString::from(value.unwrap_or_else(|| "-".to_string()))),
-            cx,
-        ));
-    }
+    // pi's startup defaults, editable in place. pi reads them at startup, so
+    // a running session keeps its model until it restarts.
+    let defaults_block = section(i18n::t(cx, "settings_pi_defaults"), cx)
+        .child(
+            row(i18n::t(cx, "settings_default_provider"), None, cx)
+                .child(field_child(shell.settings_provider_input.clone(), cx)),
+        )
+        .child(
+            row(i18n::t(cx, "settings_default_model"), None, cx)
+                .child(field_child(shell.settings_model_input.clone(), cx)),
+        )
+        .child(
+            row(i18n::t(cx, "settings_default_thinking"), None, cx).child(
+                div()
+                    .flex()
+                    .flex_none()
+                    .flex_wrap()
+                    .gap_1()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(colors.border)
+                    .p_1()
+                    .children(config::DEFAULT_THINKING_LEVELS.iter().map(|level| {
+                        let level = *level;
+                        let slug = SharedString::from(level);
+                        seg(
+                            gpui::ElementId::Name(SharedString::from(format!("default-{level}"))),
+                            slug,
+                            snapshot.setting_str("defaultThinkingLevel").as_deref() == Some(level),
+                            view,
+                            cx,
+                            {
+                                let level = level.to_string();
+                                move |shell, cx| shell.set_default_thinking(level.clone(), cx)
+                            },
+                        )
+                    })),
+            ),
+        )
+        .child(
+            div().flex().child(
+                Button::new(
+                    "settings-save-defaults",
+                    i18n::t(cx, "settings_save_defaults"),
+                )
+                .variant(ButtonVariant::Secondary)
+                .on_click({
+                    let view = view.clone();
+                    move |_, _, cx| {
+                        view.update(cx, |shell, cx| shell.save_pi_defaults(cx));
+                    }
+                }),
+            ),
+        );
     page = page.child(defaults_block);
+    page = page.child(hint(i18n::t(cx, "settings_restart_hint"), cx));
 
-    // Provider login status: the union of pido's known providers and every
-    // key stored in pi's auth.json.
+    // Provider sign-in status with actions: sign-out deletes the stored
+    // credential (pi re-reads auth.json on every use), sign-in runs
+    // `pi auth login` in the built-in terminal.
     let mut providers: Vec<String> = KNOWN_PROVIDERS
         .iter()
         .map(|provider| provider.to_string())
@@ -806,37 +875,64 @@ fn models_page(shell: &PidoApp, snapshot: &SettingsSnapshot, cx: &App) -> Div {
     providers.dedup();
     let mut providers_block = section(i18n::t(cx, "settings_providers"), cx);
     for provider in providers {
-        let ready = snapshot.ready_providers.iter().any(|ready| ready == &provider);
+        let ready = snapshot
+            .ready_providers
+            .iter()
+            .any(|ready| ready == &provider);
         let (dot, label) = if ready {
             (colors.success, i18n::t(cx, "provider_ready"))
         } else {
             (colors.fg_subtle, i18n::t(cx, "provider_not_ready"))
         };
+        let action = if ready {
+            Button::new(
+                gpui::ElementId::Name(SharedString::from(format!("logout-{provider}"))),
+                i18n::t(cx, "provider_logout"),
+            )
+            .variant(ButtonVariant::Secondary)
+            .on_click({
+                let view = view.clone();
+                let provider = provider.clone();
+                move |_, _, cx| {
+                    view.update(cx, |shell, cx| {
+                        shell.open_logout_confirm(provider.clone(), cx)
+                    });
+                }
+            })
+        } else {
+            Button::new(
+                gpui::ElementId::Name(SharedString::from(format!("login-{provider}"))),
+                i18n::t(cx, "provider_login"),
+            )
+            .variant(ButtonVariant::Secondary)
+            .on_click({
+                let view = view.clone();
+                let provider = provider.clone();
+                move |_, _, cx| {
+                    view.update(cx, |shell, cx| shell.login_provider(provider.clone(), cx));
+                }
+            })
+        };
         providers_block = providers_block.child(
-            row(SharedString::from(provider.clone()), None, cx)
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap_2()
-                        .child(
-                            div()
-                                .size(px(8.))
-                                .rounded_full()
-                                .bg(dot),
-                        )
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(colors.fg_muted)
-                                .child(label.to_string()),
-                        ),
-                ),
+            row(SharedString::from(provider.clone()), None, cx).child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(div().size(px(8.)).rounded_full().bg(dot))
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(colors.fg_muted)
+                            .child(label.to_string()),
+                    )
+                    .child(action),
+            ),
         );
     }
     page = page.child(providers_block);
 
-    // Reveal buttons for the backing files.
+    // Reveal buttons for the backing files, plus a sign-in status refresh.
     let agent_dir = snapshot
         .agent_dir
         .clone()
@@ -866,32 +962,78 @@ fn models_page(shell: &PidoApp, snapshot: &SettingsSnapshot, cx: &App) -> Div {
                 Button::new("open-models", i18n::t(cx, "open_models_config"))
                     .variant(ButtonVariant::Secondary)
                     .on_click(move |_, _, _| crate::state::reveal_in_folder(&models_reveal)),
+            )
+            .child(
+                Button::new("provider-refresh", i18n::t(cx, "provider_refresh"))
+                    .variant(ButtonVariant::Secondary)
+                    .on_click({
+                        let view = view.clone();
+                        move |_, _, cx| {
+                            view.update(cx, |shell, cx| shell.refresh_providers(cx));
+                        }
+                    }),
             ),
     );
     page
 }
 
+/// A compact text field for inline edit rows. The entity lives on the shell
+/// (created when the window opens, cleared when it closes); the fixed-width
+/// wrapper does the sizing since `Input` has no styled geometry of its own.
+fn field_child(field: Option<Entity<TextInput>>, _cx: &App) -> Div {
+    div().w(px(240.)).child(match field {
+        Some(field) => Input::new(&field).size(ControlSize::Sm).into_any_element(),
+        None => div().child("-").into_any_element(),
+    })
+}
+
 // ---------------------------------------------------------------------------
-// Skill 设置（只读）
+// Skill 设置（开关写入对应 scope 的 settings.json）
 // ---------------------------------------------------------------------------
 
-fn skills_page(snapshot: &SettingsSnapshot, cx: &App) -> Div {
+fn skills_page(snapshot: &SettingsSnapshot, view: &Entity<PidoApp>, cx: &App) -> Div {
     let mut page = div().flex().flex_col().gap_4();
     let mut block = section(i18n::t(cx, "settings_installed_skills"), cx);
     if snapshot.skills.is_empty() {
         block = block.child(hint(i18n::t(cx, "settings_no_skills"), cx));
     }
-    for skill in &snapshot.skills {
+    for (ix, skill) in snapshot.skills.iter().enumerate() {
+        let switch = Switch::new(
+            gpui::ElementId::Name(SharedString::from(format!("skill-sw-{ix}"))),
+            skill.enabled,
+        )
+        .on_change({
+            let view = view.clone();
+            let skill = skill.clone();
+            move |on, _, cx| {
+                let skill = skill.clone();
+                view.update(cx, |shell, cx| shell.set_skill_enabled(skill, on, cx));
+            }
+        });
         block = block.child(
             row(
                 SharedString::from(skill.name.clone()),
                 Some(SharedString::from(skill.description.clone())),
                 cx,
             )
-            .child(scope_tag(skill.scope, cx)),
+            .child(scope_tag(skill.scope, cx))
+            .child(
+                IconButton::new(
+                    gpui::ElementId::Name(SharedString::from(format!("skill-reveal-{ix}"))),
+                    IconName::Folder,
+                )
+                .variant(ButtonVariant::Ghost)
+                .tooltip(i18n::t(cx, "reveal_in_folder"))
+                .on_click({
+                    let dir = skill.path.clone();
+                    move |_, _, _| crate::state::reveal_in_folder(&dir)
+                }),
+            )
+            .child(switch),
         );
     }
     page = page.child(block);
+    page = page.child(hint(i18n::t(cx, "settings_restart_hint"), cx));
 
     if let Some(dir) = snapshot
         .agent_dir
@@ -934,36 +1076,143 @@ fn scope_tag(scope: Scope, cx: &App) -> Div {
 }
 
 // ---------------------------------------------------------------------------
-// 扩展设置（只读）
+// 扩展设置（内置开关 + 配置条目移除 + 添加）
 // ---------------------------------------------------------------------------
 
-fn extensions_page(snapshot: &SettingsSnapshot, cx: &App) -> Div {
+fn extensions_page(
+    shell: &PidoApp,
+    snapshot: &SettingsSnapshot,
+    view: &Entity<PidoApp>,
+    cx: &App,
+) -> Div {
     let mut page = div().flex().flex_col().gap_4();
 
     let mut builtin_block = section(i18n::t(cx, "settings_builtin_extensions"), cx);
-    for name in BUILTIN_EXTENSIONS {
+    for (ix, id) in BUILTIN_EXTENSIONS.iter().enumerate() {
+        let (enabled, _) =
+            config::builtin_extension_state(&snapshot.pi_settings, &snapshot.project_settings, id);
+        let switch = Switch::new(
+            gpui::ElementId::Name(SharedString::from(format!("builtin-sw-{ix}"))),
+            enabled,
+        )
+        .on_change({
+            let view = view.clone();
+            let id = id.to_string();
+            move |on, _, cx| {
+                view.update(cx, |shell, cx| {
+                    shell.set_builtin_extension_enabled(&id, on, cx)
+                });
+            }
+        });
         builtin_block = builtin_block.child(
-            row(SharedString::from(*name), None, cx).child(builtin_tag(cx)),
+            row(SharedString::from(*id), None, cx)
+                .child(builtin_tag(cx))
+                .child(switch),
         );
     }
     page = page.child(builtin_block);
 
-    let mut configured_block =
-        section(i18n::t(cx, "settings_configured_extensions"), cx);
+    let mut configured_block = section(i18n::t(cx, "settings_configured_extensions"), cx);
     if snapshot.extensions.is_empty() {
         configured_block = configured_block.child(hint(i18n::t(cx, "settings_no_extensions"), cx));
     }
-    for source in &snapshot.extensions {
-        configured_block = configured_block.child(
-            row(
-                SharedString::from(source.source.clone()),
-                None,
-                cx,
+    for (ix, entry) in snapshot.extensions.iter().enumerate() {
+        let control = match entry.channel {
+            // Array and package entries own their row: removing the entry is
+            // the off switch, matching `pi remove`.
+            ExtensionChannel::SettingArray | ExtensionChannel::Package => Button::new(
+                gpui::ElementId::Name(SharedString::from(format!("ext-remove-{ix}"))),
+                i18n::t(cx, "settings_ext_remove"),
             )
-            .child(scope_tag(source.scope, cx)),
+            .variant(ButtonVariant::Secondary)
+            .on_click({
+                let view = view.clone();
+                let entry = entry.clone();
+                move |_, _, cx| {
+                    let entry = entry.clone();
+                    view.update(cx, |shell, cx| shell.remove_extension(entry, cx));
+                }
+            })
+            .into_any_element(),
+            // Discovered folder files toggle like skills: an explicit
+            // `+`/`-` override in the owning scope's settings.
+            ExtensionChannel::Discovered => Switch::new(
+                gpui::ElementId::Name(SharedString::from(format!("ext-sw-{ix}"))),
+                entry.enabled,
+            )
+            .on_change({
+                let view = view.clone();
+                let entry = entry.clone();
+                move |on, _, cx| {
+                    let entry = entry.clone();
+                    view.update(cx, |shell, cx| shell.set_extension_enabled(entry, on, cx));
+                }
+            })
+            .into_any_element(),
+        };
+        configured_block = configured_block.child(
+            row(SharedString::from(entry.source.clone()), None, cx)
+                .child(scope_tag(entry.scope, cx))
+                .child(control),
         );
     }
     page = page.child(configured_block);
+
+    // Add a source: npm/git/https land in `packages`, local paths in
+    // `extensions`, in the scope picked here.
+    let mut add_block = section(i18n::t(cx, "settings_ext_add"), cx).child(
+        row(
+            i18n::t(cx, "settings_ext_add"),
+            Some(i18n::t(cx, "settings_ext_add_detail")),
+            cx,
+        )
+        .child(
+            div()
+                .flex()
+                .flex_none()
+                .items_center()
+                .gap_2()
+                .child(field_child(shell.settings_ext_input.clone(), cx))
+                .child(
+                    div()
+                        .flex()
+                        .flex_none()
+                        .gap_1()
+                        .rounded_md()
+                        .border_1()
+                        .border_color(cx.theme().colors.border)
+                        .p_1()
+                        .child(seg(
+                            "ext-scope-user",
+                            i18n::t(cx, "scope_user"),
+                            shell.ext_add_scope == Scope::User,
+                            view,
+                            cx,
+                            ext_scope_click(Scope::User),
+                        ))
+                        .child(seg(
+                            "ext-scope-project",
+                            i18n::t(cx, "scope_project"),
+                            shell.ext_add_scope == Scope::Project,
+                            view,
+                            cx,
+                            ext_scope_click(Scope::Project),
+                        )),
+                )
+                .child(
+                    Button::new("ext-add", i18n::t(cx, "settings_add"))
+                        .variant(ButtonVariant::Secondary)
+                        .on_click({
+                            let view = view.clone();
+                            move |_, _, cx| {
+                                view.update(cx, |shell, cx| shell.add_extension(cx));
+                            }
+                        }),
+                ),
+        ),
+    );
+    add_block = add_block.child(hint(i18n::t(cx, "settings_restart_hint"), cx));
+    page = page.child(add_block);
 
     if let Some(agent_dir) = snapshot.agent_dir.clone() {
         let settings_path = agent_dir.join("settings.json");
@@ -983,6 +1232,13 @@ fn extensions_page(snapshot: &SettingsSnapshot, cx: &App) -> Div {
         page = page.child(buttons);
     }
     page
+}
+
+fn ext_scope_click(scope: Scope) -> impl Fn(&mut PidoApp, &mut gpui::Context<PidoApp>) + 'static {
+    move |shell, cx| {
+        shell.ext_add_scope = scope;
+        cx.notify();
+    }
 }
 
 fn builtin_tag(cx: &App) -> Div {

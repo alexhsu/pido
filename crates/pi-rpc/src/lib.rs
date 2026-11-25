@@ -9,6 +9,7 @@
 //! unit-testable against a bundled mock Pi binary.
 
 pub mod client;
+pub mod config;
 mod io_util;
 pub mod protocol;
 pub mod resources;
@@ -18,8 +19,11 @@ pub use client::{
     ClientEvent, DisconnectReason, PI_PATH_ENV, PiClient, PiProbe, PiProcessConfig, probe_auth,
     probe_pi_install,
 };
-pub use resources::{BUILTIN_EXTENSIONS, ExtensionSource, Scope, SkillSummary, pi_extensions, pi_skills};
 pub use protocol::{
     AgentMessage, Command, Event, Request, Response, RpcRecord, StreamingBehavior, parse_record,
+};
+pub use resources::{
+    BUILTIN_EXTENSIONS, ExtensionChannel, ExtensionEntry, Scope, SkillSummary, pi_extensions,
+    pi_skills,
 };
 pub use sessions::{SessionGroup, SessionScanner, SessionSummary, read_session_cwd};

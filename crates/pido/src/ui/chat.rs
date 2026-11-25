@@ -13,25 +13,21 @@ use gpui::{
 
 use crate::i18n;
 use crate::state::{AppState, AssistantView, NoticeKind, TranscriptItem};
-use crate::ui::app::{RightTab, toggle_theme};
+use crate::ui::app::RightTab;
 
-/// The header row above the transcript: session title, theme and language
-/// toggles, compaction. Model and thinking picks live in the composer's
-/// tool row; run stats sit under the composer.
+/// The header row above the transcript: the session title and three buttons
+/// — terminal, HTML export, settings. Theme, language, compaction and
+/// auto-retry live in the settings window; rename sits in the sidebar's
+/// session menu; every message copies itself; the diff tab rides in the
+/// right panel. Model and thinking picks live in the composer's tool row;
+/// run stats sit under the composer.
 pub fn render_header(
     state: &Entity<AppState>,
     view: &Entity<crate::ui::app::PidoApp>,
-    window: &mut Window,
     cx: &mut App,
 ) -> impl IntoElement + use<> {
     let theme = cx.theme();
     let s = state.read(cx);
-    // Menu picks read the state up front: the borrow has to end before the
-    // builder chain's mutable `cx` uses (menu_under).
-    let auto_retry_on = s.auto_retry.unwrap_or(true);
-    let retrying = s.retrying;
-    let app = state.clone();
-    let next_locale = i18n::other_locale(cx);
 
     div()
         .flex()
@@ -56,41 +52,8 @@ pub fn render_header(
                             .map(|p| p.to_string_lossy().into_owned())
                             .unwrap_or_default()
                     }),
-                )))
-                .child({
-                    let view = view.clone();
-                    ely_gpui_component::buttons::IconButton::new(
-                        "rename-session",
-                        ely_gpui_component::primitives::IconName::Pencil,
-                    )
-                    .variant(ely_gpui_component::buttons::ButtonVariant::Ghost)
-                    .tooltip(i18n::t(cx, "rename"))
-                    .on_click(move |_, window, cx| {
-                        view.update(cx, |this, cx| this.open_rename(window, cx));
-                    })
-                }),
+                ))),
         )
-        // The header's actions are icon buttons; what they do shows on hover.
-        .when(!s.changes.is_empty(), |this| {
-            let view = view.clone();
-            let count = s.changes.len();
-            let tooltip = format!(
-                "{} ({})",
-                i18n::t(cx, "changes"),
-                i18n::t_arg(cx, "changes_files", "n", &count.to_string())
-            );
-            this.child(
-                ely_gpui_component::buttons::IconButton::new(
-                    "open-changes",
-                    ely_gpui_component::primitives::IconName::MessageSquareDiff,
-                )
-                .variant(ely_gpui_component::buttons::ButtonVariant::Ghost)
-                .tooltip(tooltip)
-                .on_click(move |_, _, cx| {
-                    view.update(cx, |this, cx| this.open_right(RightTab::Diff, cx));
-                }),
-            )
-        })
         .child({
             let view = view.clone();
             ely_gpui_component::buttons::IconButton::new(
@@ -104,54 +67,7 @@ pub fn render_header(
             })
         })
         .child({
-            let dark = theme.is_dark();
-            ely_gpui_component::buttons::IconButton::new(
-                "theme",
-                if dark {
-                    ely_gpui_component::primitives::IconName::Sun
-                } else {
-                    ely_gpui_component::primitives::IconName::Moon
-                },
-            )
-            .variant(ely_gpui_component::buttons::ButtonVariant::Ghost)
-            .tooltip(i18n::t(cx, "theme"))
-            .on_click(|_, _, cx| toggle_theme(cx))
-        })
-        .child(
-            ely_gpui_component::buttons::IconButton::new(
-                "locale",
-                ely_gpui_component::primitives::IconName::Languages,
-            )
-            .variant(ely_gpui_component::buttons::ButtonVariant::Ghost)
-            .tooltip(next_locale)
-            .on_click(move |_, _, cx| {
-                crate::settings::save_setting(|s| {
-                    s.locale = Some(next_locale.to_string());
-                });
-                ely_gpui_component::i18n::I18n::set_locale(next_locale, cx);
-            }),
-        )
-        .child({
-            let app = app.clone();
-            ely_gpui_component::buttons::IconButton::new(
-                "copy-last-answer",
-                ely_gpui_component::primitives::IconName::Copy,
-            )
-            .variant(ely_gpui_component::buttons::ButtonVariant::Ghost)
-            .tooltip(i18n::t(cx, "copy_last_answer"))
-            .on_click(move |_, _, cx| {
-                app.update(cx, |s, cx| {
-                    let text = s.last_answer_text().unwrap_or_default();
-                    if !text.is_empty() {
-                        cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
-                        s.push_notice(NoticeKind::Info, i18n::t(cx, "copied_answer").to_string());
-                    }
-                    cx.notify();
-                });
-            })
-        })
-        .child({
-            let app = app.clone();
+            let app = state.clone();
             ely_gpui_component::buttons::IconButton::new(
                 "export-html",
                 ely_gpui_component::primitives::IconName::ExternalLink,
@@ -159,87 +75,6 @@ pub fn render_header(
             .variant(ely_gpui_component::buttons::ButtonVariant::Ghost)
             .tooltip(i18n::t(cx, "export_html"))
             .on_click(move |_, _, cx| app.update(cx, |s, cx| s.export_html(cx)))
-        })
-        .child({
-            let app = app.clone();
-            let auto = s.auto_compaction.unwrap_or(true);
-            let compact_label = i18n::t(cx, "compact_now").to_string();
-            let auto_label = i18n::t(cx, "auto_compact").to_string();
-            let tooltip = i18n::t(cx, "compact_now");
-            let compact = app.clone();
-            let menu = ely_gpui_component::menus::Menu::new()
-                .item(
-                    ely_gpui_component::menus::MenuItem::new(compact_label)
-                        .icon(ely_gpui_component::primitives::IconName::Minimize2)
-                        .on_click(move |_, cx| compact.update(cx, |s, cx| s.compact_now(cx))),
-                )
-                .item({
-                    let app = app.clone();
-                    ely_gpui_component::menus::MenuItem::check(auto_label, auto).on_click(
-                        move |_, cx| {
-                            app.update(cx, |s, cx| s.set_auto_compaction(!auto, cx));
-                        },
-                    )
-                });
-            ely_gpui_component::menus::menu_under(
-                "compact".into(),
-                &menu,
-                move |click| {
-                    ely_gpui_component::buttons::IconButton::new(
-                        "compact-button",
-                        ely_gpui_component::primitives::IconName::Minimize2,
-                    )
-                    .variant(ely_gpui_component::buttons::ButtonVariant::Ghost)
-                    .tooltip(tooltip)
-                    .on_click(move |event, window, cx| click(event, window, cx))
-                    .into_any_element()
-                },
-                window,
-                cx,
-            )
-        })
-        .child({
-            // Auto-retry flips pi's persisted switch; stopping cancels the
-            // backoff pi is currently waiting out.
-            let app = app.clone();
-            let auto = auto_retry_on;
-            let auto_label = i18n::t(cx, "auto_retry").to_string();
-            let stop_label = i18n::t(cx, "stop_retry").to_string();
-            let tooltip = i18n::t(cx, "auto_retry");
-            let mut menu = ely_gpui_component::menus::Menu::new().item({
-                let app = app.clone();
-                ely_gpui_component::menus::MenuItem::check(auto_label, auto).on_click(
-                    move |_, cx| {
-                        app.update(cx, |s, cx| s.set_auto_retry(!auto, cx));
-                    },
-                )
-            });
-            if retrying {
-                let app = app.clone();
-                menu = menu.item(
-                    ely_gpui_component::menus::MenuItem::new(stop_label)
-                        .icon(ely_gpui_component::primitives::IconName::X)
-                        .on_click(move |_, cx| {
-                            app.update(cx, |s, cx| s.abort_retry(cx));
-                        }),
-                );
-            }
-            ely_gpui_component::menus::menu_under(
-                "retry".into(),
-                &menu,
-                move |click| {
-                    ely_gpui_component::buttons::IconButton::new(
-                        "retry-button",
-                        ely_gpui_component::primitives::IconName::RotateCcw,
-                    )
-                    .variant(ely_gpui_component::buttons::ButtonVariant::Ghost)
-                    .tooltip(tooltip)
-                    .on_click(move |event, window, cx| click(event, window, cx))
-                    .into_any_element()
-                },
-                window,
-                cx,
-            )
         })
         .child({
             let view = view.clone();
@@ -251,7 +86,9 @@ pub fn render_header(
             .variant(ely_gpui_component::buttons::ButtonVariant::Ghost)
             .tooltip(i18n::t(cx, "settings"))
             .on_click(move |_, window, cx| {
-                view.update(cx, |shell, cx| shell.open_settings(settings_page, window, cx));
+                view.update(cx, |shell, cx| {
+                    shell.open_settings(settings_page, window, cx)
+                });
             })
         })
 }
@@ -1192,9 +1029,11 @@ fn render_update_banner(
         crate::update::UpdateStatus::Failed { message } => {
             let banner_view_5 = view.clone();
             actions.push(
+                // A failure carries no release metadata, so the retry is a
+                // fresh check rather than a second download attempt.
                 Button::new("update-retry", i18n::t(cx, "retry"))
                     .on_click(move |_, _, cx| {
-                        banner_view_5.update(cx, |this, cx| this.start_update_download(cx));
+                        banner_view_5.update(cx, |this, cx| this.check_for_updates(true, cx));
                     })
                     .into_any_element(),
             );

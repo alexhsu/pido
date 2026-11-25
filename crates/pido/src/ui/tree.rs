@@ -238,7 +238,9 @@ fn tree_row(
         } else {
             gpui::transparent_black()
         })
-        .pl(px(10.0 + row.depth as f32 * 16.0))
+        // The sidebar caps its fork indent the same way: a deep fork chain
+        // would otherwise push the text out of the panel.
+        .pl(px(10.0 + row.depth.min(6) as f32 * 16.0))
         .pr_3()
         .py_0p5()
         .w_full()

@@ -1269,24 +1269,7 @@ impl AppState {
                         };
                     };
                     let retry_enabled = pi_rpc::client::pi_retry_enabled(cwd.as_deref());
-                    let providers = probe_providers();
-                    let ready_providers = std::thread::scope(|scope| {
-                        let handles = providers
-                            .into_iter()
-                            .map(|provider| {
-                                scope.spawn(move || {
-                                    let ready = pi_rpc::client::probe_auth(&provider, None)
-                                        .unwrap_or(false);
-                                    (provider, ready)
-                                })
-                            })
-                            .collect::<Vec<_>>();
-                        handles
-                            .into_iter()
-                            .filter_map(|handle| handle.join().ok())
-                            .filter_map(|(provider, ready)| ready.then_some(provider))
-                            .collect()
-                    });
+                    let ready_providers = probe_ready_providers_blocking();
                     Environment {
                         pi_version: Some(pi_version),
                         pi_error: None,
@@ -3909,17 +3892,6 @@ impl AppState {
         cx.notify();
     }
 
-    /// The text of the newest assistant message in the open transcript, for
-    /// a one-click copy of the last answer.
-    pub fn last_answer_text(&self) -> Option<String> {
-        self.transcript.iter().rev().find_map(|item| match item {
-            TranscriptItem::Assistant(view) if !view.text().is_empty() => {
-                Some(view.text().to_string())
-            }
-            _ => None,
-        })
-    }
-
     /// Flip pi's auto-compaction switch. Optimistic, like the model pick:
     /// a failed round trip restores the previous value.
     pub fn set_auto_compaction(&mut self, enabled: bool, cx: &mut Context<Self>) {
@@ -5376,6 +5348,29 @@ fn probe_providers() -> Vec<String> {
     providers.sort();
     providers.dedup();
     providers
+}
+
+/// The candidate providers filtered down to the ones whose `pi auth check`
+/// passes right now. Blocking (one pi process per provider) — run it on a
+/// background executor; the settings window's refresh button does.
+pub(crate) fn probe_ready_providers_blocking() -> Vec<String> {
+    let providers = probe_providers();
+    std::thread::scope(|scope| {
+        let handles = providers
+            .into_iter()
+            .map(|provider| {
+                scope.spawn(move || {
+                    let ready = pi_rpc::client::probe_auth(&provider, None).unwrap_or(false);
+                    (provider, ready)
+                })
+            })
+            .collect::<Vec<_>>();
+        handles
+            .into_iter()
+            .filter_map(|handle| handle.join().ok())
+            .filter_map(|(provider, ready)| ready.then_some(provider))
+            .collect()
+    })
 }
 
 /// Pretty-print JSON arguments for the tool card.

@@ -14,15 +14,15 @@ A native desktop client for the [Pi coding agent](https://github.com/earendil-wo
 - **会话管理** — 侧栏按项目分组列出 `~/.pi/agent/sessions` 的历史会话:分叉/克隆出的子会话按血统嵌套在父会话下(可折叠);「项目」标题栏可一键全部折叠、"+" 添加任意文件夹为项目(无会话也常驻列表),拖拽调宽且限定 200–480px;右键菜单可置顶、重命名、分叉、复制 Session ID、在文件夹显示、归档(归档项收进底部「已归档」折叠);顶部搜索框按标题或内容过滤
 - **消息操作** — 悬停用户消息显示分叉(分出新会话,该条消息回填输入框供修改重发)、时间和复制;悬停回答显示复制、token 用量和时间
 - **回合状态** — 提交后回答上方计时(「已工作 1分4秒」),结束定格为「已完成,用时 X」;完成后默认折叠工具调用和思考过程,点状态行可展开
-- **上下文压缩** — 头部压缩按钮:立即压缩,或开/关 pi 的自动压缩;压缩完成的横幅带前后 token 数,历史会话在压缩点留摘要标记
+- **上下文压缩** — 设置窗口「pi 行为」里一键立即压缩,或开/关 pi 的自动压缩;压缩完成的横幅带前后 token 数,历史会话在压缩点留摘要标记
 - **导出 HTML** — 头部一键把当前会话导出为 HTML 并在文件管理器中显示
 - **命令运行器** — 输入框输 `!cmd` 直接跑 shell 命令(`!!` 发送原文),输出流式进转录行、可中止,并进入模型上下文;命令面板带「运行命令」模板
 - **状态同步** — pi 侧的改名/换思考级别即时反映到侧栏与选择器;重试显示「第 2/3 次(2s 后):错误详情」;压缩启动有提示
-- **运行控制** — 队列投递方式可选(全部一次 / 每轮一条);头部「复制最后回答」一键复制;流式中实时显示累计 token
+- **运行控制** — 队列投递方式可选(全部一次 / 每轮一条);每条消息悬停即可复制;流式中实时显示累计 token
 - **富展示** — 工具返回的图片(read 截图等)直接在卡片下渲染;工具结果一键复制;回答里的代码块自带复制按钮与折叠
 - **并行会话** — 侧栏就是任务管理器:切走的会话在后台继续跑(每个会话独立 pi 进程),列表行前有运行中的 spinner 与完成后的未读点;右键可停止后台运行或关闭后台会话;同时最多 4 个活进程,满员自动让位给最旧的空闲会话;退出时的会话编队在下次启动原样回归
 - **会话分支树** — 右侧栏「会话树」标签画出当前会话的分叉结构:活跃分支高亮,离开的分支带摘要标记(`branch_summary`);活跃分支的提问可在节点上一键「从这里分叉」;未连接时直接读会话文件建树
-- **自动重试控制** — 头部重试菜单可开关 pi 的自动重试(写入 pi 的全局设置);重试等待中的横幅与菜单都能一键停止
+- **自动重试控制** — 设置窗口「pi 行为」里的自动重试开关(写入 pi 的全局设置);重试等待中的横幅可一键停止
 - **版本提示** — pi 低于 pido 支持的最低版本时,转录上方给出升级提醒
 - **搜索/面板增强** — 面板与侧栏过滤支持子序列模糊匹配(`xs` 找到「新会话」);面板置顶工作区文件(@ 引用);查找条显示命中行类型与上下文摘录
 - **会话搜索** — 转录区 Ctrl+F 即时过滤并循环跳转(高亮当前行);侧栏输入框按标题/内容过滤会话,内容命中带上下文摘录
@@ -31,22 +31,22 @@ A native desktop client for the [Pi coding agent](https://github.com/earendil-wo
 - **内置终端** — 右侧栏终端页运行真实 shell(Windows 为 PowerShell,Linux/macOS 为 `$SHELL`,ConPTY/PTY 驱动),可新建、随会话目录启动;切换会话时自动在新目录重生
 - **统计** — token 用量、成本、上下文占用,每轮结束后刷新
 - **亮暗主题 + 中英双语** — 一键切换,偏好持久化(含窗口尺寸、最近项目)
-- **系统设置** — 头部齿轮打开设置窗口:通用(外观深色/浅色/跟随系统、语言、pi 的自动压缩与自动重试、队列投递默认值、启动检查更新、思考等级)、模型(当前模型、pi 启动默认值、provider 登录状态)、Skill 与扩展(只读列表 + 打开配置/目录),其余项一键跳转 pi 的配置文件
+- **系统设置** — 头部齿轮打开设置窗口:通用(外观深色/浅色/跟随系统、语言、pi 的自动压缩与自动重试、队列投递默认值、启动检查更新、思考等级)、模型(pi 启动默认值可直接编辑:默认提供商/模型/思考等级;provider 登录状态一目了然,未登录的一键在内置终端里跑 `pi auth login`,已登录的可登出——删除 pi 存的凭据,运行中会话立即生效)、Skill 与扩展(每个技能可开关、可跳到所在目录;内置扩展可停用,配置的扩展与包可移除,可按用户/项目级添加 npm:/git:/https 源或本地扩展路径)。这些改动直接写入 pi 的配置文件,运行中的会话在重启 pi 后生效、新会话立即生效
 - **A complete chat loop** — pick a project directory, stream replies, thinking, and tool-call cards live
 - **Steering** — typing while the agent runs steers it, or switches to queueing it as a follow-up; queued messages show as chips over the composer and can be cleared in one click; Esc or the stop button clears the queue and aborts
 - **Model & thinking switching** — the model pill at the composer's right opens two levels: model and thinking level
 - **Sessions** — the sidebar lists past sessions grouped by project, with forked/cloned children nested under the session they came from (foldable): the "Projects" header folds everything at once and a "+" button adds any folder as a project (it stays listed even with no sessions); the width drags between 200–480px. The right-click menu pins, renames, forks, copies the session ID, reveals the file, and archives (archived sessions collect under an "Archived" fold at the bottom); a search box filters by title or content
 - **Message actions** — hover a prompt to fork (a new session without it, its text back in the composer for re-editing), or copy; hover a reply for copy, token usage and time
 - **Turn status** — a clock above the reply while it works ("Working · 1m 4s"), frozen to "Done in X" on completion; tool calls and thinking fold away, click the line to re-open
-- **Compaction** — the header compaction button: compact now, or toggle pi's auto-compaction; the finished banner reports the before/after token counts, and restored sessions keep a summary marker at each compaction seam
+- **Compaction** — compact now, or toggle pi's auto-compaction, in the settings window's "pi behavior" section; the finished banner reports the before/after token counts, and restored sessions keep a summary marker at each compaction seam
 - **HTML export** — one click exports the open session to HTML and reveals the file
 - **Shell runner** — type `!cmd` to run a shell command (`!!` sends literally); output streams into a transcript row with a stop button and joins the model's context; the palette carries a run-a-command entry
 - **State sync** — renames and thinking-level picks made in pi reach the sidebar and picker live; retries name their attempt and delay; compaction start announces itself
-- **Run controls** — queue delivery is all-at-once or one-per-turn; the header copies the last answer; a streaming answer shows its cumulative token count as it grows
+- **Run controls** — queue delivery is all-at-once or one-per-turn; every message copies on hover; a streaming answer shows its cumulative token count as it grows
 - **Rich results** — images a tool returns (screenshot reads) render under the card; results copy in one click; code blocks in answers carry their own copy button and folding
 - **Parallel sessions** — the sidebar doubles as the task manager: a session you switch away from keeps running in the background (each with its own pi process), rows carry a running spinner and an after-settle unread dot, the session menu stops a background run or closes its slot, at most four processes live at once with the oldest idle one giving way, and the fleet that was open at quit comes back on the next start
 - **Branch tree** — the right panel's "Session tree" tab draws the open session's fork structure: the active branch highlighted, abandoned ones marked with their summaries (`branch_summary`); a user prompt on the active branch forks from its node in one click; with no live pi the tree is built from the session file itself
-- **Retry control** — the header retry menu flips pi's auto-retry (persisted into pi's own global settings); a retry's backoff stops from the banner or the menu
+- **Retry control** — the auto-retry switch in the settings window's "pi behavior" section (persisted into pi's own global settings, applied to every open session); a retry's backoff stops from the banner
 - **Version notice** — when the pi CLI is older than the minimum pido expects, a banner above the transcript says so
 - **Search/palette** — subsequence fuzzy matching (`xs` finds 新会话); workspace files lead the palette (@refs); the find bar names the matched row's kind and excerpt
 - **Search** — Ctrl+F filters the transcript and cycles through matches (the current row tints); the sidebar filters sessions by title or content, with a snippet on content hits
@@ -55,7 +55,7 @@ A native desktop client for the [Pi coding agent](https://github.com/earendil-wo
 - **Built-in terminal** — the right panel's terminal tab runs a real shell (PowerShell on Windows, `$SHELL` on Linux/macOS) via ConPTY/PTY; spawn a fresh one any time, and it respawns in the new directory when the session switches
 - **Stats** — tokens, cost, and context usage refresh after every run
 - **Dark/light + 中文/English** — one-click toggle, persisted along with window size and last project
-- **Settings** — the header gear opens a settings window: General (appearance dark/light/system, language, pi's auto-compaction and auto-retry, queue delivery default, update checks, thinking level), Models (current model, pi's startup defaults, provider sign-in status), and Skills & Extensions (read-only lists with one-click reveal of the backing files and directories)
+- **Settings** — the header gear opens a settings window: General (appearance dark/light/system, language, pi's auto-compaction and auto-retry, queue delivery default, update checks, thinking level), Models (pi's startup defaults are editable — default provider, model, and thinking level — and provider sign-in status comes with actions: one-click sign-in runs `pi auth login` in the built-in terminal, sign-out deletes the stored credential and applies to running sessions immediately), and Skills & Extensions (toggle each skill on or off and reveal its folder; disable builtin extensions, remove configured extensions and packages, and add an npm:/git:/https source or a local path at user or project scope). These edits land in pi's config files; running sessions pick them up after pi restarts, new sessions immediately
 
 ## 前置条件 / Prerequisites
 

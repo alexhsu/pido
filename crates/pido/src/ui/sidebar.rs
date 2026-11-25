@@ -698,9 +698,9 @@ fn session_menu(
     let mut fork = MenuItem::new(i18n::t(cx, "fork_session"))
         .icon(IconName::GitBranch)
         .on_click({
-            let state = state.clone();
+            let view = view.clone();
             let path = path.to_string();
-            move |_, cx| state.update(cx, |s, cx| s.fork_session(&path, cx))
+            move |_, cx| view.update(cx, |shell, cx| shell.fork_session(path.clone(), cx))
         });
 
     let reveal = MenuItem::new(i18n::t(cx, "reveal_in_folder"))

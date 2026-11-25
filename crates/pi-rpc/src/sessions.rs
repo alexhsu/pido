@@ -17,7 +17,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::Deserialize;
 
-use crate::io_util::read_line_capped_terminated;
+use crate::io_util::{read_line_capped, read_line_capped_terminated};
 
 /// Default session root: `$PI_CODING_AGENT_SESSION_DIR`, else
 /// `~/.pi/agent/sessions`. Pi honours the same variable.
@@ -109,10 +109,13 @@ impl ScanAccum {
         match entry.entry_type.as_deref() {
             Some("session_info") => {
                 // Last one wins; a blank name clears the title, exactly as
-                // pi's own getSessionName resolves it.
-                self.name = entry
-                    .name
-                    .filter(|entry_name| !entry_name.trim().is_empty());
+                // pi's own getSessionName resolves it. An absent `name` field
+                // says nothing about the title and must leave it alone.
+                match entry.name {
+                    Some(name) if name.trim().is_empty() => self.name = None,
+                    Some(name) => self.name = Some(name),
+                    None => {}
+                }
             }
             Some("message") => {
                 self.message_count += 1;
@@ -120,7 +123,11 @@ impl ScanAccum {
                     && let Some(message) = &entry.message
                     && message.get("role").and_then(|r| r.as_str()) == Some("user")
                 {
-                    self.preview = user_message_preview(message);
+                    // Only the first 120 chars are ever shown; keeping the
+                    // whole message would pin a pasted log in memory for the
+                    // life of the process (and clone it on every refresh).
+                    self.preview =
+                        user_message_preview(message).map(|preview| truncate(&preview, 120));
                 }
             }
             _ => {}
@@ -143,6 +150,10 @@ struct CachedSummary {
     len: u64,
     /// How many bytes have been parsed: the end of the last complete line.
     consumed: u64,
+    /// The bytes just before `consumed`. A rewrite of the same path (pi
+    /// migrating an old session, a restored backup) changes them, which is how
+    /// the append path proves it is still looking at the same file content.
+    fingerprint: Vec<u8>,
     accum: ScanAccum,
     head: SessionHead,
     summary: SessionSummary,
@@ -185,15 +196,18 @@ impl SessionScanner {
                     continue;
                 }
                 if len > cached.consumed
+                    && prefix_matches(path, cached.consumed, &cached.fingerprint)
                     && let Some((summary, consumed, accum)) =
                         append_scan(path, cached.consumed, &cached.head, cached.accum.clone())
                 {
+                    let fingerprint = tail_fingerprint(path, consumed).unwrap_or_default();
                     self.cache.insert(
                         path.clone(),
                         CachedSummary {
                             modified,
                             len,
                             consumed,
+                            fingerprint,
                             accum,
                             head: cached.head.clone(),
                             summary: summary.clone(),
@@ -207,12 +221,14 @@ impl SessionScanner {
                 log::warn!("skipping unparseable session file: {}", path.display());
                 continue;
             };
+            let fingerprint = tail_fingerprint(path, consumed).unwrap_or_default();
             self.cache.insert(
                 path.clone(),
                 CachedSummary {
                     modified,
                     len,
                     consumed,
+                    fingerprint,
                     accum,
                     head,
                     summary: summary.clone(),
@@ -225,6 +241,29 @@ impl SessionScanner {
             .retain(|path, _| present.contains(path.as_path()));
         Ok(group_summaries(summaries))
     }
+}
+
+/// How many bytes before `consumed` prove the parsed prefix is unchanged.
+const FINGERPRINT_BYTES: u64 = 64;
+
+/// The bytes ending at `consumed`, or `None` when the file is shorter than
+/// that offset now. Cheap: at most one small read.
+fn tail_fingerprint(path: &Path, consumed: u64) -> Option<Vec<u8>> {
+    use std::io::{Read as _, Seek as _};
+    let mut file = std::fs::File::open(path).ok()?;
+    let start = consumed.saturating_sub(FINGERPRINT_BYTES);
+    file.seek(std::io::SeekFrom::Start(start)).ok()?;
+    let mut buf = vec![0u8; (consumed - start) as usize];
+    file.read_exact(&mut buf).ok()?;
+    Some(buf)
+}
+
+/// Whether the bytes up to `consumed` are still the ones that were parsed.
+/// A file that grew is only an append when this holds; a rewrite that happens
+/// to make the file longer (pi's v1→v3 migration, a restored backup) fails it
+/// and is parsed whole instead of being folded into the old counters.
+fn prefix_matches(path: &Path, consumed: u64, expected: &[u8]) -> bool {
+    !expected.is_empty() && tail_fingerprint(path, consumed).as_deref() == Some(expected)
 }
 
 /// Parse just the bytes appended since `consumed`. Returns the refreshed
@@ -639,14 +678,22 @@ pub fn read_session_entries(path: &Path) -> anyhow::Result<Vec<crate::protocol::
     let file = std::fs::File::open(path)?;
     let mut reader = BufReader::new(file);
     let mut entries = Vec::new();
-    let mut line = String::new();
+    let mut buf = Vec::new();
     loop {
-        line.clear();
-        match reader.read_line(&mut line) {
-            Ok(0) | Err(_) => break,
-            Ok(_) => {}
+        // Bytes rather than `read_line`: that one requires UTF-8 and stops at
+        // the first bad byte, silently truncating the tree. The capped reader
+        // keeps one huge entry from being buffered whole.
+        let len = match read_line_capped(&mut reader, &mut buf, MAX_LINE) {
+            Ok(0) => break,
+            Ok(len) => len,
+            Err(error) => return Err(error.into()),
+        };
+        if len > MAX_LINE {
+            log::warn!("session {}: skipped an oversized entry", path.display());
+            continue;
         }
-        if let Ok(entry) = serde_json::from_str::<crate::protocol::SessionEntry>(line.trim_end()) {
+        let text = String::from_utf8_lossy(&buf);
+        if let Ok(entry) = serde_json::from_str::<crate::protocol::SessionEntry>(text.trim_end()) {
             entries.push(entry);
         }
     }
@@ -968,6 +1015,73 @@ mod tests {
         std::fs::write(&path, format!("{header}\n{}\n", message("m3"))).unwrap();
         let summary = scanner.scan(root.path()).unwrap()[0].sessions[0].clone();
         assert_eq!(summary.message_count, 1);
+    }
+
+    #[test]
+    fn a_grown_rewrite_is_parsed_whole_not_appended() {
+        // pi migrates an old session in place when it loads one: the path
+        // stays the same, every line is rewritten, and the file ends up
+        // *longer* (ids and parent ids are added). Appending from the old
+        // offset would start mid-line and fold unrelated entries into the
+        // previous counts.
+        let root = tempdir();
+        let project = root.path().join("--C--one--");
+        let v1_header = r#"{"type":"session","version":1,"id":"id","timestamp":"2026-01-01T10:00:00.000Z","cwd":"C:\\one"}"#;
+        let v1_message =
+            r#"{"type":"message","timestamp":1,"message":{"role":"user","content":"first"}}"#;
+        let path = write_session(
+            &project,
+            "2026-01-01T10-00-00-000Z_id.jsonl",
+            &[v1_header.into(), v1_message.into()],
+            10,
+        );
+        let mut scanner = SessionScanner::default();
+        assert_eq!(
+            scanner.scan(root.path()).unwrap()[0].sessions[0].message_count,
+            1
+        );
+
+        let v3_header = format!(
+            r#"{{"type":"session","version":3,"id":"id","timestamp":"2026-01-01T10:00:00.000Z","cwd":"C:\\{}"}}"#,
+            "x".repeat(400)
+        );
+        let v3_first = r#"{"type":"message","id":"a1b2c3d4","parentId":null,"timestamp":"2026-01-01T10:00:01.000Z","message":{"role":"user","content":"first","timestamp":1}}"#;
+        let v3_second = r#"{"type":"message","id":"b2c3d4e5","parentId":"a1b2c3d4","timestamp":"2026-01-01T10:00:02.000Z","message":{"role":"user","content":"second","timestamp":2}}"#;
+        let v3_third = r#"{"type":"message","id":"c3d4e5f6","parentId":"b2c3d4e5","timestamp":"2026-01-01T10:00:03.000Z","message":{"role":"user","content":"third","timestamp":3}}"#;
+        std::fs::write(
+            &path,
+            format!("{v3_header}\n{v3_first}\n{v3_second}\n{v3_third}\n"),
+        )
+        .unwrap();
+
+        let summary = scanner.scan(root.path()).unwrap()[0].sessions[0].clone();
+        // The old offset now lands inside the new (longer) header, so an
+        // append would read the three messages *on top of* the one counted
+        // before and report four.
+        assert_eq!(
+            summary.message_count, 3,
+            "the rewritten file replaces the old counts instead of doubling them"
+        );
+        assert_eq!(summary.preview.as_deref(), Some("first"));
+    }
+
+    #[test]
+    fn a_session_info_without_a_name_keeps_the_title() {
+        let root = tempdir();
+        let path = write_session(
+            &root.path().join("--C--one--"),
+            "2026-01-01T10-00-00-000Z_id.jsonl",
+            &[
+                r#"{"type":"session","version":3,"id":"id","timestamp":"2026-01-01T10:00:00.000Z","cwd":"C:\\one"}"#.into(),
+                r#"{"type":"session_info","id":"s1","parentId":null,"timestamp":"2026-01-01T10:00:01.000Z","name":"kept"}"#.into(),
+                // A writer that reports something else (pi's own
+                // `session_info_changed` event may omit the name).
+                r#"{"type":"session_info","id":"s2","parentId":"s1","timestamp":"2026-01-01T10:00:02.000Z"}"#.into(),
+            ],
+            10,
+        );
+        let summary = parse_session_file(&path).expect("parses");
+        assert_eq!(summary.name.as_deref(), Some("kept"));
     }
 
     #[test]

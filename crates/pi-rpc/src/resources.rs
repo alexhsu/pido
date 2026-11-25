@@ -1,8 +1,11 @@
-//! Read-only views of pi's optional resources — skills and configured
-//! extension/package sources — for pido's settings window. Everything
-//! user-visible is parsed here so the UI only formats.
+//! Views of pi's optional resources — skills and configured extension and
+//! package sources — for pido's settings window. Everything user-visible is
+//! parsed here so the UI only formats; the enable flags come from the same
+//! rules pi applies at startup (see [`crate::config`]).
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+use crate::config;
 
 /// Whether a resource comes from pi's agent directory or the project.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -19,13 +22,33 @@ pub struct SkillSummary {
     pub name: String,
     pub description: String,
     pub scope: Scope,
+    /// The skill's folder, for reveal buttons and toggles.
+    pub path: PathBuf,
+    /// Whether pi currently loads it — that scope's settings array decides.
+    pub enabled: bool,
 }
 
-/// A configured extension or package source.
+/// Where a configured extension comes from; drives what editing it means.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExtensionChannel {
+    /// A path listed in an `extensions` array.
+    SettingArray,
+    /// A `packages` entry (`npm:`/`git:`/`https://` source).
+    Package,
+    /// A loose file or folder in an `extensions/` directory.
+    Discovered,
+}
+
+/// One extension row for the settings window.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ExtensionSource {
+pub struct ExtensionEntry {
     pub source: String,
     pub scope: Scope,
+    pub channel: ExtensionChannel,
+    /// Whether pi currently loads it.
+    pub enabled: bool,
+    /// The resolved local path, when the entry is a local file or folder.
+    pub path: Option<PathBuf>,
 }
 
 /// pi's builtin extensions, always loaded unless disabled by name in
@@ -65,6 +88,9 @@ fn unquote(value: &str) -> &str {
 /// indented lines that follow); anything else is `None`.
 pub fn parse_skill_frontmatter(text: &str) -> Option<(String, String)> {
     const BLOCK_MARKERS: [&str; 6] = ["|", "|-", "|+", ">", ">-", ">+"];
+    // Editors on Windows save UTF-8 with a BOM; without stripping it the first
+    // line reads as "\u{feff}---" and the whole skill vanishes silently.
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
     let lines: Vec<&str> = text.lines().collect();
     if lines.first().copied().map(str::trim_end) != Some("---") {
         return None;
@@ -113,73 +139,139 @@ pub fn parse_skill_frontmatter(text: &str) -> Option<(String, String)> {
 }
 
 /// Skills from `<agent_dir>/skills/*` (user) and `<cwd>/.pi/skills/*`
-/// (project). A directory counts only when its SKILL.md parses.
+/// (project). A directory counts only when its SKILL.md parses. Each entry
+/// carries the enabled state pi's matching scope settings array gives it.
 pub fn pi_skills(agent_dir: Option<&Path>, project_cwd: Option<&Path>) -> Vec<SkillSummary> {
     let mut skills = Vec::new();
     if let Some(dir) = agent_dir {
-        collect_skills(&dir.join("skills"), Scope::User, &mut skills);
+        let entries = settings_file_strings(&config::agent_settings_path(dir), "skills");
+        collect_skills(&dir.join("skills"), dir, Scope::User, &entries, &mut skills);
     }
     if let Some(cwd) = project_cwd {
-        collect_skills(&cwd.join(".pi").join("skills"), Scope::Project, &mut skills);
+        let base = cwd.join(".pi");
+        let entries = settings_file_strings(&config::project_settings_path(cwd), "skills");
+        collect_skills(
+            &base.join("skills"),
+            &base,
+            Scope::Project,
+            &entries,
+            &mut skills,
+        );
     }
     skills.sort_by(|a, b| a.name.cmp(&b.name));
     skills
 }
 
-fn collect_skills(dir: &Path, scope: Scope, out: &mut Vec<SkillSummary>) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
+/// Read one settings file and pull a string array out of it; a missing or
+/// malformed file reads as empty (every resource then shows enabled).
+fn settings_file_strings(path: &Path, key: &str) -> Vec<String> {
+    config::read_json(path)
+        .map(|value| config::string_array(&value, key))
+        .unwrap_or_default()
+}
+
+fn collect_skills(
+    dir: &Path,
+    base_dir: &Path,
+    scope: Scope,
+    entries: &[String],
+    out: &mut Vec<SkillSummary>,
+) {
+    let Ok(read) = std::fs::read_dir(dir) else {
         return;
     };
-    for entry in entries.flatten() {
-        let path = entry.path().join("SKILL.md");
-        let Ok(text) = std::fs::read_to_string(path) else {
+    for entry in read.flatten() {
+        let path = entry.path();
+        let skill_md = path.join("SKILL.md");
+        let Ok(text) = std::fs::read_to_string(&skill_md) else {
             continue;
         };
         let Some((name, description)) = parse_skill_frontmatter(&text) else {
             continue;
         };
+        let enabled = config::resource_enabled(base_dir, &skill_md, entries, true);
         out.push(SkillSummary {
             name,
             description,
             scope,
+            path,
+            enabled,
         });
     }
 }
 
-/// Configured extension/package sources: both levels' settings.json
+/// Configured extension/package entries: both levels' settings.json
 /// `packages` and `extensions` arrays (string or `{source}` entries), plus
-/// loose files in the agent directory's `extensions/` folder. Global first,
-/// then project, matching pi's combine order.
-pub fn pi_extensions(agent_dir: Option<&Path>, project_cwd: Option<&Path>) -> Vec<ExtensionSource> {
-    let mut sources = Vec::new();
+/// loose files in each scope's `extensions/` folder. Global first, then
+/// project, matching pi's combine order. Builtin extensions are not listed
+/// here — the settings window renders [`BUILTIN_EXTENSIONS`] with
+/// [`config::builtin_extension_state`].
+pub fn pi_extensions(agent_dir: Option<&Path>, project_cwd: Option<&Path>) -> Vec<ExtensionEntry> {
+    let mut entries = Vec::new();
+    let user_settings = agent_dir
+        .map(config::agent_settings_path)
+        .and_then(|path| config::read_json(&path).ok());
+    let project_settings = project_cwd
+        .map(config::project_settings_path)
+        .and_then(|path| config::read_json(&path).ok());
     if let Some(dir) = agent_dir {
-        collect_setting_sources(&dir.join("settings.json"), Scope::User, &mut sources);
-        collect_extension_files(&dir.join("extensions"), Scope::User, &mut sources);
+        extension_entries_from_value(
+            user_settings.as_ref().unwrap_or(&serde_json::Value::Null),
+            Scope::User,
+            dir,
+            &mut entries,
+        );
+        collect_extension_files(
+            &dir.join("extensions"),
+            dir,
+            Scope::User,
+            user_settings.as_ref(),
+            &mut entries,
+        );
     }
     if let Some(cwd) = project_cwd {
-        collect_setting_sources(
-            &cwd.join(".pi").join("settings.json"),
+        let base = cwd.join(".pi");
+        extension_entries_from_value(
+            project_settings
+                .as_ref()
+                .unwrap_or(&serde_json::Value::Null),
             Scope::Project,
-            &mut sources,
+            &base,
+            &mut entries,
         );
-        collect_extension_files(&cwd.join(".pi").join("extensions"), Scope::Project, &mut sources);
+        collect_extension_files(
+            &base.join("extensions"),
+            &base,
+            Scope::Project,
+            project_settings.as_ref(),
+            &mut entries,
+        );
     }
-    sources
+    entries
 }
 
-/// Parse the `packages`/`extensions` arrays out of one settings file's
-/// text. Split out for tests; [`pi_extensions`] feeds it from disk.
-pub fn extension_sources_from_text(text: &str, scope: Scope, out: &mut Vec<ExtensionSource>) {
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(text) else {
-        return;
+/// Parse the `packages` and `extensions` arrays out of one settings value
+/// into channel-tagged rows. Split out for tests; [`pi_extensions`] feeds it
+/// from disk.
+pub fn extension_entries_from_value(
+    value: &serde_json::Value,
+    scope: Scope,
+    base_dir: &Path,
+    out: &mut Vec<ExtensionEntry>,
+) {
+    let object = match value.as_object() {
+        Some(object) => object,
+        None => return,
     };
-    let Some(object) = value.as_object() else {
-        return;
-    };
-    for key in ["packages", "extensions"] {
-        let Some(list) = object.get(key).and_then(|v| v.as_array()) else {
-            continue;
+    for (key, channel) in [
+        ("packages", ExtensionChannel::Package),
+        ("extensions", ExtensionChannel::SettingArray),
+    ] {
+        let list = match object.get(key).and_then(|list| list.as_array()) {
+            Some(list) => list,
+            None => continue,
         };
+        let overrides = config::string_array(value, "extensions");
         for entry in list {
             let source = match entry {
                 serde_json::Value::String(text) => Some(text.clone()),
@@ -189,47 +281,90 @@ pub fn extension_sources_from_text(text: &str, scope: Scope, out: &mut Vec<Exten
                     .map(String::from),
                 _ => None,
             };
-            let Some(source) = source else { continue };
-            if source.is_empty() {
+            let Some(source) = source.filter(|source| !source.is_empty()) else {
+                continue;
+            };
+            // In an `extensions` array, override entries (`+`/`-`/`!`) are
+            // toggles for discovered resources, not rows of their own — pi's
+            // loader splits them out before resolving sources.
+            if channel == ExtensionChannel::SettingArray
+                && matches!(source.chars().next(), Some('!' | '+' | '-'))
+            {
                 continue;
             }
             // pi tolerates duplicates across scopes; showing one row per
-            // (source, scope) keeps the list honest without noise.
-            if !out
-                .iter()
-                .any(|existing| existing.source == source && existing.scope == scope)
-            {
-                out.push(ExtensionSource { source, scope });
+            // (source, scope, channel) keeps the list honest without noise.
+            if out.iter().any(|existing| {
+                existing.source == source && existing.scope == scope && existing.channel == channel
+            }) {
+                continue;
             }
+            // A local path resolves against the settings file that named it;
+            // remote specs (npm:/git:/https) have no local face. The enabled
+            // flag follows the same scope's `extensions` overrides.
+            let local = if source.starts_with("npm:")
+                || source.starts_with("git:")
+                || source.starts_with("https://")
+                || source.starts_with("http://")
+            {
+                None
+            } else {
+                let candidate = PathBuf::from(&source);
+                Some(if candidate.is_absolute() {
+                    candidate
+                } else {
+                    base_dir.join(candidate)
+                })
+            };
+            let enabled = local
+                .as_deref()
+                .is_none_or(|path| config::resource_enabled(base_dir, path, &overrides, false));
+            out.push(ExtensionEntry {
+                source,
+                scope,
+                channel,
+                enabled,
+                path: local,
+            });
         }
     }
 }
 
-fn collect_setting_sources(path: &Path, scope: Scope, out: &mut Vec<ExtensionSource>) {
-    if let Ok(text) = std::fs::read_to_string(path) {
-        extension_sources_from_text(&text, scope, out);
-    }
-}
-
-fn collect_extension_files(dir: &Path, scope: Scope, out: &mut Vec<ExtensionSource>) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
+fn collect_extension_files(
+    dir: &Path,
+    base_dir: &Path,
+    scope: Scope,
+    settings: Option<&serde_json::Value>,
+    out: &mut Vec<ExtensionEntry>,
+) {
+    let Ok(read) = std::fs::read_dir(dir) else {
         return;
     };
-    for entry in entries.flatten() {
+    let overrides = settings
+        .map(|value| config::string_array(value, "extensions"))
+        .unwrap_or_default();
+    for entry in read.flatten() {
         let path = entry.path();
         // pi discovers directories with an entry point and loose .ts/.js
         // files; anything else in the folder is noise.
         let discovered = path.is_dir()
-            || matches!(path.extension().and_then(|ext| ext.to_str()), Some("ts" | "js"));
+            || matches!(
+                path.extension().and_then(|ext| ext.to_str()),
+                Some("ts" | "js")
+            );
         if !discovered {
             continue;
         }
         let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
             continue;
         };
-        out.push(ExtensionSource {
+        let enabled = config::resource_enabled(base_dir, &path, &overrides, false);
+        out.push(ExtensionEntry {
             source: name.to_string(),
             scope,
+            channel: ExtensionChannel::Discovered,
+            enabled,
+            path: Some(path),
         });
     }
 }
@@ -268,10 +403,7 @@ mod tests {
         let block = "---\nname: blocky\ndescription: |\n  first line\n  second line\n---\nbody";
         assert_eq!(
             parse_skill_frontmatter(block),
-            Some((
-                "blocky".to_string(),
-                "first line · second line".to_string()
-            ))
+            Some(("blocky".to_string(), "first line · second line".to_string()))
         );
     }
 
@@ -284,7 +416,18 @@ mod tests {
     }
 
     #[test]
-    fn extension_sources_read_strings_objects_and_dedupe() {
+    fn a_utf8_bom_does_not_hide_a_skill() {
+        // Windows editors save SKILL.md with a BOM; pi's own loader reads the
+        // file as text, so the skill must not disappear from the list.
+        let text = "\u{feff}---\nname: bom-skill\ndescription: Saved by Notepad.\n---\nbody";
+        assert_eq!(
+            parse_skill_frontmatter(text),
+            Some(("bom-skill".to_string(), "Saved by Notepad.".to_string()))
+        );
+    }
+
+    #[test]
+    fn extension_entries_read_strings_objects_channels_and_dedupe() {
         let text = r#"{
             "packages": [
                 "npm:@scope/pkg@1",
@@ -294,37 +437,62 @@ mod tests {
             "extensions": ["./ext.ts"],
             "retry": {"enabled": true}
         }"#;
-        let mut sources = Vec::new();
-        extension_sources_from_text(text, Scope::User, &mut sources);
+        let value: serde_json::Value = serde_json::from_str(text).expect("json");
+        let mut entries = Vec::new();
+        extension_entries_from_value(&value, Scope::User, Path::new("/agent"), &mut entries);
         assert_eq!(
-            sources,
+            entries,
             vec![
-                ExtensionSource {
+                ExtensionEntry {
                     source: "npm:@scope/pkg@1".to_string(),
                     scope: Scope::User,
+                    channel: ExtensionChannel::Package,
+                    enabled: true,
+                    path: None,
                 },
-                ExtensionSource {
+                ExtensionEntry {
                     source: "git:github.com/x/y@main".to_string(),
                     scope: Scope::User,
+                    channel: ExtensionChannel::Package,
+                    enabled: true,
+                    path: None,
                 },
-                ExtensionSource {
+                ExtensionEntry {
                     source: "./ext.ts".to_string(),
                     scope: Scope::User,
+                    channel: ExtensionChannel::SettingArray,
+                    enabled: true,
+                    path: Some(PathBuf::from("/agent/ext.ts")),
                 },
             ]
         );
     }
 
     #[test]
-    fn extension_sources_ignore_garbage_and_empty() {
-        let mut sources = Vec::new();
-        extension_sources_from_text("not json", Scope::User, &mut sources);
-        assert!(sources.is_empty());
-        extension_sources_from_text(
-            r#"{"packages": ["", {"no_source": 1}, 42]}"#,
+    fn extension_entries_ignore_garbage_and_empty() {
+        let mut entries = Vec::new();
+        extension_entries_from_value(
+            &serde_json::Value::Null,
             Scope::User,
-            &mut sources,
+            Path::new("/agent"),
+            &mut entries,
         );
-        assert!(sources.is_empty());
+        assert!(entries.is_empty());
+        let garbage: serde_json::Value =
+            serde_json::from_str(r#"{"packages": ["", {"no_source": 1}, 42]}"#).expect("json");
+        extension_entries_from_value(&garbage, Scope::User, Path::new("/agent"), &mut entries);
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn a_settings_override_disables_a_local_extension_entry() {
+        let value: serde_json::Value =
+            serde_json::from_str(r#"{"extensions": ["./ext.ts", "-ext.ts"]}"#).expect("json");
+        let mut entries = Vec::new();
+        extension_entries_from_value(&value, Scope::User, Path::new("/agent"), &mut entries);
+        // Only the plain entry is a configured row; the `-ext.ts` override is
+        // what switches it off.
+        assert_eq!(entries.len(), 1);
+        assert!(!entries[0].enabled);
     }
 }
